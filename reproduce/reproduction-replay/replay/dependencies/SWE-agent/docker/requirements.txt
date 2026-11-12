@@ -1,0 +1,4 @@
+config
+openai
+uv
+python-dotenv>=1.0

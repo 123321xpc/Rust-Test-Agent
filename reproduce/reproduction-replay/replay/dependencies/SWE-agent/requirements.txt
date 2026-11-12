@@ -1,0 +1,19 @@
+config
+datasets
+docker >= 7.1.0  # https://github.com/princeton-nlp/SWE-agent/issues/379
+gymnasium
+numpy
+openai>=1.0
+pandas
+rich
+ruamel.yaml
+swebench>=1.0.1
+tenacity
+unidiff
+simple-parsing
+rich-argparse
+flask
+flask-cors
+flask-socketio
+python-dotenv>=1.0
+httpx>=0.27,<1

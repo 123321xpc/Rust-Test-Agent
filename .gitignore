@@ -1,0 +1,40 @@
+# Local secrets
+.env
+
+# IDE settings
+**/.vscode/
+**/.idea/
+
+# Python caches and local environments
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/env/
+*.py[cod]
+
+# Rust build output
+**/target/
+
+# Python packaging output
+**/*.egg-info/
+**/build/
+**/dist/
+
+# Generated run data and logs
+**/log/
+**/logs/
+**/result/
+**/traces/
+# Local Codex/editor metadata
+.cursor/
+
+# Temporary root-level analysis artifacts
+report.md
+gen_report.py
+make_md.py
+write_sections.py
+test_single.py
+test_b64.txt
+test.b64
+extracted_paper_text.txt
