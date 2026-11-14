@@ -57,7 +57,7 @@ def test_run_agent_returns_tool_submission(agent_module, monkeypatch, tmp_path):
 
     create = Mock(return_value=SimpleNamespace(invoke=invoke))
     monkeypatch.setattr(agent_module, "create_agent", create)
-    assert agent_module.run_agent(tmp_path, "fix issue", "model", "key", "https://example.com", max_api_calls=3) == submitted_patch
+    assert agent_module.run_agent(tmp_path, "fix issue", "model", "key", "https://example.com", max_api_calls=3, multi_agent=False) == submitted_patch
     state.close.assert_called_once()
     create.assert_called_once_with(model=llm, tools=tools, system_prompt=agent_module.SYSTEM_PROMPT)
     assert llm_factory.call_args.kwargs["base_url"] == "https://example.com"
@@ -73,7 +73,7 @@ def test_run_agent_reports_verified_toolchain(agent_module, monkeypatch, tmp_pat
         assert "rustc 1.72.0" in inputs["messages"][0]["content"]
         state.patch = "patch"
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    assert agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, rust_version="1.72.0") == "patch"
+    assert agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, rust_version="1.72.0", multi_agent=False) == "patch"
     make_tools.assert_called_once_with(tmp_path, "1.72.0")
     trace.record.assert_called_once_with("rust_environment", **state.rust_info)
 
@@ -84,7 +84,7 @@ def test_run_agent_rejects_missing_submission(agent_module, monkeypatch, tmp_pat
     monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=Mock())))
     with pytest.raises(RuntimeError, match="non-empty patch"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key")
+        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
     state.close.assert_called_once()
 
 
@@ -113,7 +113,7 @@ def test_run_agent_uses_selected_patch_and_requires_resubmission(agent_module, m
 
     create = Mock(return_value=SimpleNamespace(invoke=invoke))
     monkeypatch.setattr(agent_module, "create_agent", create)
-    patch = agent_module.run_agent(tmp_path, "issue", "model", "key")
+    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
     assert "after" in patch and "test_regression_fix.rs" not in patch
 
     def invoke_without_submission(inputs, config):
@@ -127,7 +127,7 @@ def test_run_agent_uses_selected_patch_and_requires_resubmission(agent_module, m
 
     create.return_value = SimpleNamespace(invoke=invoke_without_submission)
     with pytest.raises(RuntimeError, match="non-empty patch"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key")
+        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
 
 
 def test_agent_continues_when_model_stops_without_submission(agent_module, monkeypatch, tmp_path):
@@ -144,7 +144,7 @@ def test_agent_continues_when_model_stops_without_submission(agent_module, monke
         return {"messages": inputs["messages"]}
 
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    assert agent_module.run_agent(tmp_path, "issue", "model", "key") == state.patch
+    assert agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False) == state.patch
     assert len(calls) == 2 and "continue" in calls[1][-1]["content"].lower()
 
 
@@ -253,7 +253,7 @@ def test_run_agent_auto_submits_verified_changes_when_api_limit_reached(agent_mo
     create = Mock(return_value=SimpleNamespace(invoke=invoke_verified_then_limit))
     monkeypatch.setattr(agent_module, "create_agent", create)
     trace = Mock()
-    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, max_api_calls=5)
+    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, max_api_calls=5, multi_agent=False)
     assert "+after" in patch and "test_regression_fix.rs" not in patch
     trace.record.assert_called_once_with("auto_submit_on_limit", patch=patch)
 
@@ -264,7 +264,7 @@ def test_run_agent_auto_submits_verified_changes_when_api_limit_reached(agent_mo
 
     create.return_value = SimpleNamespace(invoke=invoke_unverified_then_limit)
     with pytest.raises(RuntimeError, match="Model API call limit reached"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key", max_api_calls=5)
+        agent_module.run_agent(tmp_path, "issue", "model", "key", max_api_calls=5, multi_agent=False)
 
 
 def test_compress_history_messages_trims_old_tool_outputs(agent_module):
@@ -373,7 +373,7 @@ def test_run_agent_auto_submits_when_verified_without_extra_continuation(agent_m
 
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
     trace = Mock()
-    result_patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace)
+    result_patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, multi_agent=False)
     assert result_patch == "diff --git verified\n"
     # Auto-submission must finish on the FIRST invoke without requiring continuation!
     assert len(calls) == 1
@@ -443,7 +443,7 @@ def test_run_agent_stops_after_repeated_idle_responses(agent_module, monkeypatch
 
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
     with pytest.raises(RuntimeError, match="stopped calling tools"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key")
+        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
     assert len(calls) == 4
 
 
@@ -465,3 +465,43 @@ def test_compress_history_messages_compacts_older_assistant_thoughts(agent_modul
     old_ai = compressed[1]
     assert "earlier thought omitted" in old_ai.content
     assert len(old_ai.content) < len(long_thought)
+
+
+def test_compress_history_messages_compacts_stale_file_reads(agent_module):
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    msgs = [
+        HumanMessage(content="start"),
+        # Turn 0: read_lines src/lib.rs
+        AIMessage(content="", tool_calls=[{"id": "c0", "name": "read_lines", "args": {"path": "src/lib.rs", "start_line": 1, "end_line": 20}}]),
+        ToolMessage(content="1: fn foo() {}\n" * 10, tool_call_id="c0"),
+        # Turn 1: edit_file src/lib.rs
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "edit_file", "args": {"path": "src/lib.rs", "old_text": "foo", "new_text": "bar"}}]),
+        ToolMessage(content="Updated src/lib.rs", tool_call_id="c1"),
+        # Turn 2: read_lines src/lib.rs (fresh read after edit)
+        AIMessage(content="", tool_calls=[{"id": "c2", "name": "read_lines", "args": {"path": "src/lib.rs", "start_line": 1, "end_line": 20}}]),
+        ToolMessage(content="1: fn bar() {}\n" * 10, tool_call_id="c2"),
+    ]
+    # keep_recent_steps=6 keeps all 3 turns in window, but turn 0 read should be compacted as stale!
+    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=6, test_cutoff_steps=1)
+    assert "subsequent step" in compressed[2].content
+    assert "1: fn bar()" in compressed[6].content
+
+
+def test_cli_single_agent_flag_passes_multi_agent_false(agent_module, monkeypatch, tmp_path):
+    issue = tmp_path / "issue.txt"
+    issue.write_text("issue text", encoding="utf-8")
+    output = tmp_path / "out.jsonl"
+    monkeypatch.setenv("API_LIMIT", "70")
+    monkeypatch.setenv("MODEL", "model")
+    monkeypatch.setenv("API_KEY", "key")
+    monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
+    monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
+    run = Mock(return_value="diff --git patch\n")
+    monkeypatch.setattr(agent_module, "run_agent", run)
+    monkeypatch.setattr(sys, "argv", [
+        "agent.py", "--repo", str(tmp_path), "--instance-id", "id",
+        "--issue-file", str(issue), "--output", str(output),
+        "--rust-toolchain", "1.72.0", "--single-agent",
+    ])
+    agent_module.main()
+    assert run.call_args.kwargs["multi_agent"] is False

@@ -44,30 +44,36 @@ def _load_file(name, path):
 
 make_tools = _load_file("test_tools", Path(__file__).with_name("tools.py")).make_tools
 _trace = _load_file("baseline_trace", Path(__file__).with_name("agent_trace.py"))
-TraceHTTPClient, TraceRecorder = _trace.TraceHTTPClient, _trace.TraceRecorder
+TraceHTTPClient, TraceRecorder, RoleTraceCallback = _trace.TraceHTTPClient, _trace.TraceRecorder, _trace.RoleTraceCallback
 benchmark_toolchain = _load_file("rust_environment", Path(__file__).with_name("rust_environment.py")).benchmark_toolchain
+_prompts = _load_file("agent_prompts", Path(__file__).with_name("agent_prompts.py"))
+_multi_agent = _load_file("multi_agent", Path(__file__).with_name("multi_agent.py"))
 
 
 SYSTEM_PROMPT = """You are a software engineer resolving an issue in a Rust repository.
 Follow this order:
 1. Analyze the issue and relevant code. Identify the cause, expected behavior,
-   and callers/trait constraints using search_code (with context_lines when helpful),
-   rust_symbols (including callers=True / references=True), read_lines, and
-   cargo_workspace. Keep initial exploration focused (typically within 10-15
+   and callers/trait constraints using search_code (with context_lines when helpful,
+   or summarize=True for a file overview, or empty query with file_glob to locate files),
+   rust_symbols (including callers=True / references=True, inspecting vis and enclosing trait/impl),
+   read_lines, and cargo_workspace. Keep initial exploration focused (typically within 10-15
    read/search calls) before writing the regression test.
 2. Use write_regression_test to create a new temporary integration test in the
-   relevant package's tests/test_regression_<name>.rs. Reproduce the issue via
+   relevant package's tests/test_regression_<name>.rs. You may set run_now=True to
+   immediately execute cargo_test on the written test in one step. Reproduce the issue via
    the public API (or for binary-only CLI crates, via `env!("CARGO_BIN_EXE_<bin>")`)
    and cover boundary cases described in the issue. Run cargo_test with test_target
    set to the regression test before fixing to confirm reproduction (Red phase:
    runtime failure on buggy code, or expected API-missing compile failure for new
    APIs). Do not add or modify inline tests or other test files; never modify files in tests/ or benches/ (modifications to existing test files are blocked to prevent benchmark conflicts).
 3. Implement a targeted fix using edit_file (single replacement or edits=[...]
-   for multiple hunks), preserving unrelated code. Before changing any function
-   signature or trait bound, check callers with rust_symbols(callers=True). Use
-   checkpoint(action="save"/"restore") before risky refactors and revert_file to
-   cleanly discard unwanted changes. If a strategy_warning appears, step back and
-   change approach instead of repeating similar local tweaks.
+   for multiple hunks), strictly preserving unrelated code and adhering to minimal modification.
+   Do not reformat or reduce lines in unrelated public functions/traits, as shifting line counts
+   can break existing exact-line Rust doctests (e.g. 'file.rs - (line X)'). When the issue specifies
+   a concrete function/method name, implement the exact requested name (not just an internal `_opt`
+   variant). Before changing any function signature or trait bound, check callers with rust_symbols(callers=True).
+   Use checkpoint(action="save"/"restore") before risky refactors and revert_file to cleanly discard unwanted
+   changes. If a strategy_warning appears, step back and change approach instead of repeating similar local tweaks.
 4. Use layered verification after edits: first run cargo_check (or cargo_test
    with no_run=True to check test target compilation), then run cargo_test with
    test_target set to each regression test (no filter). Then run targeted existing
@@ -78,11 +84,12 @@ Follow this order:
    modify or remove them to satisfy the gate. If the issue states an existing test
    asserts outdated behavior contrary to the issue, do not weaken your fix to pass it.
    When modifying public APIs, types, or doc comments, you may also run cargo_test with doc=True to verify documentation examples.
-5. After verification passes, use generate_patch to preview changes, then submit
-   all changed source files using an explicit list of file paths. Temporary
+5. After verification passes, use generate_patch to preview changes, or call
+   generate_patch(submit=True) to automatically submit all verified source changes in one call.
+   Alternatively, submit explicitly with paths=[...]. Temporary
    regression tests are excluded automatically, and a post-strip verification
-   checks affected crates and downstream workspace dependents. Any further write
-   invalidates regression verification: rerun the required tests. Watch for budget
+   checks affected crates and downstream workspace dependents under both cargo check and cargo check --tests.
+   Any further write invalidates regression verification: rerun the required tests. Watch for budget
    notices and submit before API calls run out.
 Briefly describe the analysis, tests, and change.
 Do not run git or external shell commands to inspect history or host files.
@@ -117,6 +124,23 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
     raw_code_cutoff = max(0, total_tools - min(keep_recent_steps, total_tools))
     raw_test_cutoff = max(0, total_tools - min(test_cutoff_steps, total_tools))
 
+    tc_map = {}
+    file_modified_indices = {}
+    for idx, m in enumerate(messages):
+        is_ai_m = getattr(m, "type", None) == "ai" or (isinstance(m, dict) and m.get("role") == "assistant")
+        if is_ai_m:
+            t_calls = getattr(m, "tool_calls", None) if not isinstance(m, dict) else m.get("tool_calls")
+            if isinstance(t_calls, list):
+                for tc in t_calls:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        tc_map[tc["id"]] = tc
+                        t_name = tc.get("name")
+                        t_args = tc.get("args") or {}
+                        if t_name in ("edit_file", "write_file", "write_regression_test") and isinstance(t_args, dict):
+                            p = t_args.get("path")
+                            if p:
+                                file_modified_indices.setdefault(str(p), []).append(idx)
+
     if block_size > 1:
         code_pos = (raw_code_cutoff // block_size) * block_size
         test_pos = (raw_test_cutoff // block_size) * block_size
@@ -128,14 +152,14 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
     test_cutoff_idx = tool_indices[test_pos] if test_pos < total_tools else len(messages)
 
     def _trim_arg_str(val):
-        if not isinstance(val, str) or len(val) <= 400 or "[earlier write omitted]" in val:
+        if not isinstance(val, str) or len(val) <= 400 or "[earlier write omitted" in val:
             return val, False
         lines = val.splitlines()
-        if len(lines) > 8:
-            head = "\n".join(lines[:4])
-            tail = "\n".join(lines[-3:])
-            return f"{head}\n... [earlier write omitted ({len(lines) - 7} lines)] ...\n{tail}", True
-        return val[:250] + "\n... [earlier write omitted] ...", True
+        return (
+            f"[earlier write omitted: {len(lines)} lines, {len(val)} chars — "
+            "do not copy this placeholder; read the file directly if needed]",
+            True,
+        )
 
     compressed = []
     for i, msg in enumerate(messages):
@@ -210,12 +234,25 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
             continue
 
         content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
-        if not isinstance(content, str) or len(content) <= 300:
+        if not isinstance(content, str):
             compressed.append(msg)
             continue
 
         stripped = content.strip()
         new_content = None
+
+        # If file was modified in a later turn, older read outputs are stale
+        t_id = getattr(msg, "tool_call_id", "") or (msg.get("tool_call_id") if isinstance(msg, dict) else "")
+        tc_info = tc_map.get(t_id, {})
+        if tc_info.get("name") in ("read_lines", "read_file"):
+            target_p = str((tc_info.get("args") or {}).get("path") or "")
+            mod_indices = file_modified_indices.get(target_p, [])
+            if any(mod_idx > i for mod_idx in mod_indices):
+                new_content = f"[earlier read of '{target_p}' omitted: file was modified in subsequent step; line numbers may have shifted]"
+
+        if new_content is None and len(content) <= 300:
+            compressed.append(msg)
+            continue
 
         if i < test_cutoff_idx and stripped.startswith("{") and stripped.endswith("}"):
             try:
@@ -262,6 +299,7 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                         }, ensure_ascii=False)
             except Exception:
                 pass
+
 
         if new_content is None and i < code_cutoff_idx:
             if stripped.startswith("{") and stripped.endswith("}"):
@@ -354,7 +392,7 @@ def _continuation_prompt(state, client):
     return prompt
 
 
-def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None):
+def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None, multi_agent=True, dump_pre_fix_dir=None, replay_pre_fix_dir=None, intervention=None):
     configure_repair_git()
     kwargs = {}
     if instance_id is not None:
@@ -377,10 +415,35 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         if hasattr(state, "set_budget"):
             state.set_budget(client)
         try:
-            llm = ChatOpenAI(model=model, api_key=api_key, base_url=base_url,
-                             temperature=0, timeout=180, max_retries=3, http_client=client)
             import functools
             compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2)
+            if multi_agent:
+                patch = _multi_agent.run_multi_agent(
+                    Path(repo),
+                    issue,
+                    model,
+                    api_key,
+                    base_url,
+                    tools=tools,
+                    state=state,
+                    client=client,
+                    trace=trace,
+                    max_api_calls=max_api_calls,
+                    compress_fn=compress_fn,
+                    create_agent_fn=create_agent,
+                    chat_model_factory=ChatOpenAI,
+                    prompts_mod=_prompts,
+                    role_callback_cls=RoleTraceCallback,
+                    dump_pre_fix_dir=dump_pre_fix_dir,
+                    replay_pre_fix_dir=replay_pre_fix_dir,
+                    intervention=intervention,
+                )
+                if not patch:
+                    raise RuntimeError("Agent did not generate a non-empty patch")
+                return patch
+
+            llm = ChatOpenAI(model=model, api_key=api_key, base_url=base_url,
+                             temperature=0, timeout=180, max_retries=3, http_client=client)
             if hasattr(llm, "bind_tools") and callable(getattr(llm, "bind_tools")):
                 from langchain_core.runnables import RunnableLambda
                 orig_bind_tools = llm.bind_tools
@@ -464,8 +527,17 @@ def main():
     rust = parser.add_mutually_exclusive_group(required=True)
     rust.add_argument("--dataset", help="Benchmark JSONL containing the selected instance")
     rust.add_argument("--rust-toolchain", help="Explicit evaluation toolchain when dataset metadata is unavailable")
+    parser.add_argument("--single-agent", action="store_true", default=False,
+                        help="Run legacy single-agent ReAct loop instead of adaptive multi-agent pipeline")
     parser.add_argument("--harness-root", default=str(Path(__file__).resolve().parents[2] / "Rust-bench"),
                         help="Rust-bench harness used for evaluation")
+    parser.add_argument("--dump-pre-fix", help="Directory where pre_fix checkpoint bundle should be exported after Navigator")
+    parser.add_argument("--replay-pre-fix", help="Directory where pre_fix checkpoint bundle should be loaded from to skip Navigator")
+    parser.add_argument("--intervene-feature", help="Target semantic feature for CAM causal intervention")
+    parser.add_argument("--intervene-action", choices=("drop", "weaken", "corrupt", "override", "truncate"), default="drop",
+                        help="Causal intervention action (default: drop)")
+    parser.add_argument("--intervene-value", help="Optional value string or JSON for causal intervention")
+    parser.add_argument("--intervention-file", help="Path to JSON file specifying {'feature': ..., 'action': ..., 'value': ...}")
     args = parser.parse_args()
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
@@ -499,9 +571,29 @@ def main():
     try:
         rust_version = (benchmark_toolchain(args.dataset, args.instance_id, args.harness_root)
                         if args.dataset else args.rust_toolchain)
-        patch = run_agent(repo, issue, model, api_key, os.getenv("BASE_URL") or None,
-                          trace=trace, max_api_calls=max_api_calls, rust_version=rust_version,
-                          require_reproduction=args.require_reproduction, instance_id=args.instance_id)
+        intervention_spec = None
+        if args.intervention_file:
+            intervention_spec = json.loads(Path(args.intervention_file).read_text(encoding="utf-8"))
+        elif args.intervene_feature:
+            intervention_spec = {
+                "feature": args.intervene_feature,
+                "action": args.intervene_action,
+                "value": args.intervene_value,
+            }
+
+        run_kwargs = {
+            "trace": trace,
+            "max_api_calls": max_api_calls,
+            "rust_version": rust_version,
+            "require_reproduction": args.require_reproduction,
+            "instance_id": args.instance_id,
+            "dump_pre_fix_dir": args.dump_pre_fix,
+            "replay_pre_fix_dir": args.replay_pre_fix,
+            "intervention": intervention_spec,
+        }
+        if args.single_agent:
+            run_kwargs["multi_agent"] = False
+        patch = run_agent(repo, issue, model, api_key, os.getenv("BASE_URL") or None, **run_kwargs)
         trace.record("patch", patch=patch)
         stage = "prediction"
         prediction = {"instance_id": args.instance_id, "model_name_or_path": f"test__{model}",

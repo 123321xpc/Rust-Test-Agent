@@ -32,6 +32,7 @@ This repository contains the official dataset, evaluation harness, agent framewo
   - [SWE-agent](#swe-agent)
   - [Normal Baseline (LangChain ReAct)](#normal-baseline-langchain-react)
   - [Test Baseline](#test-baseline)
+- [Jifang Development Validation Set](#jifang-development-validation-set)
 - [Reproduction Suites](#-reproduction-suites)
   - [1. Trajectory Replay (`reproduce/reproduction-replay`)](#1-trajectory-replay-reproducereproduction-replay)
   - [2. ACR & Agentless Reproduction (`reproduce/acr-agentless-reproduce`)](#2-acr--agentless-reproduction-reproduceacr-agentless-reproduce)
@@ -81,7 +82,14 @@ Rust-SWE-Bench/
 ├── baselines/                   # Benchmark baseline agent implementations
 │   ├── SWE-agent/               # SWE-agent adapted for Rust projects
 │   ├── normal/                  # LangChain ReAct baseline with cargo tools & diagnostics
-│   └── test/                    # Extended experimental baseline
+│   ├── ACI-impr/                # Experimental ACI improvements (Round 1 baseline)
+│   ├── trace-impr/              # Single-agent tracing & diagnostic baseline (pre-multi-agent)
+│   └── test/                    # Multi-agent Rust repair system
+│
+├── validation/                  # Frozen 10-task Jifang development set and runner
+│   ├── manifest.json            # Selected task IDs, sizes, commits, and image tags
+│   ├── validate                 # Jifang CLI and background launcher
+│   └── README.md                # Detailed usage and selection rules
 │
 ├── reproduce/                   # Experimental reproduction frameworks
 │   ├── reproduction-replay/     # Replays trajectory actions in Docker with output capture
@@ -312,6 +320,33 @@ python baselines/normal/agent.py     --repo /path/to/target_checkout     --insta
 
 An extended variant of the normal baseline used for ongoing experimental optimizations and ablation studies.
 *See [baselines/test/README.md](baselines/test/README.md) for details.*
+
+---
+
+## Jifang Development Validation Set
+
+The fixed [10-task validation set](validation/manifest.json) supports repeated agent development on the Jifang server. It was selected from the 110 locally cached task images with three large, four medium, and three small reference patches. Patch size is the number of added plus deleted lines: small ≤15, medium 16–150, and large >150. These thresholds are operational choices based on scales used in the paper, not a formal difficulty classification. Selection uses a fixed seed, favors distinct repositories, and excludes tasks with evaluation reports found at selection time; the latter does not prove the remaining tasks were never run.
+
+Run the following commands **on Jifang**. The entry point depends on the existing `~/xpc` layout, rootful Docker, the task images, `~/xpc/.env`, and the Windows proxy and SSH reverse tunnel on port `11321`. Check that the Windows proxy is listening and the tunnel is reachable before evaluation.
+
+```bash
+# Inspect the fixed tasks or check prerequisites without calling a model
+~/xpc/validation/validate --agent all --list
+~/xpc/validation/validate --agent all --dry-run
+
+# Generate patches and evaluate all registered agents
+~/xpc/validation/validate --agent normal
+~/xpc/validation/validate --background --agent all
+
+# Restrict a run to one task; --instance may be repeated
+~/xpc/validation/validate --agent test --instance chronotope__chrono-991
+```
+
+`--agent` accepts `swe-agent`, `RustForger`, `normal`, `ACI-impr`, `trace-impr`, `test`, or `all`. `--background` must be the first argument and prints the launcher log path. Use `--max-workers` and `--timeout` to control evaluation concurrency and the per-task test timeout. Runs call the configured model and can incur API costs.
+
+Results are written under `~/xpc/validation/runs/<run_id>/`, including predictions, agent logs, source and image metadata, and `summary.json`. The summary distinguishes resolved, unresolved, no-patch, agent-error, and evaluation-error outcomes. Per-instance harness reports and test output are under `~/xpc/Rust-bench/logs/run_evaluation/`. Updates made in the Windows workspace must first be synchronized to the corresponding server-side agent directories; this runner does not synchronize source code automatically.
+
+See [validation/README.md](validation/README.md) for all commands, exact selection rules, and result paths. Because this set is repeatedly used to guide development, reserve a separate test set for final independent evaluation.
 
 ---
 

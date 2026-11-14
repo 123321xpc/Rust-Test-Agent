@@ -187,3 +187,125 @@ def test_clean_cargo_stderr_strips_progress_lines():
     cleaned = diagnostics.clean_cargo_stderr(raw)
     assert "Compiling libc" not in cleaned
     assert "error: build failed" in cleaned
+
+
+def test_enrich_diagnostic_symbol_lookup(tmp_path):
+    root = tmp_path.resolve()
+    (root / "src").mkdir()
+    (root / "src" / "service.rs").write_text('''
+pub trait Compute {
+    fn calculate(&self) -> i32;
+}
+
+pub struct Engine;
+
+impl Compute for Engine {
+    fn calculate(&self) -> i32 { 42 }
+}
+
+pub(crate) struct InternalWorker;
+''', encoding="utf-8")
+    (root / "src" / "lib.rs").write_text('''
+pub mod service;
+pub use crate::service::Engine;
+''', encoding="utf-8")
+
+    # 1. Test E0599
+    diag_e0599 = [{
+        "level": "error",
+        "code": "E0599",
+        "message": "no method named `calculate` found for struct `Engine` in the current scope",
+    }]
+    diagnostics.enrich_diagnostic_symbol_lookup(diag_e0599, root)
+    assert "auto_lookup" in diag_e0599[0]
+    assert "calculate" in diag_e0599[0]["auto_lookup"]
+    assert "Compute" in diag_e0599[0]["auto_lookup"]
+    assert "src/service.rs" in diag_e0599[0]["auto_lookup"]
+
+    # 2. Test E0412 with pub(crate) notice
+    diag_e0412 = [{
+        "level": "error",
+        "code": "E0412",
+        "message": "cannot find type `InternalWorker` in this scope",
+    }]
+    diagnostics.enrich_diagnostic_symbol_lookup(diag_e0412, root)
+    assert "auto_lookup" in diag_e0412[0]
+    assert "InternalWorker" in diag_e0412[0]["auto_lookup"]
+    assert "pub(crate)" in diag_e0412[0]["auto_lookup"]
+
+    # 3. Test E0277
+    diag_e0277 = [{
+        "level": "error",
+        "code": "E0277",
+        "message": "the trait bound `OtherType: Compute` is not satisfied",
+    }]
+    diagnostics.enrich_diagnostic_symbol_lookup(diag_e0277, root)
+    assert "auto_lookup" in diag_e0277[0]
+    assert "Compute" in diag_e0277[0]["auto_lookup"]
+    assert "src/service.rs" in diag_e0277[0]["auto_lookup"]
+
+
+def test_cargo_check_invokes_symbol_lookup_and_surfaces_machine_applicable(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "diag_ckg"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "helper.rs").write_text("pub struct MyItem;\n", encoding="utf-8")
+    (root / "src" / "lib.rs").write_text("pub mod helper;\npub use crate::helper::MyItem;\nfn f() { let _: MyItem = todo!(); }\n", encoding="utf-8")
+
+    spec_ckg = importlib.util.spec_from_file_location("ckg_for_diag_test", Path(__file__).with_name("rust_ckg.py"))
+    ckg_mod = importlib.util.module_from_spec(spec_ckg)
+    spec_ckg.loader.exec_module(ckg_mod)
+    ckg = ckg_mod.RustCodeGraph(root)
+
+    compiler_json = json.dumps({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "code": {"code": "E0412"},
+            "message": "cannot find type `MyItem` in this scope",
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "line_start": 3,
+                "line_end": 3,
+                "column_start": 17,
+                "column_end": 23,
+                "is_primary": True,
+                "suggested_replacement": "crate::helper::MyItem",
+                "suggestion_applicability": "MachineApplicable",
+            }],
+            "children": [],
+        },
+    })
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(stdout=compiler_json + "\n", stderr="error: aborting", returncode=101)
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", fake_run)
+    check = diagnostics.make_cargo_check_tool(root, lambda path: (root / path).resolve(), ckg=ckg)
+    out = json.loads(check.invoke({}))
+    diag = out["diagnostics"][0]
+    assert "auto_lookup" in diag
+    assert "use diag_ckg::MyItem;" in diag["auto_lookup"]
+    assert diag["machine_applicable_fix"]["replacement"] == "crate::helper::MyItem"
+
+
+
+def test_enrich_diagnostic_symbol_lookup_respects_cache_and_deadline(tmp_path):
+    root = tmp_path.resolve()
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text("pub struct TargetStruct;\n", encoding="utf-8")
+    diags = [
+        {"level": "error", "code": "E0412", "message": "cannot find type `TargetStruct` in this scope"}
+        for _ in range(3)
+    ]
+    shared_cache = {}
+    diagnostics.enrich_diagnostic_symbol_lookup(diags, root, mask_cache=shared_cache, time_budget_sec=5.0)
+    # Identical symbol across repeated diagnostics deduplicates cleanly and populates shared_cache
+    assert "auto_lookup" in diags[0]
+    assert "auto_lookup" not in diags[1]
+    assert shared_cache
+
+    # Zero-second budget exits immediately without scanning
+    diags_timeout = [{"level": "error", "code": "E0412", "message": "cannot find type `TargetStruct` in this scope"}]
+    diagnostics.enrich_diagnostic_symbol_lookup(diags_timeout, root, mask_cache={}, time_budget_sec=-1.0)
+    assert "auto_lookup" not in diags_timeout[0]

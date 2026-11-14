@@ -40,6 +40,37 @@ def _run_test_process(command, cwd, timeout, env):
                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
+
+
+def _extract_project_backtrace(test_output: str) -> str:
+    """Extract and format repository-local frames from a panic stack backtrace."""
+    if "stack backtrace:" not in test_output and "panicked at" not in test_output:
+        return ""
+    lines = test_output.splitlines()
+    in_trace = False
+    project_frames = []
+    current_fn = ""
+    for line in lines:
+        if "stack backtrace:" in line:
+            in_trace = True
+            continue
+        if in_trace:
+            if not line.strip() or line.startswith("test result:"):
+                in_trace = False
+                continue
+            m_fn = re.match(r"^\s*\d+:\s*(.+)$", line)
+            if m_fn:
+                current_fn = m_fn.group(1).strip()
+            elif "at " in line and ("./src/" in line or "src/" in line or "tests/" in line):
+                loc = line.strip().removeprefix("at ")
+                if not any(pkg in loc for pkg in ("/rustc/", "/.cargo/", "/library/core/", "/library/std/", "/library/alloc/")):
+                    frame_desc = f"{loc} (in {current_fn})" if current_fn else loc
+                    if frame_desc not in project_frames:
+                        project_frames.append(frame_desc)
+    if project_frames:
+        return "\n[Panic backtrace in project code]:\n" + "\n".join(f"  -> {f}" for f in project_frames[:8])
+    return ""
+
 def _compact_test_output(test_output: str, limit: int = 16000) -> tuple[str, bool]:
     """Keep failure stdout blocks and panic lines when truncating long test output."""
     if len(test_output) <= limit:
@@ -65,6 +96,39 @@ def _compact_test_output(test_output: str, limit: int = 16000) -> tuple[str, boo
     pinned = "\n\n".join(excerpts)[:pinned_budget]
     remaining = max(0, limit - len(pinned) - len(marker))
     return pinned + marker + test_output[-remaining:], True
+
+
+def _extract_test_failure_details(test_output: str) -> list[dict]:
+    """Extract evidence emitted by libtest, before its output is compacted."""
+    details = []
+    header = re.compile(r"(?m)^---- (.+?) stdout ----\s*$")
+    matches = list(header.finditer(test_output))
+    for index, match in enumerate(matches[:10]):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(test_output)
+        block = test_output[match.end():end]
+        boundary = re.search(r"(?m)^(?:failures:|test result:|running \d+ tests?)\s*", block)
+        if boundary:
+            block = block[:boundary.start()]
+        block = block.strip()
+        actual = re.search(r"(?m)^\s*panic message:\s*(.*)$", block)
+        expected = re.search(r"(?m)^\s*expected substring:\s*(.*)$", block)
+        if expected:
+            kind = "panic_message_mismatch"
+        elif "test did not panic as expected" in block:
+            kind = "expected_panic_not_observed"
+        elif "panicked at" in block:
+            kind = "unexpected_panic"
+        else:
+            kind = "test_failure"
+        entry = {"test": match.group(1), "kind": kind, "output": block[:4000]}
+        if len(block) > 4000:
+            entry["output_truncated"] = True
+        if actual:
+            entry["actual_panic_message"] = actual.group(1).strip()[:2000]
+        if expected:
+            entry["expected_panic_substring"] = expected.group(1).strip()[:2000]
+        details.append(entry)
+    return details
 
 
 def _clean_cargo_stderr(stderr: str, max_chars: int = 2000) -> str:
@@ -176,7 +240,7 @@ def make_cargo_test_tool(
             legacy_keys = (
                 "manifest_path", "package", "test_target", "test_filter",
                 "lib", "bin_target", "tests", "executed", "failures",
-                "returncode", "failed_target",
+                "returncode", "failed_target", "compile_errors",
             )
             try:
                 on_failure(token, **{k: kwargs[k] for k in legacy_keys if k in kwargs})
@@ -239,7 +303,9 @@ def make_cargo_test_tool(
                 command.append("--target=" + target)
             if test_filter:
                 command.append(test_filter)
-            result = _run_test_process(command, cwd=root, timeout=timeout, env=env)
+            test_env = dict(env) if env is not None else os.environ.copy()
+            test_env.setdefault("RUST_BACKTRACE", "1")
+            result = _run_test_process(command, cwd=root, timeout=timeout, env=test_env)
             diagnostics, output = [], []
             for line in result.stdout.splitlines():
                 try:
@@ -252,10 +318,15 @@ def make_cargo_test_tool(
                 elif not isinstance(item, dict) or "reason" not in item:
                     output.append(line)
             test_output = "\n".join(output)
-            failures = re.findall(r"^test (.+?) \.\.\. FAILED\s*$", test_output, re.MULTILINE)
-            passed_tests = re.findall(r"^test (.+?) \.\.\. ok\s*$", test_output, re.MULTILINE)
+            failures = [re.sub(r" - should panic$", "", name) for name in
+                        re.findall(r"^test (.+?) \.\.\. FAILED\s*$", test_output, re.MULTILINE)]
+            failure_details = _extract_test_failure_details(test_output)
+            passed_tests = [re.sub(r" - should panic$", "", name) for name in
+                            re.findall(r"^test (.+?) \.\.\. ok\s*$", test_output, re.MULTILINE)]
             failed_target_match = re.search(r"--test(?:=|\s+)([\w-]+)", result.stderr)
             failed_target = failed_target_match.group(1) if failed_target_match else ""
+            started_counts = re.findall(r"^running (\d+) tests?\s*$", test_output, re.MULTILINE)
+            tests_started = sum(int(c) for c in started_counts)
             counts = re.findall(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", test_output, re.MULTILINE)
             executed = sum(int(passed) + int(failed) for passed, failed, ignored in counts)
             ignored_tests = sum(int(ignored) for _, _, ignored in counts)
@@ -278,6 +349,8 @@ def make_cargo_test_tool(
                     all_features=all_features,
                     no_default_features=no_default_features,
                     target=target,
+                    doc=doc,
+                    executed=executed,
                 )
             else:
                 _invoke_on_failure(
@@ -294,8 +367,14 @@ def make_cargo_test_tool(
                     returncode=result.returncode,
                     failed_target=failed_target,
                     compile_errors=compile_errors,
+                    tests_started=tests_started,
+                    doc=doc,
+                    failure_details=failure_details,
                 )
             compacted_output, output_truncated = _compact_test_output(test_output, 16000)
+            proj_trace = _extract_project_backtrace(test_output)
+            if proj_trace and proj_trace not in compacted_output:
+                compacted_output = compacted_output + "\n" + proj_trace
             kept_diagnostics, omitted_diagnostics = compact_diag(diagnostics)
             if enrich_diagnostics and compile_errors:
                 enrich_diagnostics(kept_diagnostics, root, manifest_dir=manifest.parent)
@@ -324,6 +403,7 @@ def make_cargo_test_tool(
                 "tests_executed": executed,
                 "tests_ignored": ignored_tests,
                 "failed_tests": failures,
+                "failure_details": failure_details,
                 "test_output": compacted_output,
                 "test_output_truncated": output_truncated,
                 "cargo_output": cargo_output,
@@ -333,7 +413,10 @@ def make_cargo_test_tool(
                 payload["diagnostics_omitted"] = omitted_diagnostics
             if on_test_feedback and not no_run:
                 strategy_warning = on_test_feedback(
-                    manifest_path, test_target, result.returncode, failures, executed, compile_errors
+                    manifest_path, test_target, result.returncode, failures, executed, compile_errors,
+                    failure_details=failure_details,
+                    selection={"package": package, "filter": test_filter, "lib": lib,
+                               "bin_target": bin_target, "tests": tests, "doc": doc},
                 )
                 if strategy_warning:
                     payload["strategy_warning"] = strategy_warning

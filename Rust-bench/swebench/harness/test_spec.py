@@ -220,7 +220,26 @@ class TestSpec:
 
     @property
     def eval_script(self):
-        return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + self.eval_script_list) + "\n"
+        commands = list(self.eval_script_list)
+        if os.environ.get("RUSTBENCH_CARGO_CACHE_ROOT"):
+            lock_dir = f"/cargo-cache/lockfiles/{self.instance_id}"
+            restore_locks = [
+                f"if [[ -d {lock_dir} ]]; then while IFS= read -r -d '' cached_lock; do "
+                f"relative=${{cached_lock#{lock_dir}/}}; destination=\"/workspace/$relative\"; "
+                "mkdir -p \"$(dirname \"$destination\")\"; "
+                "cp \"$cached_lock\" \"$destination\"; "
+                f"done < <(find {lock_dir} -type f -name Cargo.lock -print0); fi",
+            ]
+            patch_index = next((i for i, command in enumerate(commands)
+                                if "ERROR: failed to apply test patch" in command), None)
+            if patch_index is not None:
+                commands[patch_index + 1:patch_index + 1] = restore_locks
+            else:
+                workspace_index = next((i for i, command in enumerate(commands)
+                                        if command == "cd /workspace"), -1)
+                commands[workspace_index + 1:workspace_index + 1] = restore_locks
+            commands.insert(0, "export CARGO_NET_OFFLINE=true")
+        return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
         # Don't exit early because we need to revert tests at the end
 
     @property
@@ -424,13 +443,22 @@ def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit
 
     if specs.get("task_rust_version"):
         test_commands.insert(0, f"export RUSTUP_TOOLCHAIN={specs['task_rust_version']}")
-    test_commands = [
-        f"if [[ -f Cargo.lock ]]; then {command.replace('cargo test', 'cargo test --locked')}; "
-        f"else {command}; fi"
-        if "cargo test" in command and "--locked" not in command
-        else command
-        for command in test_commands
-    ]
+    if os.environ.get("RUSTBENCH_CARGO_CACHE_ROOT"):
+        test_commands = [
+            command if "cargo test" not in command or "--frozen" in command
+            else (command.replace("cargo test --locked", "cargo test --frozen")
+                  if "--locked" in command
+                  else command.replace("cargo test", "cargo test --frozen"))
+            for command in test_commands
+        ]
+    else:
+        test_commands = [
+            f"if [[ -f Cargo.lock ]]; then {command.replace('cargo test', 'cargo test --locked')}; "
+            f"else {command}; fi"
+            if "cargo test" in command and "--locked" not in command
+            else command
+            for command in test_commands
+        ]
 
 
     eval_commands = []
@@ -582,13 +610,22 @@ def make_eval_script_list_wo_features(instance, specs, env_name, repo_directory,
 
     if specs.get("task_rust_version"):
         test_commands.insert(0, f"export RUSTUP_TOOLCHAIN={specs['task_rust_version']}")
-    test_commands = [
-        f"if [[ -f Cargo.lock ]]; then {command.replace('cargo test', 'cargo test --locked')}; "
-        f"else {command}; fi"
-        if "cargo test" in command and "--locked" not in command
-        else command
-        for command in test_commands
-    ]
+    if os.environ.get("RUSTBENCH_CARGO_CACHE_ROOT"):
+        test_commands = [
+            command if "cargo test" not in command or "--frozen" in command
+            else (command.replace("cargo test --locked", "cargo test --frozen")
+                  if "--locked" in command
+                  else command.replace("cargo test", "cargo test --frozen"))
+            for command in test_commands
+        ]
+    else:
+        test_commands = [
+            f"if [[ -f Cargo.lock ]]; then {command.replace('cargo test', 'cargo test --locked')}; "
+            f"else {command}; fi"
+            if "cargo test" in command and "--locked" not in command
+            else command
+            for command in test_commands
+        ]
 
 
     eval_commands = []

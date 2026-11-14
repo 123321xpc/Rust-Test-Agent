@@ -68,84 +68,181 @@ PATCH_PATTERN = re.compile(
 )
 PATCH_FILE_PATTERN = re.compile(r"\-\-\-\s+a\/(?:.+)\n\+\+\+\s+b\/(?:.+)")
 PATCH_HUNK_PATTERN = re.compile(
-    r"\@\@\s+\-(\d+),(\d+)\s+\+(\d+),(\d+)\s+\@\@(.+?)(?=diff\ |\-\-\-\ a\/|\@\@\ \-|\Z)",
+    r"\@\@\s+\-(\d+),?(\d*)\s+\+(\d+),?(\d*)\s+\@\@(.+?)(?=diff\ |\-\-\-\ a\/|\@\@\ \-|\Z)",
     re.DOTALL,
 )
 
 
-def get_first_idx(charlist):
-    """Get index of first occurrence of "-" or "+" in charlist"""
-    first_min = charlist.index("-") if "-" in charlist else len(charlist)
-    first_plus = charlist.index("+") if "+" in charlist else len(charlist)
-    return min(first_min, first_plus)
+def _repair_single_file_diff(file_diff: str) -> str:
+    lines = file_diff.splitlines()
+    diff_git_line = None
+    old_file_line = None
+    new_file_line = None
+    meta_lines = []
+    hunks = []
+    current_hunk = []
+    in_hunk = False
 
-
-def get_last_idx(charlist):
-    """Get index of last occurrence of "-" or "+" in charlist"""
-    char_idx = get_first_idx(charlist[::-1])
-    last_idx = len(charlist) - char_idx
-    return last_idx + 1
-
-
-def strip_content(hunk):
-    """Remove trailing non +/- lines and trailing whitespace per line per hunk"""
-    first_chars = list(map(lambda x: None if not len(x) else x[0], hunk.split("\n")))
-    first_idx = get_first_idx(first_chars)
-    last_idx = get_last_idx(first_chars)
-    new_lines = list(map(lambda x: x.rstrip(), hunk.split("\n")[first_idx:last_idx]))
-    new_hunk = "\n" + "\n".join(new_lines) + "\n"
-    return new_hunk, first_idx - 1
-
-
-def get_hunk_stats(pre_start, pre_len, post_start, post_len, hunk, total_delta):
-    """Recalculate hunk start/end position and diff delta"""
-    stats = {"context": 0, "added": 0, "subtracted": 0}
-    hunk = hunk.split("\n", 1)[-1].strip("\n")
-    for line in hunk.split("\n"):
-        if line.startswith("-"):
-            stats["subtracted"] += 1
-        elif line.startswith("+"):
-            stats["added"] += 1
+    for line in lines:
+        if line.startswith("diff --git "):
+            diff_git_line = line
+        elif line.startswith("--- "):
+            old_file_line = line
+        elif line.startswith("+++ "):
+            new_file_line = line
+        elif line.startswith("@@ "):
+            in_hunk = True
+            if current_hunk:
+                hunks.append(current_hunk)
+                current_hunk = []
+            current_hunk.append(line)
+        elif in_hunk:
+            current_hunk.append(line)
         else:
-            stats["context"] += 1
-    context = stats["context"]
-    added = stats["added"]
-    subtracted = stats["subtracted"]
-    pre_len = context + subtracted
-    post_start = pre_start + total_delta
-    post_len = context + added
-    total_delta = total_delta + (post_len - pre_len)
-    return pre_start, pre_len, post_start, post_len, total_delta
+            if not in_hunk:
+                meta_lines.append(line)
+
+    if current_hunk:
+        hunks.append(current_hunk)
+
+    if not hunks:
+        return file_diff
+
+    if not diff_git_line and old_file_line and new_file_line:
+        old_m = re.search(r"---\s+(?:a/)?(.*)", old_file_line)
+        new_m = re.search(r"\+\+\+\s+(?:b/)?(.*)", new_file_line)
+        old_p = old_m.group(1).strip() if old_m else ""
+        new_p = new_m.group(1).strip() if new_m else ""
+        if old_p and new_p:
+            src = old_p if old_p == "/dev/null" else f"a/{old_p}"
+            dst = new_p if new_p == "/dev/null" else f"b/{new_p}"
+            diff_git_line = f"diff --git {src} {dst}"
+
+    repaired_hunks = []
+    total_delta = 0
+    hunk_header_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$")
+
+    for h in hunks:
+        h_head = h[0]
+        h_body = h[1:]
+        m = hunk_header_re.match(h_head)
+        if not m:
+            repaired_hunks.append("\n".join(h))
+            continue
+
+        pre_start = int(m.group(1))
+        trailing_suffix = m.group(5) or ""
+
+        first_mod = None
+        last_mod = None
+        for idx, line in enumerate(h_body):
+            if line.startswith("+") or line.startswith("-"):
+                if first_mod is None:
+                    first_mod = idx
+                last_mod = idx
+
+        if first_mod is None:
+            continue
+
+        ctx_keep = 3
+        start_idx = max(0, first_mod - ctx_keep)
+        end_idx = min(len(h_body), last_mod + ctx_keep + 1)
+        trimmed_body = h_body[start_idx:end_idx]
+
+        ctx_count = 0
+        del_count = 0
+        add_count = 0
+        clean_lines = []
+        for line in trimmed_body:
+            if not line:
+                norm_line = " "
+            elif line[0] in ("+", "-"):
+                norm_line = line
+            elif line.startswith(" "):
+                norm_line = line
+            elif line.startswith("\\ No newline at end of file"):
+                norm_line = line
+            else:
+                norm_line = " " + line
+
+            if norm_line.startswith("-"):
+                del_count += 1
+            elif norm_line.startswith("+"):
+                add_count += 1
+            elif norm_line.startswith(" "):
+                ctx_count += 1
+            clean_lines.append(norm_line.rstrip())
+
+        adj_pre_start = pre_start + start_idx
+        adj_pre_len = ctx_count + del_count
+        adj_post_start = adj_pre_start + total_delta
+        adj_post_len = ctx_count + add_count
+        total_delta += (adj_post_len - adj_pre_len)
+
+        new_head = f"@@ -{adj_pre_start},{adj_pre_len} +{adj_post_start},{adj_post_len} @@{trailing_suffix}"
+        repaired_hunks.append(new_head + "\n" + "\n".join(clean_lines))
+
+    if not repaired_hunks:
+        return file_diff
+
+    out = []
+    if diff_git_line:
+        out.append(diff_git_line)
+    for mline in meta_lines:
+        if mline.startswith(("old mode", "new mode", "deleted file mode", "new file mode", "index ")):
+            out.append(mline)
+    if old_file_line:
+        out.append(old_file_line)
+    if new_file_line:
+        out.append(new_file_line)
+    out.extend(repaired_hunks)
+    return "\n".join(out)
 
 
-def extract_minimal_patch(model_patch):
-    """
-    Wrapper function that takes hunk and
-    * Removes trailing non +/- lines and trailing whitespace per line per hunk
-    * Recalculates hunk start/end position and diff delta
-    * Returns new patch
-    """
-    model_patch = model_patch.lstrip("\n")
-    new_patch = ""
-    for patch in PATCH_PATTERN.findall(model_patch):
-        total_delta = 0
-        patch_header = PATCH_FILE_PATTERN.findall(patch)[0]
-        if patch_header:
-            new_patch += patch_header + "\n"
-        for hunk in PATCH_HUNK_PATTERN.findall(patch):
-            pre_start, pre_len, post_start, post_len, content = hunk
-            pre_start, pre_len, post_start, post_len, content = list(
-                map(lambda x: int(x) if x.isnumeric() else x, hunk)
-            )
-            content, adjust_pre_start = strip_content(content)
-            pre_start += adjust_pre_start
-            pre_start, pre_len, post_start, post_len, total_delta = get_hunk_stats(
-                pre_start, pre_len, post_start, post_len, content, total_delta
-            )
-            new_patch += (
-                f"@@ -{pre_start},{pre_len} +{post_start},{post_len} @@{content}"
-            )
-    return new_patch
+def extract_minimal_patch(model_patch: str) -> str:
+    if not model_patch or not model_patch.strip():
+        return ""
+
+    text = model_patch.replace("\r\n", "\n")
+
+    # Extract diff within markdown fences if present
+    md_matches = re.findall(r"```(?:diff|patch)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if md_matches:
+        text = "\n".join(md_matches)
+
+    # Locate diff start, dropping conversational prefix
+    start_match = re.search(r"(?m)^(?:diff --git|--- (?:a/|/dev/null))", text)
+    if start_match:
+        text = text[start_match.start():]
+
+    lines = text.splitlines()
+    diff_blocks = []
+    current_block = []
+
+    for line in lines:
+        is_file_start = (
+            line.startswith("diff --git ") or
+            ((line.startswith("--- a/") or line.startswith("--- /dev/null")) and
+             (not current_block or any(l.startswith("+++ b/") or l.startswith("+++ /dev/null") for l in current_block)))
+        )
+        if is_file_start and current_block:
+            diff_blocks.append("\n".join(current_block))
+            current_block = []
+        current_block.append(line)
+
+    if current_block:
+        diff_blocks.append("\n".join(current_block))
+
+    repaired_files = []
+    for block in diff_blocks:
+        repaired = _repair_single_file_diff(block)
+        if repaired:
+            repaired_files.append(repaired)
+
+    if not repaired_files:
+        return model_patch
+
+    return "\n".join(repaired_files).rstrip() + "\n"
 
 
 def has_attribute_or_import_error(log_before):

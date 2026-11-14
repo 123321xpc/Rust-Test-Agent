@@ -34,9 +34,10 @@ from swebench.harness.docker_build import (
     close_logger,
     setup_logger,
 )
-from swebench.harness.grading import get_eval_report
+from swebench.harness.grading import get_eval_report, classify_detailed_status
+from swebench.harness.constants import DetailedResolvedStatus
 from swebench.harness.test_spec import make_test_spec, TestSpec, make_nightly_test_spec, make_test_spec_wo_features, make_test_spec_nightly_wo_feature
-from swebench.harness.utils import load_swebench_dataset, str2bool
+from swebench.harness.utils import load_swebench_dataset, str2bool, extract_minimal_patch
 
 
 class EvaluationError(Exception):
@@ -120,32 +121,84 @@ def run_instance(
         )
         copy_to_container(container, patch_file, Path("/tmp/patch.diff"))
 
-        # Attempt to apply patch to container
+        # Attempt to apply patch to container with tiered repair fallback
+        # Tier 1: Exact git apply
         val = container.exec_run(
             "git apply -v /tmp/patch.diff",
             workdir="/testbed",
             user="root",
         )
+        apply_method = "git apply (exact)"
+
+        # Tier 2: Git apply with whitespace tolerance and hunk recounting
         if val.exit_code != 0:
-            logger.info(f"Failed to apply patch to container, trying again...")
-            
-            # try "patch --batch --fuzz=5 -p1 -i {patch_path}" to try again
+            logger.info("Exact git apply failed, trying git apply with --ignore-whitespace --recount...")
+            val = container.exec_run(
+                "git apply --ignore-whitespace --recount -v /tmp/patch.diff",
+                workdir="/testbed",
+                user="root",
+            )
+            apply_method = "git apply (--ignore-whitespace --recount)"
+
+        # Tier 3: Automatic patch repair (extract_minimal_patch: stripping redundant context and recounting headers)
+        if val.exit_code != 0:
+            logger.info("Recount git apply failed, attempting automatic patch correction (extract_minimal_patch)...")
+            try:
+                repaired_patch = extract_minimal_patch(model_patch)
+            except Exception as e_repair:
+                logger.warning(f"Error during extract_minimal_patch: {e_repair}")
+                repaired_patch = ""
+
+            if repaired_patch and repaired_patch.strip() and repaired_patch.strip() != model_patch.strip():
+                repaired_file = Path(log_dir / "patch_repaired.diff")
+                repaired_file.write_text(repaired_patch, encoding="utf-8", newline="\n")
+                copy_to_container(container, repaired_file, Path("/tmp/patch_repaired.diff"))
+
+                logger.info("Applying auto-repaired patch with git apply...")
+                val = container.exec_run(
+                    "git apply -v /tmp/patch_repaired.diff",
+                    workdir="/testbed",
+                    user="root",
+                )
+                apply_method = "git apply (auto-repaired patch)"
+
+                if val.exit_code != 0:
+                    val = container.exec_run(
+                        "git apply --ignore-whitespace --recount -v /tmp/patch_repaired.diff",
+                        workdir="/testbed",
+                        user="root",
+                    )
+                    apply_method = "git apply (auto-repaired patch with recount)"
+
+        # Tier 4: Fallback to GNU patch with fuzz matching (tolerant to line drifts)
+        if val.exit_code != 0:
+            logger.info("Git apply steps failed, trying GNU patch --batch --fuzz=5 fallback...")
             val = container.exec_run(
                 "patch --batch --fuzz=5 -p1 -i /tmp/patch.diff",
                 workdir="/testbed",
                 user="root",
             )
-            if val.exit_code != 0:
-                logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode('utf-8')}")
-                raise EvaluationError(
-                    instance_id,
-                    f"{APPLY_PATCH_FAIL}:\n{val.output.decode('utf-8')}",
-                    logger,
+            apply_method = "patch --batch --fuzz=5"
+
+            # If original patch fails with fuzz, also try repaired patch with fuzz if available
+            if val.exit_code != 0 and (log_dir / "patch_repaired.diff").exists():
+                logger.info("Trying GNU patch --batch --fuzz=5 on auto-repaired patch...")
+                val = container.exec_run(
+                    "patch --batch --fuzz=5 -p1 -i /tmp/patch_repaired.diff",
+                    workdir="/testbed",
+                    user="root",
                 )
-            else:
-                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode('utf-8')}")
+                apply_method = "patch --batch --fuzz=5 (auto-repaired patch)"
+
+        if val.exit_code != 0:
+            logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode('utf-8')}")
+            raise EvaluationError(
+                instance_id,
+                f"{APPLY_PATCH_FAIL}:\n{val.output.decode('utf-8')}",
+                logger,
+            )
         else:
-            logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode('utf-8')}")
+            logger.info(f"{APPLY_PATCH_PASS} via {apply_method}:\n{val.output.decode('utf-8')}")
 
         # Get git diff before running eval script
         git_diff_output_before = (
@@ -438,14 +491,18 @@ def make_run_report(
     unremoved_images = set()
     unresolved_ids = set()
     incomplete_ids = set()
-    # get instances with empty patches
     empty_patch_ids = set()
+    # Fine-grained outcomes according to SWE-bench Appendix C.5 (Table 22)
+    breaking_resolved_ids = set()
+    partially_resolved_ids = set()
+    work_in_progress_ids = set()
+    no_op_ids = set()
+    regression_ids = set()
 
     # iterate through dataset and check if the instance has been run
     for instance in full_dataset:
         instance_id = instance[KEY_INSTANCE_ID]
         if instance_id not in predictions:
-            # skip instances without 
             incomplete_ids.add(instance_id)
             continue
         prediction = predictions[instance_id]
@@ -460,7 +517,6 @@ def make_run_report(
             / "report.json"
         )
         if report_file.exists():
-            # If report file exists, then the instance has been run
             report = json.loads(report_file.read_text())
             instance_report = report[instance_id]
             if "error" in instance_report:
@@ -469,13 +525,30 @@ def make_run_report(
                 completed_ids.add(instance_id)
             if instance_report.get("error"):
                 continue
-            if instance_report["resolved"]:
-                # Record if the instance was resolved
+            # Classify into 6 detailed outcomes
+            d_status = instance_report.get("detailed_status")
+            if not d_status:
+                d_status = classify_detailed_status(
+                    instance_report.get("tests_status", {}),
+                    patch_successfully_applied=instance_report.get("patch_successfully_applied", False),
+                    patch_exists=instance_report.get("patch_exists", True),
+                )
+
+            if instance_report.get("resolved") or d_status == DetailedResolvedStatus.RESOLVED.value:
                 resolved_ids.add(instance_id)
             else:
                 unresolved_ids.add(instance_id)
+                if d_status == DetailedResolvedStatus.BREAKING_RESOLVED.value:
+                    breaking_resolved_ids.add(instance_id)
+                elif d_status == DetailedResolvedStatus.PARTIALLY_RESOLVED.value:
+                    partially_resolved_ids.add(instance_id)
+                elif d_status == DetailedResolvedStatus.WORK_IN_PROGRESS.value:
+                    work_in_progress_ids.add(instance_id)
+                elif d_status == DetailedResolvedStatus.NO_OP.value:
+                    no_op_ids.add(instance_id)
+                elif d_status == DetailedResolvedStatus.REGRESSION.value:
+                    regression_ids.add(instance_id)
         else:
-            # Otherwise, the instance was not run successfully
             error_ids.add(instance_id)
 
     dataset_ids = {i[KEY_INSTANCE_ID] for i in full_dataset}
@@ -485,6 +558,11 @@ def make_run_report(
     print(f"Instances incomplete: {len(incomplete_ids)}")
     print(f"Instances resolved: {len(resolved_ids)}")
     print(f"Instances unresolved: {len(unresolved_ids)}")
+    print(f"  - Breaking Resolved: {len(breaking_resolved_ids)}")
+    print(f"  - Partially Resolved: {len(partially_resolved_ids)}")
+    print(f"  - Work in Progress: {len(work_in_progress_ids)}")
+    print(f"  - No-Op: {len(no_op_ids)}")
+    print(f"  - Regression: {len(regression_ids)}")
     print(f"Instances with empty patches: {len(empty_patch_ids)}")
     print(f"Instances with errors: {len(error_ids)}")
     print(f"Unstopped containers: {len(unstopped_containers)}")
@@ -497,6 +575,11 @@ def make_run_report(
         "completed_instances": len(completed_ids),
         "resolved_instances": len(resolved_ids),
         "unresolved_instances": len(unresolved_ids),
+        "breaking_resolved_instances": len(breaking_resolved_ids),
+        "partially_resolved_instances": len(partially_resolved_ids),
+        "work_in_progress_instances": len(work_in_progress_ids),
+        "no_op_instances": len(no_op_ids),
+        "regression_instances": len(regression_ids),
         "empty_patch_instances": len(empty_patch_ids),
         "error_instances": len(error_ids),
         "unstopped_instances": len(unstopped_containers),
@@ -506,6 +589,11 @@ def make_run_report(
         "submitted_ids": list(sorted(predictions.keys())),
         "resolved_ids": list(sorted(resolved_ids)),
         "unresolved_ids": list(sorted(unresolved_ids)),
+        "breaking_resolved_ids": list(sorted(breaking_resolved_ids)),
+        "partially_resolved_ids": list(sorted(partially_resolved_ids)),
+        "work_in_progress_ids": list(sorted(work_in_progress_ids)),
+        "no_op_ids": list(sorted(no_op_ids)),
+        "regression_ids": list(sorted(regression_ids)),
         "error_ids": list(sorted(error_ids)),
         "unstopped_containers": list(sorted(unstopped_containers)),
         "unremoved_images": list(sorted(unremoved_images)),

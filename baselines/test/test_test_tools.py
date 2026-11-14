@@ -28,7 +28,7 @@ def test_edits_produce_applicable_complete_patch_without_mutating_checkout(norma
     repo, tools, state = normal
     assert set(tools) == {"read_file", "write_file", "write_regression_test", "edit_file", "revert_file",
                           "checkpoint", "generate_patch", "read_lines", "search_code", "cargo_workspace",
-                          "cargo_check", "cargo_test", "rust_symbols", "rust_error_explain"}
+                          "cargo_check", "cargo_test", "rust_symbols", "inspect_rust_neighborhood", "rust_error_explain", "rust_trace"}
     write = tools["write_file"]
     write.invoke({"path": "edit.rs", "content": "intermediate\n"})
     write.invoke({"path": "edit.rs", "content": "after\n"})
@@ -847,5 +847,422 @@ def test_init_symlinks_cargo_directory_without_recursive_copy(tmp_path):
         assert (dest_cargo / "config").read_text(encoding="utf-8") == "config_data\n"
         # vendor_dir was symlinked if OS permitted, or present
         assert (dest_cargo / "vendor_dir" / "pkg").exists()
+    finally:
+        state.close()
+
+
+def test_rust_syntax_guardrail_rejects_unbalanced_braces_and_e0753(normal):
+    repo, tools, state = normal
+    # Unbalanced closing brace
+    bad_brace = "pub fn broken() {\n    let x = 1;\n"
+    res = tools["write_file"].invoke({"path": "src/broken.rs", "content": bad_brace})
+    assert "Syntax guardrail error" in res
+    assert "unclosed opening delimiter '{'" in res
+
+    # Extra closing brace
+    extra_close = "pub fn broken() {\n    let x = 1;\n}}\n"
+    res2 = tools["write_file"].invoke({"path": "src/broken2.rs", "content": extra_close})
+    assert "Syntax guardrail error" in res2
+    assert "unexpected closing delimiter '}'" in res2
+
+    # E0753: inner doc comment after code item
+    e0753_code = "use std::collections::HashMap;\n//! Inner doc after use\npub fn ok() {}\n"
+    res3 = tools["write_file"].invoke({"path": "src/e0753.rs", "content": e0753_code})
+    assert "Syntax guardrail error" in res3
+    assert "E0753" in res3
+
+
+def test_edit_file_provides_region_hint_on_missing_old_text(normal):
+    repo, tools, state = normal
+    tools["write_file"].invoke({"path": "src/hint.rs", "content": "fn one() {\n    let a = 1;\n    let b = 2;\n}\n"})
+    out = tools["edit_file"].invoke({"path": "src/hint.rs", "old_text": "let missing = 0;", "new_text": "let c = 3;", "start_line": 2, "end_line": 3})
+    assert "old_text was not found" in out
+    assert "Region hint" in out
+    assert "let a = 1;" in out
+
+
+def test_generate_patch_submit_flag_one_step(normal):
+    repo, tools, state = normal
+    tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn val() -> i32 { 42 }\n"})
+    tools["write_regression_test"].invoke({"path": "tests/test_regression_v.rs", "content": "test"})
+    state.pass_test(state.start_test(), test_target="test_regression_v")
+    state.pass_test(state.start_test())
+
+    # submit=True with paths=None
+    patch = tools["generate_patch"].invoke({"submit": True})
+    assert state.patch == patch
+    assert "+pub fn val() -> i32 { 42 }" in patch
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo is not installed")
+def test_in_module_ephemeral_regression_test_lifecycle(tmp_path):
+    repo = tmp_path / "in_mod_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "in_mod_test"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text("fn secret_calc() -> i32 { 10 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_in_mod", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    tools, state = m.make_tools(repo, require_reproduction=True)
+    tool_map = {t.name: t for t in tools}
+
+    # 1. Mount in-module regression test testing private fn
+    res = tool_map["write_regression_test"].invoke({
+        "path": "test_regression_secret",
+        "target_src": "src/lib.rs",
+        "content": "#[test] fn test_secret() { assert_eq!(secret_calc(), 20); }\n",
+        "run_now": True,
+    })
+    assert "Mounted temporary in-module regression test" in res
+    assert "[Auto-run result for __test_regression_secret]" in res
+
+    # 2. Check that working copy contains the test block but changed_paths() does not count it as prod change
+    cur_text = (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
+    assert "// __TEST_REGRESSION_START: __test_regression_secret__" in cur_text
+    assert "mod __test_regression_secret" in cur_text
+    assert state.changed_paths() == []
+
+    # 3. Agent fixes production code: 10 -> 20
+    tool_map["edit_file"].invoke({"path": "src/lib.rs", "old_text": "10", "new_text": "20"})
+    assert "src/lib.rs" in [p.as_posix() for p in state.changed_paths()]
+
+    # 4. Run cargo test --lib to pass the test
+    pass_res = json.loads(tool_map["cargo_test"].invoke({"lib": True, "test_filter": "__test_regression_secret"}))
+    assert pass_res["status"] == "passed"
+    assert state.verified()
+
+    # 5. Generate patch: verify test block is completely stripped from submitted patch!
+    patch = tool_map["generate_patch"].invoke({"submit": True})
+    assert "secret_calc() -> i32 { 20 }" in patch
+    assert "__TEST_REGRESSION_START" not in patch
+    assert "mod __test_regression_secret" not in patch
+
+    # 6. Revert file: verify file is restored cleanly
+    tool_map["revert_file"].invoke({"path": "src/lib.rs"})
+    reverted_text = (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
+    assert "__TEST_REGRESSION_START" not in reverted_text
+    assert "fn secret_calc() -> i32 { 10 }" in reverted_text
+
+
+def test_package_manifest_scan_handles_arrays_before_name(tmp_path):
+    repo = tmp_path / "pkg_array_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('''[package]
+authors = ["alice <alice@example.com>"]
+categories = ["science"]
+name = "array_pkg"
+version = "0.1.0"
+edition = "2021"
+''', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text("pub fn test() {}\\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_array_pkg", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    tools, state = m.make_tools(repo)
+    found = state._get_package_manifest("array_pkg")
+    assert found is not None
+    assert found.name == "Cargo.toml"
+
+
+def test_lockfile_modification_is_prohibited(tmp_path):
+    repo = tmp_path / "lock_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\\nname = "lock_test"\\nversion = "0.1.0"\\nedition = "2021"\\n', encoding="utf-8")
+    (repo / "Cargo.lock").write_text("# lock content\\n", encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text("pub fn f() {}\\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_lock", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    res = tools["write_file"].invoke({"path": "Cargo.lock", "content": "corrupted lock"})
+    assert "Modifying Cargo.lock is prohibited" in res
+
+
+def test_diff_hygiene_and_stuck_reset(tmp_path):
+    repo = tmp_path / "hygiene_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "hygiene"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text("pub fn compute(x: i32) -> i32 { x }\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("tools_hygiene", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub fn compute(x: i32) -> i32 { x }",
+            "new_text": "pub fn compute(x: i32) -> i32 { dbg!(x) }",
+        })
+        rep = state.diff_hygiene_report()
+        assert rep["added_dbg_lines"]
+        state.record_check_result(101, [{"level": "error", "code": "E0308", "message": "bad", "spans": [{"file_name": "src/lib.rs"}]}])
+        state.invalidate_write()
+        state.record_check_result(101, [{"level": "error", "code": "E0308", "message": "bad", "spans": [{"file_name": "src/lib.rs"}]}])
+        assert state.stuck_status()["compile_repeats"] == 2
+        state.reset_stuck_counters()
+        assert state.stuck_status()["compile_repeats"] == 0
+    finally:
+        state.close()
+
+
+def test_fail_test_preserves_clean_red_on_dirty_checkout_and_bin_target_in_module(tmp_path):
+    repo = tmp_path / "bin_red_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "mybin"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "main.rs").write_text("fn helper() -> i32 { 0 }\nfn main() {}\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_bin_red", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["write_regression_test"].invoke({
+            "path": "src/main.rs",
+            "target_src": "src/main.rs",
+            "content": "#[test] fn check_helper() { assert_eq!(helper(), 1); }",
+        })
+        # Clean Red fails at runtime via bin_target
+        state.fail_test(
+            state.start_test(),
+            bin_target="mybin",
+            test_filter="__test_regression_main",
+            executed=1,
+            failures=["__test_regression_main::check_helper"],
+            returncode=101,
+        )
+        assert state.reproduced_cleanly()
+
+        # Fixer edits src/main.rs; a transient compile/Cargo error (executed=0) must NOT erase clean Red
+        tools["edit_file"].invoke({
+            "path": "src/main.rs",
+            "old_text": "fn helper() -> i32 { 0 }",
+            "new_text": "fn helper() -> i32 { 1 }",
+        })
+        state.fail_test(
+            state.start_test(),
+            bin_target="mybin",
+            test_filter="check_helper",
+            executed=0,
+            failures=[],
+            returncode=101,
+        )
+        assert state.reproduced_cleanly()
+
+        # Passing via bin_target + inner test_filter marks the in-module regression test verified!
+        state.pass_test(
+            state.start_test(),
+            bin_target="mybin",
+            test_filter="check_helper",
+            passed_tests=["__test_regression_main::check_helper"],
+        )
+        assert state.verified()
+
+        # Callable _submit_hint_override uses truthful state
+        state._submit_hint_override = lambda st, rem: "custom pending" if not st.verified() else "custom ready"
+        state.set_budget(SimpleNamespace(max_calls=20, remaining_calls=5), warning_threshold=6)
+        assert "custom ready" in state.budget_notice()
+    finally:
+        state.close()
+
+
+
+def test_restore_snapshot_preserves_existing_test_failures(tmp_path):
+    repo = tmp_path / "snap_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "snap"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text("pub fn f() -> i32 { 0 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_snap", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "0", "new_text": "1"})
+        state.fail_test(state.start_test(), test_target="existing_t", executed=1, failures=["old_case"], returncode=101)
+        assert state._existing_test_failures
+        state.save_checkpoint("with_fail")
+        state._existing_test_failures = []
+        state.restore_checkpoint("with_fail")
+        assert len(state._existing_test_failures) == 1
+        assert state._existing_test_failures[0]["failures"] == ["old_case"]
+    finally:
+        state.close()
+
+
+def test_failure_evidence_survives_checkpoint_and_unrelated_success(normal, tmp_path):
+    _, _, state = normal
+    detail = {"test": "check_message", "kind": "panic_message_mismatch",
+              "actual_panic_message": "actual visible text", "expected_panic_substring": "expected visible text"}
+    scope = {"package": "", "filter": "", "lib": False, "bin_target": "", "tests": False, "doc": False}
+    state.record_test_result("Cargo.toml", "visible", 101, ["check_message"], 1, [],
+                             failure_details=[detail], selection=scope)
+    state.dump_checkpoint_dir(tmp_path / "checkpoint")
+    state.record_test_result("Cargo.toml", "other", 0, [], 1, [], selection=scope)
+    assert state.stuck_status()["last_test_failure"]["failure_details"] == [detail]
+    state.record_test_result("Cargo.toml", "visible", 0, [], 1, [], selection=scope)
+    assert not state.stuck_status()["last_test_failure"]
+    state.load_checkpoint_dir(tmp_path / "checkpoint")
+    assert state.stuck_status()["last_test_failure"]["failure_details"] == [detail]
+
+
+def test_write_regression_test_rejects_virtual_workspace_and_rolls_back_missing_target(tmp_path, monkeypatch):
+    repo = tmp_path / "ws_reg_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/sub"]\n', encoding="utf-8")
+    (repo / "crates" / "sub" / "src").mkdir(parents=True)
+    (repo / "crates" / "sub" / "Cargo.toml").write_text('[package]\nname = "sub_pkg"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "crates" / "sub" / "src" / "lib.rs").write_text("pub fn ok() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_ws_reg", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        err = tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_root.rs",
+            "content": "#[test] fn t() {}\n",
+            "run_now": False,
+        })
+        assert "virtual Cargo [workspace]" in err
+        assert "crates/sub/tests/test_regression_root.rs" in err
+        assert not (state.root / "tests" / "test_regression_root.rs").exists()
+        assert state.get_regression_targets() == {}
+
+        # If a standalone test inside a crate fails with "no test target named", run_now=True rolls it back
+        import os
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **kw: SimpleNamespace(
+                returncode=101,
+                stdout="",
+                stderr="error: no test target named `test_regression_ghost`",
+            ),
+        )
+        out = tools["write_regression_test"].invoke({
+            "path": "crates/sub/tests/test_regression_ghost.rs",
+            "content": "#[test] fn t() {}\n",
+            "run_now": True,
+        })
+        assert "was not kept" in out
+        assert not (state.root / "crates" / "sub" / "tests" / "test_regression_ghost.rs").exists()
+        assert state.get_regression_targets() == {}
+    finally:
+        state.close()
+
+
+def test_non_rs_template_edit_touches_crate_entry_mtime_and_hygiene_flags_scratch(tmp_path):
+    import os
+    repo = tmp_path / "tpl_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "tpl_pkg"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "lib.rs").write_text('pub fn tpl() -> &\'static str { include_str!("../templates/msg.txt") }\n', encoding="utf-8")
+    (repo / "templates").mkdir()
+    (repo / "templates" / "msg.txt").write_text("hello\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_tpl", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    try:
+        lib_rs = state.root / "src" / "lib.rs"
+        os.utime(lib_rs, (1_000_000, 1_000_000))
+        tools["edit_file"].invoke({"path": "templates/msg.txt", "old_text": "hello", "new_text": "world"})
+        assert lib_rs.stat().st_mtime > 1_000_000
+        assert [p.as_posix() for p in state.changed_paths()] == ["templates/msg.txt"]
+
+        tools["write_file"].invoke({"path": "_splice_snaps.py", "content": "print(1)\n"})
+        rep = state.diff_hygiene_report()
+        assert "_splice_snaps.py" in rep["scratch_files"]
+    finally:
+        state.close()
+
+
+
+def test_bin_only_in_module_verification_aborted_red_and_snapshot_red_preservation(tmp_path):
+    repo = tmp_path / "bin_only_repo"
+    repo.mkdir()
+    (repo / "Cargo.toml").write_text(
+        '[package]\nauthors = ["a"]\nname = "mycli"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (repo / "src").mkdir()
+    (repo / "src" / "main.rs").write_text("fn run() -> i32 { 0 }\nfn main() {}\n", encoding="utf-8")
+    (repo / "src" / "other.rs").write_text("pub fn helper() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_bin_only", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True, post_strip_check=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["write_regression_test"].invoke({
+            "path": "test_regression_cli",
+            "target_src": "src/other.rs",
+            "content": "#[test] fn t() { assert_eq!(helper(), 2); }",
+        })
+        missing_msg = state.missing_verification_steps()
+        assert "bin_target='mycli'" in missing_msg
+        assert "lib=True" not in missing_msg
+
+        # Moving the same regression module name to src/main.rs strips the stale block from src/other.rs
+        tools["write_regression_test"].invoke({
+            "path": "test_regression_cli",
+            "target_src": "src/main.rs",
+            "content": "#[test] fn t() { assert_eq!(run(), 1); }",
+        })
+        assert "__TEST_REGRESSION_START" not in (state.root / "src" / "other.rs").read_text(encoding="utf-8")
+        assert len(state.get_regression_targets()) == 1
+
+        # Guard against copying compression placeholders or editing ephemeral test blocks directly
+        bad_wrt = tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_bad.rs",
+            "content": "fn x() {\n... [earlier write omitted (10 lines)] ...\n}",
+        })
+        assert "history-compression omission placeholder" in bad_wrt
+        bad_edit = tools["edit_file"].invoke({
+            "path": "src/main.rs",
+            "old_text": "assert_eq!(run(), 1);",
+            "new_text": "assert_eq!(run(), 2);",
+        })
+        assert "Do not modify temporary '// __TEST_REGRESSION_START' blocks via edit_file" in bad_edit
+
+        # Save pre_fix, edit source, save fix, restore pre_fix, reproduce Red via tests_started=1 & exit_code=1, restore fix
+        state.save_checkpoint("pre_fix")
+        tools["edit_file"].invoke({"path": "src/main.rs", "old_text": "fn run() -> i32 { 0 }", "new_text": "fn run() -> i32 { 1 }"})
+        state.save_checkpoint("fix")
+        state.restore_checkpoint("pre_fix")
+        state.fail_test(
+            state.start_test(),
+            bin_target="mycli",
+            test_filter="t",
+            executed=0,
+            tests_started=1,
+            failures=[],
+            returncode=1,
+        )
+        assert state.reproduced_cleanly()
+        state.restore_checkpoint("fix")
+        assert state.reproduced_cleanly()
     finally:
         state.close()

@@ -38,3 +38,11 @@ test_single.py
 test_b64.txt
 test.b64
 extracted_paper_text.txt
+
+# Backup files
+*.bak
+
+# Local course material (unrelated)
+_material_extract/
+组合数学期末复习总结.docx
+_docx_render/

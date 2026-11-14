@@ -137,3 +137,49 @@ class TraceHTTPClient(httpx.Client):
             self.recorder.record('api_response', request_id=request_id, status=response.status_code,
                                  body=_body(response.content))
         return response
+
+
+class RoleTraceCallback(BaseCallbackHandler):
+    """Forward LangChain callback events to TraceRecorder tagged with agent_role."""
+
+    raise_error = True
+    run_inline = True
+
+    def __init__(self, recorder: TraceRecorder, role: str, attempt: int = 1):
+        self.recorder = recorder
+        self.role = role
+        self.attempt = attempt
+
+    def on_chat_model_start(self, serialized, messages, *, run_id, parent_run_id=None, **kwargs):
+        self.recorder.record(
+            'model_start',
+            agent_role=self.role,
+            attempt=self.attempt,
+            run_id=str(run_id),
+            parent_run_id=str(parent_run_id) if parent_run_id else None,
+            messages=messages,
+            invocation_params=kwargs.get('invocation_params', {}),
+        )
+
+    def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs):
+        self.recorder.record('model_end', agent_role=self.role, attempt=self.attempt, run_id=str(run_id), response=response)
+
+    def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        self.recorder.record('model_error', agent_role=self.role, attempt=self.attempt, run_id=str(run_id), error=str(error))
+
+    def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, inputs=None, **kwargs):
+        self.recorder.record(
+            'tool_start',
+            agent_role=self.role,
+            attempt=self.attempt,
+            run_id=str(run_id),
+            parent_run_id=str(parent_run_id) if parent_run_id else None,
+            tool=serialized.get('name'),
+            input=inputs if inputs is not None else input_str,
+        )
+
+    def on_tool_end(self, output, *, run_id, parent_run_id=None, **kwargs):
+        self.recorder.record('tool_end', agent_role=self.role, attempt=self.attempt, run_id=str(run_id), output=output)
+
+    def on_tool_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        self.recorder.record('tool_error', agent_role=self.role, attempt=self.attempt, run_id=str(run_id), error=str(error))

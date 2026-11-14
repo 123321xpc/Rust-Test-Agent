@@ -76,6 +76,17 @@ class ResolvedStatus(Enum):
     FULL = "RESOLVED_FULL"
 
 
+class DetailedResolvedStatus(Enum):
+    RESOLVED = "Resolved"
+    BREAKING_RESOLVED = "Breaking Resolved"
+    PARTIALLY_RESOLVED = "Partially Resolved"
+    WORK_IN_PROGRESS = "Work in Progress"
+    NO_OP = "No-Op"
+    REGRESSION = "Regression"
+    PATCH_APPLY_FAIL = "Patch Apply Fail"
+    EMPTY_PATCH = "Empty Patch"
+
+
 class TestStatus(Enum):
     FAILED = "FAILED"
     PASSED = "PASSED"

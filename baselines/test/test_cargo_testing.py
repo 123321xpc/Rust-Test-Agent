@@ -102,6 +102,45 @@ def test_long_output_preserves_early_failure_details(project, monkeypatch):
     assert "passing_case_1199" in result["test_output"]
 
 
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo is not installed")
+def test_visible_should_panic_mismatch_reports_expected_and_actual(project):
+    root, tool = project
+    (root / "tests" / "panic_case.rs").write_text(
+        '#[test]\n#[should_panic(expected = "visible expected text")]\n'
+        'fn checks_message() { panic!("observed message"); }\n', encoding="utf-8"
+    )
+    result = json.loads(tool.invoke({"test_target": "panic_case"}))
+    assert result["failed_tests"] == ["checks_message"]
+    detail = result["failure_details"][0]
+    assert detail["test"] == "checks_message"
+    assert detail["kind"] == "panic_message_mismatch"
+    assert "observed message" in detail["actual_panic_message"]
+    assert "visible expected text" in detail["expected_panic_substring"]
+
+
+def test_failure_details_survive_output_compaction_and_keep_test_boundaries(project, monkeypatch):
+    _, tool = project
+    stdout = (
+        'running 2 tests\ntest one ... FAILED\ntest two ... FAILED\nfailures:\n\n'
+        '---- one stdout ----\nthread \'one\' panicked at \'first actual\'\n'
+        'note: panic did not contain expected string\n panic message: `first actual`\n'
+        ' expected substring: `first expected`\n\n'
+        '---- two stdout ----\nnote: test did not panic as expected\n\n'
+        'failures:\n    one\n    two\n'
+        'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n'
+        + 'noise\n' * 6000
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a[0], 101, stdout, ""))
+    result = json.loads(tool.invoke({}))
+    assert result["test_output_truncated"]
+    first, second = result["failure_details"]
+    assert first["kind"] == "panic_message_mismatch"
+    assert "first expected" in first["expected_panic_substring"]
+    assert "first actual" in first["actual_panic_message"]
+    assert "two stdout" not in first["output"]
+    assert second["kind"] == "expected_panic_not_observed"
+
+
 def test_cargo_test_tests_flag_and_mutex(project, monkeypatch):
     _, tool = project
     calls = []
@@ -229,3 +268,41 @@ def test_cargo_test_supports_doc_flag_and_mutex(project, monkeypatch):
     assert "--doc" in calls[0]
     assert json.loads(tool.invoke({"doc": True, "tests": True}))["status"] == "error"
     assert json.loads(tool.invoke({"doc": True, "lib": True}))["status"] == "error"
+
+
+def test_extract_project_backtrace():
+    from cargo_testing import _extract_project_backtrace
+    sample = '''thread 'main' panicked at 'explicit panic', src/lib.rs:10:5
+stack backtrace:
+   0: rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: example::value
+             at ./src/lib.rs:10:5
+   3: core::ops::function::FnOnce::call_once
+test result: FAILED. 0 passed; 1 failed; 0 ignored;
+'''
+    res = _extract_project_backtrace(sample)
+    assert "[Panic backtrace in project code]" in res
+    assert "./src/lib.rs:10:5" in res
+
+
+
+def test_cargo_test_passes_tests_started_on_aborted_process(project, monkeypatch):
+    root, _ = project
+    seen_failure = []
+    diag_mod = load("rust_diagnostics")
+    test_tool = load("cargo_testing").make_cargo_test_tool(
+        root, lambda p: (root / p).resolve(), diag_mod._simplify,
+        on_start=lambda: "tok",
+        on_failure=lambda token, **kw: seen_failure.append(kw),
+        compact_fn=diag_mod.compact_diagnostics,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], 1, "\nrunning 2 tests\n", "error: exited early\n"),
+    )
+    res = json.loads(test_tool.invoke({"bin_target": "sample", "test_filter": "__test_regression_cli"}))
+    assert res["status"] == "failed"
+    assert res["tests_executed"] == 0
+    assert seen_failure[0]["tests_started"] == 2

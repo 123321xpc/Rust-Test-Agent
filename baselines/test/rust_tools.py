@@ -58,16 +58,20 @@ def make_rust_tools(root, resolve_path, env=None):
             return f"Error reading lines: {exc}"
 
     @tool
-    def search_code(query: str, path: str = ".", file_glob: str = "*.rs", regex: bool = False,
-                    max_results: int = 100, context_lines: int = 0, multiline: bool = False) -> str:
+    def search_code(query: str = "", path: str = ".", file_glob: str = "*.rs", regex: bool = False,
+                    max_results: int = 100, context_lines: int = 0, multiline: bool = False,
+                    exclude_tests: bool = False, summarize: bool = False) -> str:
         """Search UTF-8 code by literal text or regex, reporting repository-relative file and line; defaults to Rust files.
 
         Set context_lines (0 to 20) to include surrounding lines for each match.
         Set multiline=True to match cross-line signatures or statements where whitespace may span multiple lines.
+        Set exclude_tests=True to skip tests/ and benches/ directories.
+        Set summarize=True to return match counts grouped by file instead of all lines.
+        Leave query empty with a specific file_glob to list matching files across the repository.
         """
         try:
-            if not query or not 1 <= max_results <= 500:
-                raise ValueError("Provide a query and max_results between 1 and 500")
+            if not 1 <= max_results <= 500:
+                raise ValueError("max_results must be between 1 and 500")
             if not isinstance(context_lines, int) or isinstance(context_lines, bool) or not 0 <= context_lines <= 20:
                 raise ValueError("context_lines must be an integer between 0 and 20")
             target = resolve_path(path)
@@ -77,9 +81,36 @@ def make_rust_tools(root, resolve_path, env=None):
                 files = [target]
             else:
                 files = []
+                skip_dirs = {".git", "target"} | ({"tests", "benches"} if exclude_tests else set())
                 for directory, dirs, names in os.walk(target, followlinks=False):
-                    dirs[:] = sorted(d for d in dirs if d not in (".git", "target") and not (Path(directory) / d).is_symlink())
+                    dirs[:] = sorted(d for d in dirs if d not in skip_dirs and not (Path(directory) / d).is_symlink())
                     files.extend(Path(directory) / name for name in sorted(names) if fnmatch.fnmatch(name, file_glob))
+
+            def _sort_key(p: Path):
+                try:
+                    rel = p.relative_to(root).as_posix()
+                except ValueError:
+                    rel = p.as_posix()
+                if rel.startswith("src/") or "/src/" in rel:
+                    return (0, rel)
+                if "/" not in rel:
+                    return (1, rel)
+                if rel.startswith("examples/") or "/examples/" in rel:
+                    return (2, rel)
+                return (3, rel)
+
+            files.sort(key=_sort_key)
+
+            if not query:
+                if file_glob and file_glob != "*.rs":
+                    matching_names = [f.relative_to(root).as_posix() for f in files]
+                    if not matching_names:
+                        return f"(no files matching '{file_glob}')"
+                    out = "\n".join(matching_names[:max_results])
+                    if len(matching_names) > max_results:
+                        out += "\n(results truncated)"
+                    return out
+                raise ValueError("Provide a query and max_results between 1 and 500")
 
             if multiline:
                 if regex:
@@ -91,6 +122,7 @@ def make_rust_tools(root, resolve_path, env=None):
                     pattern = re.compile(raw_pat, re.MULTILINE)
 
                 matches = []
+                file_match_counts = {}
                 total_matches = 0
                 for file in files:
                     resolved = file.resolve()
@@ -106,24 +138,60 @@ def make_rust_tools(root, resolve_path, env=None):
                         line_no = text.count("\n", 0, m.start()) + 1
                         matched_numbers.append(line_no)
                         total_matches += 1
-                        if total_matches >= max_results:
+                        if not summarize and total_matches >= max_results:
                             break
                     if matched_numbers:
                         rel_posix = file.relative_to(root).as_posix()
-                        if context_lines == 0:
-                            for ln in matched_numbers:
-                                line_content = file_lines[ln - 1] if ln <= len(file_lines) else ""
-                                matches.append(f"{rel_posix}:{ln}: {line_content}")
-                        else:
-                            matches.append(_format_context_matches(rel_posix, file_lines, matched_numbers, context_lines))
-                    if total_matches >= max_results:
+                        file_match_counts[rel_posix] = len(matched_numbers)
+                        if not summarize:
+                            if context_lines == 0:
+                                for ln in matched_numbers:
+                                    line_content = file_lines[ln - 1] if ln <= len(file_lines) else ""
+                                    matches.append(f"{rel_posix}:{ln}: {line_content}")
+                            else:
+                                matches.append(_format_context_matches(rel_posix, file_lines, matched_numbers, context_lines))
+                    if not summarize and total_matches >= max_results:
                         break
+
+                if summarize:
+                    if not file_match_counts:
+                        return "(no matches)"
+                    summary_lines = [f"Found {total_matches} matches across {len(file_match_counts)} files:"]
+                    for fpath, cnt in file_match_counts.items():
+                        summary_lines.append(f"  {fpath}: {cnt} match(es)")
+                    return "\n".join(summary_lines)
+
                 if not matches:
                     return "(no matches)"
                 output = "\n".join(matches) if context_lines == 0 else "\n--\n".join(matches)
                 return output + ("\n(results truncated)" if total_matches >= max_results else "")
 
             pattern = re.compile(query if regex else re.escape(query))
+            if summarize:
+                file_match_counts = {}
+                total_matches = 0
+                for file in files:
+                    resolved = file.resolve()
+                    if not resolved.is_relative_to(root) or not resolved.is_file():
+                        continue
+                    try:
+                        count = 0
+                        with resolved.open(encoding="utf-8") as stream:
+                            for line in stream:
+                                if pattern.search(line):
+                                    count += 1
+                        if count:
+                            file_match_counts[file.relative_to(root).as_posix()] = count
+                            total_matches += count
+                    except (OSError, UnicodeError):
+                        continue
+                if not file_match_counts:
+                    return "(no matches)"
+                summary_lines = [f"Found {total_matches} matches across {len(file_match_counts)} files:"]
+                for fpath, cnt in file_match_counts.items():
+                    summary_lines.append(f"  {fpath}: {cnt} match(es)")
+                return "\n".join(summary_lines)
+
             if context_lines == 0:
                 matches = []
                 for file in files:
@@ -195,8 +263,12 @@ def make_rust_tools(root, resolve_path, env=None):
             def display_path(path):
                 path = Path(path)
                 return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
-            packages = [{"name": p["name"], "version": p["version"], "id": p["id"],
+            packages = [{"name": p["name"], "import_name": p["name"].replace("-", "_"),
+                         "version": p["version"], "id": p["id"],
                          "manifest_path": display_path(p["manifest_path"]),
+                         "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
+                         "features": list(p.get("features", {}).keys())[:25],
+                         "default_features": p.get("features", {}).get("default", []),
                          "targets": [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in p["targets"]]}
                         for p in metadata["packages"] if p["id"] in members]
             return json.dumps({"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages}, ensure_ascii=False, indent=2)

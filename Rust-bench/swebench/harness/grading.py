@@ -12,6 +12,7 @@ from swebench.harness.constants import (
     RESET_FAILED,
     TESTS_ERROR,
     TESTS_TIMEOUT,
+    DetailedResolvedStatus,
     ResolvedStatus,
     TestStatus,
 )
@@ -208,6 +209,65 @@ def get_resolution_status(report: dict[str, dict[str, Any]]) -> str:
         return ResolvedStatus.NO.value
     
 
+def classify_detailed_status(
+    tests_report: dict[str, dict[str, Any]],
+    patch_successfully_applied: bool = True,
+    patch_exists: bool = True,
+) -> str:
+    """
+    Categorize the outcome of an evaluation run into the 6 fine-grained classes
+    defined in SWE-bench Appendix C.5 (Table 22):
+    - Resolved: All F2P pass, All P2P pass
+    - Breaking Resolved: All F2P pass, but some or all P2P fail
+    - Partially Resolved: Some F2P pass, All P2P pass
+    - Work in Progress: Some F2P pass, but some or all P2P fail
+    - No-Op: No F2P pass, All P2P pass
+    - Regression: No F2P pass, and some or all P2P fail
+    """
+    if not patch_exists:
+        return DetailedResolvedStatus.EMPTY_PATCH.value
+    if not patch_successfully_applied:
+        return DetailedResolvedStatus.PATCH_APPLY_FAIL.value
+
+    f2p = tests_report.get(FAIL_TO_PASS, {})
+    p2p = tests_report.get(PASS_TO_PASS, {})
+
+    f2p_succ = len(f2p.get("success", []))
+    f2p_fail = len(f2p.get("failure", []))
+    p2p_succ = len(p2p.get("success", []))
+    p2p_fail = len(p2p.get("failure", []))
+
+    f2p_total = f2p_succ + f2p_fail
+    p2p_total = p2p_succ + p2p_fail
+
+    if f2p_total == 0 or f2p_fail == 0:
+        f2p_rate = "All"
+    elif f2p_succ > 0:
+        f2p_rate = "Partial"
+    else:
+        f2p_rate = "None"
+
+    if p2p_total == 0 or p2p_fail == 0:
+        p2p_rate = "All"
+    elif p2p_succ > 0:
+        p2p_rate = "Partial"
+    else:
+        p2p_rate = "None"
+
+    matrix = {
+        ("All", "All"): DetailedResolvedStatus.RESOLVED.value,
+        ("All", "Partial"): DetailedResolvedStatus.BREAKING_RESOLVED.value,
+        ("All", "None"): DetailedResolvedStatus.BREAKING_RESOLVED.value,
+        ("Partial", "All"): DetailedResolvedStatus.PARTIALLY_RESOLVED.value,
+        ("Partial", "Partial"): DetailedResolvedStatus.WORK_IN_PROGRESS.value,
+        ("Partial", "None"): DetailedResolvedStatus.WORK_IN_PROGRESS.value,
+        ("None", "All"): DetailedResolvedStatus.NO_OP.value,
+        ("None", "Partial"): DetailedResolvedStatus.REGRESSION.value,
+        ("None", "None"): DetailedResolvedStatus.REGRESSION.value,
+    }
+    return matrix.get((f2p_rate, p2p_rate), DetailedResolvedStatus.NO_OP.value)
+
+
 def get_eval_report(
     test_spec: TestSpec,
     prediction: dict[str, str],
@@ -215,18 +275,6 @@ def get_eval_report(
     test_output_path: str,
     include_tests_status: bool,
 ) -> dict[str, Any]:
-    """
-    Generate a report of model evaluation results from a prediction, task instance,
-    and evaluation log.
-
-    Args:
-        test_spec (dict): test spec containing keys "instance_id", "FAIL_TO_PASS", and "PASS_TO_PASS"
-        prediction (dict): prediction containing keys "instance_id", "model_name_or_path", and "model_patch"
-        log_path (str): path to evaluation log
-        include_tests_status (bool): whether to include the status of each test in the returned report
-    Returns:
-        report (dict): report of metrics
-    """
     report_map = {}
 
     instance_id = prediction[KEY_INSTANCE_ID]
@@ -236,18 +284,19 @@ def get_eval_report(
             "patch_exists": False,
             "patch_successfully_applied": False,
             "resolved": False,
+            "detailed_status": DetailedResolvedStatus.NO_OP.value,
         }
 
-    # Check if the model patch exists
     if prediction["model_patch"] is None:
         report_map[instance_id]["none"] = True
+        report_map[instance_id]["detailed_status"] = DetailedResolvedStatus.EMPTY_PATCH.value
         return report_map
     report_map[instance_id]["patch_exists"] = True
 
-    # Get evaluation logs
     eval_sm, found = get_logs_eval(log_path, test_output_path)
 
     if not found:
+        report_map[instance_id]["detailed_status"] = DetailedResolvedStatus.PATCH_APPLY_FAIL.value
         return report_map
     report_map[instance_id]["patch_successfully_applied"] = True
 
@@ -258,8 +307,14 @@ def get_eval_report(
     }
 
     report = get_eval_tests_report(eval_sm, eval_ref)
-    if get_resolution_status(report) == ResolvedStatus.FULL.value:
+    detailed_status = classify_detailed_status(
+        report,
+        patch_successfully_applied=True,
+        patch_exists=True,
+    )
+    if detailed_status == DetailedResolvedStatus.RESOLVED.value:
         report_map[instance_id]["resolved"] = True
+    report_map[instance_id]["detailed_status"] = detailed_status
 
     if include_tests_status:
         report_map[instance_id]["tests_status"] = report  # type: ignore

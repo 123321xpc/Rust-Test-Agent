@@ -108,3 +108,61 @@ def test_callers_and_references_modes(tmp_path, symbols):
 
     assert "error" in json.loads(symbols.invoke({"name": "run", "callers": True, "references": True}))
     assert "error" in json.loads(symbols.invoke({"callers": True}))
+
+
+def test_visibility_and_enclosing(symbols):
+    res = json.loads(symbols.invoke({}))
+    entries = {e["name"]: e for e in res["results"]}
+    assert entries["Widget"]["vis"] == "pub"
+    assert entries["COUNTER"]["vis"] == "private"
+    draw_impl = next(e for e in res["results"] if e["name"] == "draw" and e.get("enclosing") == "impl<'a> Draw for Widget")
+    assert draw_impl["enclosing"] == "impl<'a> Draw for Widget"
+
+
+def test_attrs_and_symbol_details_helpers(tmp_path):
+    root = tmp_path.resolve()
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "types.rs").write_text(
+        '#[derive(Debug, Clone, PartialEq)]\n'
+        '#[cfg(feature = "extra")]\n'
+        'pub struct CustomItem {\n'
+        '    pub id: u32,\n'
+        '}\n\n'
+        'pub trait CustomTrait {\n'
+        '    fn process(&self);\n'
+        '}\n\n'
+        'impl CustomTrait for CustomItem {\n'
+        '    fn process(&self) {}\n'
+        '}\n',
+        encoding="utf-8"
+    )
+    (root / "src" / "lib.rs").write_text(
+        'pub mod types;\n'
+        'pub use crate::types::CustomItem;\n',
+        encoding="utf-8"
+    )
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rust_symbols_mod", Path('baselines/test/rust_symbols.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 1. Test lookup_symbol_details
+    details = mod.lookup_symbol_details(root, name="CustomItem", exact=True)
+    assert len(details) >= 1
+    assert details[0]["path"] == "src/types.rs"
+    assert details[0]["vis"] == "pub"
+    assert "attrs" in details[0]
+    assert any("derive(Debug, Clone, PartialEq)" in a for a in details[0]["attrs"])
+    assert any('cfg(feature = "extra")' in a for a in details[0]["attrs"])
+
+    # 2. Test find_trait_implementations
+    impls = mod.find_trait_implementations(root, trait_name="CustomTrait")
+    assert len(impls) >= 1
+    assert impls[0]["path"] == "src/types.rs"
+    assert "CustomTrait for CustomItem" in impls[0]["header"]
+
+    # 3. Test find_reexports
+    reexports = mod.find_reexports(root, symbol_name="CustomItem")
+    assert len(reexports) >= 1
+    assert reexports[0]["path"] == "src/lib.rs"
+    assert "pub use crate::types::CustomItem;" in reexports[0]["reexport"]

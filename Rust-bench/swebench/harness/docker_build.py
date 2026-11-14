@@ -590,6 +590,17 @@ def build_container(
             logger.info("Mounting host kernel BTF directory read-only")
         else:
             logger.info("Host kernel BTF file is unavailable; container will not have /sys/kernel/btf/vmlinux")
+        cache_root = os.environ.get("RUSTBENCH_CARGO_CACHE_ROOT")
+        container_environment = network_proxy_environment()
+        if cache_root:
+            for source, target, mode in (
+                ("registry/cache", "/root/.cargo/registry/cache", "rw"),
+                ("registry/src", "/root/.cargo/registry/src", "rw"),
+                ("git", "/root/.cargo/git", "rw"),
+                ("lockfiles", "/cargo-cache/lockfiles", "ro"),
+            ):
+                volumes[f"{cache_root}/{source}"] = {"bind": target, "mode": mode}
+            container_environment["CARGO_NET_OFFLINE"] = "true"
         # Create the container
         logger.info(f"Creating container for {test_spec.instance_id}...")
         # if test_spec.repo == "asterinas/asterinas":
@@ -619,7 +630,7 @@ def build_container(
             tmpfs=tmpfs_mount_options,
             volumes=volumes,
             network_mode="host",
-            environment=network_proxy_environment(),
+            environment=container_environment,
         )
         logger.info(f"Container for {test_spec.instance_id} created: {container.id}")
         return container

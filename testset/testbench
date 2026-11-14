@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$HOME/xpc"
+export LD_LIBRARY_PATH="$ROOT/gcc-12/lib:$ROOT/gcc-12/x86_64-conda-linux-gnu/lib:${LD_LIBRARY_PATH:-}"
+cd "$ROOT"
+if [[ "${1:-}" == "--background" ]]; then
+  shift
+  # Fail synchronously when configuration, images, or the remote proxy are unavailable.
+  "$ROOT/testset/testbench" "$@" --dry-run
+  mkdir -p "$ROOT/testset/launcher-logs"
+  log="$ROOT/testset/launcher-logs/$(date +%Y%m%d_%H%M%S)_$$.log"
+  setsid nohup "$ROOT/testset/testbench" "$@" >"$log" 2>&1 < /dev/null &
+  printf 'Started PID %s\nLog: %s\n' "$!" "$log"
+  exit 0
+fi
+exec "$ROOT/envs/rustbench/bin/python" "$ROOT/testset/run.py" "$@"

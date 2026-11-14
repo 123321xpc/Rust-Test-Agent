@@ -1,3 +1,4 @@
+import importlib.util
 """Run Cargo and classify structured rustc diagnostics for the test agent."""
 
 import json
@@ -49,6 +50,13 @@ _CODE_HINTS = {
     "E0599": "No method found on type. Check if the required trait is in scope (`use ...`), or if a deref/conversion is missing.",
     "E0425": "Unresolved name. Check `use` imports, typo, or feature flags.",
     "E0433": "Unresolved module or crate. Check `use` path, extern crate, or Cargo.toml dependencies.",
+    "E0432": "Unresolved import. Verify the crate name, module path, or re-exports in src/lib.rs, and check if a feature flag is needed in Cargo.toml.",
+    "E0412": "Type name not in scope. Check if `use ...` is missing or if the type requires a generic parameter.",
+    "E0405": "Trait not in scope. Check if `use ...` is needed to bring the trait into scope before using or implementing it.",
+    "E0753": "Inner doc comment `//!` or attribute `#![...]` used in an invalid context. Inner attributes must appear at the top of the file before other items.",
+    "E0282": "Type cannot be inferred. Add an explicit type annotation (e.g. `let x: TargetType = ...` or `::<Type>`).",
+    "E0061": "Mismatched number of function arguments. Inspect the function signature with rust_symbols(name=..., kind='fn').",
+    "E0407": "Method definition not in trait. Verify method name spelling and check the trait definition.",
     "E0616": "Field is private. Use public accessor methods or add visibility in the defining module.",
     "E0624": "Associated item is private. Check item visibility or use public constructor/methods.",
 }
@@ -82,7 +90,7 @@ def _simplify(message):
     spans = [
         _compact_span(
             span,
-            ("file_name", "line_start", "line_end", "column_start", "column_end", "is_primary", "label", "suggested_replacement"),
+            ("file_name", "line_start", "line_end", "column_start", "column_end", "is_primary", "label", "suggested_replacement", "suggestion_applicability"),
         )
         for span in message.get("spans", [])
     ]
@@ -93,18 +101,33 @@ def _simplify(message):
     hint = get_remediation_hint(category, code, message.get("message")) if level == "error" else None
 
     suggested_fix = None
+    machine_applicable_fix = None
     for span in message.get("spans", []):
-        if span.get("suggested_replacement") and span.get("is_primary"):
-            suggested_fix = span.get("suggested_replacement")
-            break
-    if suggested_fix is None:
+        rep = span.get("suggested_replacement")
+        if rep is not None and rep != "":
+            if span.get("is_primary") and suggested_fix is None:
+                suggested_fix = rep
+            if span.get("suggestion_applicability") == "MachineApplicable" and machine_applicable_fix is None:
+                machine_applicable_fix = {
+                    "file": span.get("file_name"),
+                    "line_start": span.get("line_start"),
+                    "line_end": span.get("line_end"),
+                    "replacement": rep,
+                }
+    if suggested_fix is None or machine_applicable_fix is None:
         for child in message.get("children", []):
             for span in child.get("spans", []):
-                if span.get("suggested_replacement"):
-                    suggested_fix = span.get("suggested_replacement")
-                    break
-            if suggested_fix is not None:
-                break
+                rep = span.get("suggested_replacement")
+                if rep is not None and rep != "":
+                    if suggested_fix is None:
+                        suggested_fix = rep
+                    if span.get("suggestion_applicability") == "MachineApplicable" and machine_applicable_fix is None:
+                        machine_applicable_fix = {
+                            "file": span.get("file_name"),
+                            "line_start": span.get("line_start"),
+                            "line_end": span.get("line_end"),
+                            "replacement": rep,
+                        }
 
     children = []
     for child in message.get("children", []):
@@ -132,6 +155,8 @@ def _simplify(message):
         payload["remediation_hint"] = hint
     if suggested_fix:
         payload["suggested_fix"] = suggested_fix
+    if machine_applicable_fix:
+        payload["machine_applicable_fix"] = machine_applicable_fix
     return payload
 
 
@@ -323,7 +348,192 @@ def attach_diagnostic_snippets(diagnostics, root, manifest_dir=None, context_lin
                 total_chars += len(snippet)
 
 
-def make_cargo_check_tool(root, resolve_path, env=None, on_result=None):
+
+_SHARED_DIAG_MASK_CACHE: dict[Path, dict] = {}
+
+
+def enrich_diagnostic_symbol_lookup(
+    diagnostics: list[dict],
+    root: Path,
+    symbols_module=None,
+    ckg=None,
+    manifest_dir: Path | None = None,
+    mask_cache: dict | None = None,
+    time_budget_sec: float = 5.0,
+    max_diags: int = 5,
+):
+    """Enrich compiler error diagnostics with cached, deadline-bounded symbol lookup and guidance."""
+    import time as _time
+
+    if not diagnostics or not root:
+        return
+    if time_budget_sec is not None and time_budget_sec <= 0:
+        return
+    if symbols_module is None:
+        try:
+            spec = importlib.util.spec_from_file_location("rust_symbols_lookup", Path(__file__).with_name("rust_symbols.py"))
+            symbols_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(symbols_module)
+        except Exception:
+            return
+
+    resolved_root = Path(root).resolve()
+    if mask_cache is None:
+        mask_cache = _SHARED_DIAG_MASK_CACHE.setdefault(resolved_root, {})
+    deadline = _time.monotonic() + time_budget_sec if time_budget_sec and time_budget_sec > 0 else None
+    enriched_count = 0
+    seen_queries: set[tuple[str, str]] = set()
+
+    for diag in diagnostics:
+        if diag.get("level") != "error":
+            continue
+        if enriched_count >= max_diags:
+            break
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        code = diag.get("code")
+        msg = diag.get("message") or ""
+        lookup_info = []
+        sym = None
+        fn_name = None
+
+        # 1. E0599: No method found on type
+        if code == "E0599":
+            m = re.search(r"(?:no method|no function or associated item) named `([^`]+)` found for (?:type|struct|enum|trait|reference|union) `([^`]+)`", msg)
+            if m:
+                fn_name, ty_name = m.group(1).strip(), m.group(2).strip()
+                if (code, fn_name) in seen_queries:
+                    continue
+                seen_queries.add((code, fn_name))
+                enriched_count += 1
+                matches = symbols_module.lookup_symbol_details(
+                    root, name=fn_name, kind="fn", exact=True, max_results=3,
+                    mask_cache=mask_cache, priority_dir=manifest_dir, deadline=deadline,
+                )
+                if matches:
+                    top = matches[0]
+                    enclosing = top.get("enclosing")
+                    vis = top.get("vis", "private")
+                    loc = f"{top['path']}:{top['line']}"
+                    if enclosing:
+                        lookup_info.append(
+                            f"[Auto-Lookup: Method '{fn_name}' is defined in '{enclosing}' at {loc} (vis: {vis}). "
+                            f"Ensure the enclosing trait/type is imported or check receiver type.]"
+                        )
+                    else:
+                        lookup_info.append(
+                            f"[Auto-Lookup: Function/method '{fn_name}' is defined at {loc} (vis: {vis}). "
+                            f"Check if receiver type '{ty_name}' matches the definition.]"
+                        )
+
+        # 2. E0425, E0412, E0405, E0432, E0433: Unresolved names, types, traits, imports, modules
+        elif code in ("E0425", "E0412", "E0405", "E0432", "E0433"):
+            sym = None
+            if code == "E0425":
+                m = re.search(r"cannot find (?:value|function|macro) `([^`]+)` in this scope", msg)
+                if m: sym = m.group(1).strip()
+            elif code == "E0412":
+                m = re.search(r"cannot find type `([^`]+)` in this scope", msg)
+                if m: sym = m.group(1).strip()
+            elif code == "E0405":
+                m = re.search(r"cannot find trait `([^`]+)` in this scope", msg)
+                if m: sym = m.group(1).strip()
+            elif code == "E0432":
+                m = re.search(r"unresolved import `([^`]+)`", msg)
+                if m:
+                    parts = m.group(1).strip().split("::")
+                    sym = parts[-1].strip("{}")
+            elif code == "E0433":
+                m = re.search(r"failed to resolve: use of undeclared (?:crate or module|type) `([^`]+)`", msg)
+                if m: sym = m.group(1).strip()
+
+            if sym and re.match(r"^[A-Za-z_]\w*$", sym):
+                if (code, sym) in seen_queries:
+                    continue
+                seen_queries.add((code, sym))
+                enriched_count += 1
+                matches = symbols_module.lookup_symbol_details(
+                    root, name=sym, exact=True, max_results=3,
+                    mask_cache=mask_cache, priority_dir=manifest_dir, deadline=deadline,
+                )
+                if matches:
+                    top = matches[0]
+                    vis = top.get("vis", "private")
+                    kind = top.get("kind", "item")
+                    loc = f"{top['path']}:{top['line']}"
+                    vis_hint = " Note: pub(crate) items cannot be accessed from external tests/ (use an in-module test or re-export)." if vis == "pub(crate)" else ""
+                    lookup_info.append(
+                        f"[Auto-Lookup: '{sym}' ({kind}) is defined at {loc} (vis: {vis}).{vis_hint}]"
+                    )
+                reexports = symbols_module.find_reexports(
+                    root, symbol_name=sym, max_results=1,
+                    mask_cache=mask_cache, priority_dir=manifest_dir, deadline=deadline,
+                )
+                if reexports:
+                    r_top = reexports[0]
+                    lookup_info.append(
+                        f"[Auto-Lookup: '{sym}' is re-exported at {r_top['path']}:{r_top['line']} ('{r_top['reexport']}').]"
+                    )
+
+        # 3. E0277: Trait bound not satisfied
+        elif code == "E0277":
+            m = re.search(r"the trait bound `([^:]+): ([^`]+)` is not satisfied", msg)
+            if m:
+                ty_name, trait_name = m.group(1).strip(), m.group(2).strip()
+                base_trait = trait_name.split("<")[0].split("::")[-1].strip()
+                if re.match(r"^[A-Za-z_]\w*$", base_trait):
+                    if (code, base_trait) in seen_queries:
+                        continue
+                    seen_queries.add((code, base_trait))
+                    enriched_count += 1
+                    impls = symbols_module.find_trait_implementations(
+                        root, trait_name=base_trait, max_results=2,
+                        mask_cache=mask_cache, priority_dir=manifest_dir, deadline=deadline,
+                    )
+                    if impls:
+                        top = impls[0]
+                        lookup_info.append(
+                            f"[Auto-Lookup: Trait '{base_trait}' has existing implementation at {top['path']}:{top['line']} ('{top['header']}'). "
+                            f"Check if '{ty_name}' needs implementing '{base_trait}' or deriving it.]"
+                        )
+
+        if ckg is not None and code in ("E0425", "E0412", "E0405", "E0432", "E0433", "E0599") and (deadline is None or _time.monotonic() < deadline):
+            target_sym = sym or fn_name
+            if target_sym and re.match(r"^[A-Za-z_]\w*$", target_sym):
+                try:
+                    nb = ckg.query_neighborhood(target_sym, exclude_tests=True)
+                    pub_paths = []
+                    for d_item in nb.get("definitions", [])[:2]:
+                        for pp in d_item.get("public_paths", []):
+                            if pp not in pub_paths:
+                                pub_paths.append(pp)
+                    if pub_paths:
+                        use_hint = f"[Auto-Lookup CKG: Public import path(s) for '{target_sym}': " + ", ".join(f"use {p};" for p in pub_paths[:3]) + "]"
+                        if use_hint not in lookup_info:
+                            lookup_info.append(use_hint)
+                except Exception:
+                    pass
+
+        if lookup_info:
+            full_lookup = chr(10).join(lookup_info)
+            diag["auto_lookup"] = full_lookup
+            existing_hint = diag.get("remediation_hint")
+            if existing_hint:
+                diag["remediation_hint"] = f"{existing_hint}\n{full_lookup}"
+            else:
+                diag["remediation_hint"] = full_lookup
+
+
+def attach_snippets_and_lookup(diagnostics, root, manifest_dir=None, ckg=None, mask_cache=None):
+    """Inline source snippets and run automated symbol/CKG lookup for compiler error diagnostics."""
+    attach_diagnostic_snippets(diagnostics, root, manifest_dir=manifest_dir)
+    if any(d.get("level") == "error" for d in diagnostics):
+        enrich_diagnostic_symbol_lookup(
+            diagnostics, Path(root), ckg=ckg, manifest_dir=manifest_dir, mask_cache=mask_cache,
+        )
+
+
+def make_cargo_check_tool(root, resolve_path, env=None, on_result=None, ckg=None, mask_cache=None):
     """Build a Cargo check tool for the agent's isolated working copy."""
     @tool
     def cargo_check(manifest_path: str = "Cargo.toml", package: str = "",
@@ -371,7 +581,7 @@ def make_cargo_check_tool(root, resolve_path, env=None, on_result=None):
                 if item.get("reason") == "compiler-message" and isinstance(item.get("message"), dict):
                     diagnostics.append(_simplify(item["message"]))
             kept, omitted = compact_diagnostics(diagnostics)
-            attach_diagnostic_snippets(kept, root, manifest_dir=manifest.parent)
+            attach_snippets_and_lookup(kept, root, manifest_dir=manifest.parent, ckg=ckg, mask_cache=mask_cache)
 
             has_errors = any(d.get("level") == "error" for d in kept)
             if result.returncode == 0:

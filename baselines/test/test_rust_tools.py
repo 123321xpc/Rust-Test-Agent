@@ -88,3 +88,24 @@ def test_read_lines_clamps_range_over_500_lines(rust_tools):
     assert "509: // line 509" in out
     assert "510: // line 510" not in out
     assert "clamped to 10-509" in out
+
+
+def test_search_code_summarize_and_file_listing(rust_tools):
+    root, tools = rust_tools
+    (root / "src" / "other.rs").write_text("pub fn needle_helper() {}\n", encoding="utf-8")
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "tests" / "test_it.rs").write_text("// needle in test\n", encoding="utf-8")
+
+    # summarize mode
+    summary = tools["search_code"].invoke({"query": "needle", "summarize": True})
+    assert "Found" in summary and "matches across" in summary
+    assert "src/lib.rs: 1 match(es)" in summary
+
+    # exclude_tests mode
+    without_tests = tools["search_code"].invoke({"query": "needle", "exclude_tests": True})
+    assert "tests/test_it.rs" not in without_tests
+    assert "src/lib.rs" in without_tests
+
+    # empty query file_glob listing
+    files_list = tools["search_code"].invoke({"query": "", "file_glob": "other.rs"})
+    assert "src/other.rs" in files_list

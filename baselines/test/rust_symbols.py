@@ -74,6 +74,7 @@ _ITEM = re.compile(
 )
 _MACRO = re.compile(r"(?<![\w#])macro_rules!\s*(?P<name>" + _IDENT + r")", re.UNICODE)
 _IMPL = re.compile(r"(?<![\w#])impl\b(?P<header>[^;{}]{1,1000})(?=\{)", re.DOTALL)
+_PUB_USE = re.compile(r"(?<![\w#])pub(?:\s*\([^\)]+\))?\s+use\s+(?P<path>[^;{}]+);", re.UNICODE)
 
 
 def _matches_name(query: str, item_kind: str, item_name: str, exact: bool) -> bool:
@@ -82,13 +83,22 @@ def _matches_name(query: str, item_kind: str, item_name: str, exact: bool) -> bo
     if not exact:
         return query in item_name
     clean_query = query.removeprefix("r#")
-    if item_kind == "impl":
+    if item_kind in ("impl", "use"):
         return bool(re.search(r"(?<![\w#])(?:r#)?" + re.escape(clean_query) + r"(?!\w)", item_name))
     return item_name.removeprefix("r#") == clean_query
 
 
-def _collect_rs_files(root: Path, target: Path, exclude_tests: bool) -> list[Path]:
-    skip_dirs = {".git", "target"} | ({"tests", "benches"} if exclude_tests else set())
+_MAX_WIDE_SCAN_BYTES = 400_000
+
+
+def _collect_rs_files(
+    root: Path,
+    target: Path,
+    exclude_tests: bool,
+    priority_dir: Path | None = None,
+    max_file_bytes: int | None = None,
+) -> list[Path]:
+    skip_dirs = {".git", "target", ".cargo"} | ({"tests", "benches"} if exclude_tests else set())
     files = []
     if target.is_file():
         if target.suffix == ".rs":
@@ -96,7 +106,23 @@ def _collect_rs_files(root: Path, target: Path, exclude_tests: bool) -> list[Pat
     elif target.is_dir():
         for directory, dirs, names in os.walk(target, followlinks=False):
             dirs[:] = sorted(d for d in dirs if d not in skip_dirs and not (Path(directory) / d).is_symlink())
-            files.extend(Path(directory) / f for f in sorted(names) if f.endswith(".rs"))
+            for f in sorted(names):
+                if not f.endswith(".rs"):
+                    continue
+                fpath = Path(directory) / f
+                if max_file_bytes is not None:
+                    try:
+                        if fpath.stat().st_size > max_file_bytes:
+                            continue
+                    except OSError:
+                        continue
+                files.append(fpath)
+    if priority_dir is not None and len(files) > 1:
+        try:
+            prio = Path(priority_dir).resolve()
+            files.sort(key=lambda p: (0 if p.resolve().is_relative_to(prio) else 1, p.as_posix()))
+        except Exception:
+            pass
     return files
 
 
@@ -118,6 +144,27 @@ def _read_and_mask(file: Path, root: Path, mask_cache: dict | None = None):
         return source, code
     except (OSError, UnicodeError):
         return None, None
+
+
+def _build_enclosing_blocks(source: str, code: str) -> list[tuple[int, int, str]]:
+    open_braces = {}
+    for m in re.finditer(r"(?<![\w#])(?:pub(?:\s*\([^\)]+\))?\s+)?impl\b(?P<header>[^;{}]{1,500})\{", code):
+        open_braces[m.end() - 1] = " ".join(source[m.start():m.end() - 1].split())
+    for m in re.finditer(r"(?<![\w#])(?:pub(?:\s*\([^\)]+\))?\s+)?trait\s+(?P<name>(?:r#)?[A-Za-z_]\w*)(?P<header>[^;{}]{0,500})\{", code):
+        open_braces[m.end() - 1] = " ".join(source[m.start():m.end() - 1].split())
+
+    blocks = []
+    stack = []
+    for idx, ch in enumerate(code):
+        if ch == "{":
+            hdr = open_braces.get(idx)
+            stack.append((idx, hdr))
+        elif ch == "}":
+            if stack:
+                start_idx, hdr = stack.pop()
+                if hdr:
+                    blocks.append((start_idx, idx, hdr))
+    return blocks
 
 
 def find_rust_references(
@@ -194,7 +241,8 @@ def make_rust_symbols_tool(root, resolve_path):
     ) -> str:
         """Find Rust definitions, callers, or identifier references in repository-relative path.
 
-        Default mode searches definitions (kinds: fn, struct, enum, trait, impl, mod, union, type, const, static, macro).
+        Default mode searches definitions (kinds: fn, struct, enum, trait, impl, mod, union, type, const, static, macro, use).
+        Returns item kind, name, visibility (pub/pub(crate)/private), and enclosing impl/trait signature when applicable.
         Set exact=True for exact identifier matches; exclude_tests=True to skip tests/ and benches/.
         Set outline=True for an ordered structural summary of all definitions in target path/file.
         Set callers=True with a symbol name to find call sites (excluding the fn definition itself).
@@ -229,9 +277,9 @@ def make_rust_symbols_tool(root, resolve_path):
                     "truncated": truncated,
                 }, ensure_ascii=False)
 
-            kinds = {"fn", "struct", "enum", "trait", "impl", "mod", "union", "type", "const", "static", "macro"}
+            kinds = {"fn", "struct", "enum", "trait", "impl", "mod", "union", "type", "const", "static", "macro", "use"}
             if kind and kind not in kinds:
-                raise ValueError("Unknown kind; use fn, struct, enum, trait, impl, mod, union, type, const, static, or macro")
+                raise ValueError("Unknown kind; use fn, struct, enum, trait, impl, mod, union, type, const, static, macro, or use")
 
             files = _collect_rs_files(root, target, exclude_tests=exclude_tests)
             matches = []
@@ -239,12 +287,15 @@ def make_rust_symbols_tool(root, resolve_path):
                 source, code = _read_and_mask(file, root, mask_cache=mask_cache)
                 if source is None:
                     continue
+                enclosing_blocks = _build_enclosing_blocks(source, code)
                 found = [
                     (m.start(), m.group("kind") or m.group("static_kind"), m.group("name"))
                     for m in _ITEM.finditer(code)
                 ]
                 found.extend((m.start(), "macro", m.group("name")) for m in _MACRO.finditer(code))
                 found.extend((m.start(), "impl", " ".join(source[m.start():m.end()].split())) for m in _IMPL.finditer(code))
+                found.extend((m.start(), "use", m.group("path").strip()) for m in _PUB_USE.finditer(code))
+
                 for offset, item_kind, item_name in sorted(found):
                     if (kind and kind != item_kind) or not _matches_name(name, item_kind, item_name, exact):
                         continue
@@ -262,7 +313,37 @@ def make_rust_symbols_tool(root, resolve_path):
                             context = context_line
                     else:
                         context = context_line
-                    matches.append({"path": file.relative_to(root).as_posix(), "line": line, "kind": item_kind, "name": item_name, "context": context})
+
+                    prefix = code[max(0, offset - 50):offset]
+                    m_vis = re.search(r"\bpub(?:\s*\([^\)]+\))?(?=\s*(?:async\s+|unsafe\s+|const\s+|extern\s+(?:\"[^\"]+\"\s+)?)*$)", prefix)
+                    vis = " ".join(m_vis.group(0).split()) if m_vis else "private"
+
+                    enclosing = None
+                    for b_start, b_end, b_hdr in enclosing_blocks:
+                        if b_start <= offset <= b_end:
+                            if enclosing is None or b_start > enclosing[0]:
+                                enclosing = (b_start, b_hdr)
+                    enclosing_text = enclosing[1] if enclosing else None
+
+                    attr_window = source[max(0, offset - 400):offset]
+                    attrs = []
+                    for attr_match in re.finditer(r"#\[\s*(derive\([^]]+\)|cfg\([^]]+\))\s*\]", attr_window):
+                        attrs.append(attr_match.group(1).strip())
+
+                    entry = {
+                        "path": file.relative_to(root).as_posix(),
+                        "line": line,
+                        "kind": item_kind,
+                        "name": item_name,
+                        "context": context,
+                        "vis": vis,
+                    }
+                    if enclosing_text and item_kind != "impl":
+                        entry["enclosing"] = enclosing_text
+                    if attrs:
+                        entry["attrs"] = attrs
+
+                    matches.append(entry)
                     if len(matches) > max_results:
                         res = matches[:max_results]
                         if outline:
@@ -275,3 +356,204 @@ def make_rust_symbols_tool(root, resolve_path):
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
     return rust_symbols
+
+
+
+def lookup_symbol_details(
+    root: Path,
+    name: str,
+    kind: str = "",
+    exact: bool = True,
+    max_results: int = 5,
+    exclude_tests: bool = True,
+    mask_cache: dict | None = None,
+    priority_dir: Path | None = None,
+    deadline: float | None = None,
+) -> list[dict]:
+    """Search for exact or fuzzy symbol definitions across repository."""
+    import time as _time
+
+    root = Path(root).resolve()
+    clean_name = name.strip().removeprefix("r#")
+    if not clean_name:
+        return []
+    files = _collect_rs_files(root, root, exclude_tests=exclude_tests, max_file_bytes=_MAX_WIDE_SCAN_BYTES)
+    prio_resolved = Path(priority_dir).resolve() if priority_dir is not None else None
+
+    def _sort_key(p: Path):
+        try:
+            resolved = p.resolve()
+            in_prio = 0 if (prio_resolved is not None and resolved.is_relative_to(prio_resolved)) else 1
+            rel = resolved.relative_to(root).as_posix()
+        except ValueError:
+            in_prio = 1
+            rel = p.as_posix()
+        if rel.startswith("src/") or "/src/" in rel:
+            return (in_prio, 0, rel)
+        if "/" not in rel:
+            return (in_prio, 1, rel)
+        return (in_prio, 2, rel)
+
+    files.sort(key=_sort_key)
+    matches = []
+    for file in files:
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        try:
+            raw_source = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if clean_name not in raw_source:
+            continue
+        source, code = _read_and_mask(file, root, mask_cache=mask_cache)
+        if source is None:
+            continue
+        enclosing_blocks = _build_enclosing_blocks(source, code)
+        found = [
+            (m.start(), m.group("kind") or m.group("static_kind"), m.group("name"))
+            for m in _ITEM.finditer(code)
+        ]
+        found.extend((m.start(), "macro", m.group("name")) for m in _MACRO.finditer(code))
+        found.extend((m.start(), "impl", " ".join(source[m.start():m.end()].split())) for m in _IMPL.finditer(code))
+        found.extend((m.start(), "use", m.group("path").strip()) for m in _PUB_USE.finditer(code))
+
+        for offset, item_kind, item_name in sorted(found):
+            if (kind and kind != item_kind) or not _matches_name(clean_name, item_kind, item_name, exact):
+                continue
+            line = source.count(chr(10), 0, offset) + 1
+            start = source.rfind(chr(10), 0, offset) + 1
+            end = source.find(chr(10), offset)
+            context_line = source[start:end if end >= 0 else len(source)].strip()
+
+            prefix = code[max(0, offset - 50):offset]
+            m_vis = re.search(r"\bpub(?:\s*\([^)]+\))?(?=\s*(?:async\s+|unsafe\s+|const\s+|extern\s+(?:\"[^\"]+\"\s+)?)*$)", prefix)
+            vis = " ".join(m_vis.group(0).split()) if m_vis else "private"
+
+            enclosing = None
+            for b_start, b_end, b_hdr in enclosing_blocks:
+                if b_start <= offset <= b_end:
+                    if enclosing is None or b_start > enclosing[0]:
+                        enclosing = (b_start, b_hdr)
+            enclosing_text = enclosing[1] if enclosing else None
+
+            attr_window = source[max(0, offset - 400):offset]
+            attrs = []
+            for attr_match in re.finditer(r"#\[\s*(derive\([^]]+\)|cfg\([^]]+\))\s*\]", attr_window):
+                attrs.append(attr_match.group(1).strip())
+
+            entry = {
+                "path": file.relative_to(root).as_posix(),
+                "line": line,
+                "kind": item_kind,
+                "name": item_name,
+                "context": context_line,
+                "vis": vis,
+            }
+            if enclosing_text and item_kind != "impl":
+                entry["enclosing"] = enclosing_text
+            if attrs:
+                entry["attrs"] = attrs
+            matches.append(entry)
+        if len(matches) >= max_results * 3:
+            break
+        if prio_resolved is not None and len(matches) >= max_results:
+            try:
+                if not file.resolve().is_relative_to(prio_resolved):
+                    break
+            except Exception:
+                pass
+
+    def _match_priority(m):
+        kind_prio = 0 if m["kind"] in ("struct", "enum", "trait", "fn", "type", "const", "mod", "union") else 1
+        path_prio = 0 if m["path"].startswith("src/") else 1
+        return (kind_prio, path_prio, m["path"], m["line"])
+
+    matches.sort(key=_match_priority)
+    return matches[:max_results]
+
+
+def find_trait_implementations(
+    root: Path,
+    trait_name: str,
+    max_results: int = 3,
+    mask_cache: dict | None = None,
+    priority_dir: Path | None = None,
+    deadline: float | None = None,
+) -> list[dict]:
+    """Find existing 'impl ... Trait for ...' blocks in the repository."""
+    import time as _time
+
+    root = Path(root).resolve()
+    clean_trait = trait_name.strip().removeprefix("r#")
+    if not clean_trait:
+        return []
+    pattern = re.compile(r"(?<![\w#])impl\b(?P<header>[^;{}]{1,500}\b" + re.escape(clean_trait) + r"\b[^;{}]{0,200}\bfor\b[^;{}]{1,200})\{", re.DOTALL)
+    files = _collect_rs_files(root, root, exclude_tests=True, priority_dir=priority_dir, max_file_bytes=_MAX_WIDE_SCAN_BYTES)
+    matches = []
+    for file in files:
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        try:
+            raw_source = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if clean_trait not in raw_source or "impl" not in raw_source:
+            continue
+        source, code = _read_and_mask(file, root, mask_cache=mask_cache)
+        if source is None:
+            continue
+        for m in pattern.finditer(code):
+            offset = m.start()
+            line = source.count(chr(10), 0, offset) + 1
+            hdr = " ".join(m.group("header").split())
+            matches.append({
+                "path": file.relative_to(root).as_posix(),
+                "line": line,
+                "header": f"impl {hdr}",
+            })
+            if len(matches) >= max_results:
+                return matches
+    return matches
+
+
+def find_reexports(
+    root: Path,
+    symbol_name: str,
+    max_results: int = 3,
+    mask_cache: dict | None = None,
+    priority_dir: Path | None = None,
+    deadline: float | None = None,
+) -> list[dict]:
+    """Find 'pub use ...::<symbol>' re-exports in the repository."""
+    import time as _time
+
+    root = Path(root).resolve()
+    clean_name = symbol_name.strip().removeprefix("r#")
+    if not clean_name:
+        return []
+    files = _collect_rs_files(root, root, exclude_tests=True, priority_dir=priority_dir, max_file_bytes=_MAX_WIDE_SCAN_BYTES)
+    matches = []
+    for file in files:
+        if deadline is not None and _time.monotonic() >= deadline:
+            break
+        try:
+            raw_source = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if clean_name not in raw_source or "pub" not in raw_source:
+            continue
+        source, code = _read_and_mask(file, root, mask_cache=mask_cache)
+        if source is None:
+            continue
+        for m in _PUB_USE.finditer(code):
+            use_path = m.group("path").strip()
+            if use_path.endswith(f"::{clean_name}") or use_path == clean_name or f"::{clean_name}," in use_path or f"::{clean_name}}}" in use_path:
+                line = source.count(chr(10), 0, m.start()) + 1
+                matches.append({
+                    "path": file.relative_to(root).as_posix(),
+                    "line": line,
+                    "reexport": f"pub use {use_path};",
+                })
+                if len(matches) >= max_results:
+                    return matches
+    return matches
