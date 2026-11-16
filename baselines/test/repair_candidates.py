@@ -230,13 +230,13 @@ class CandidatePolicy:
         return None
 
     def fallback_plan(self, current_plan):
-        """Planner cap cannot silently authorize an unplanned B or a refuted A."""
+        """Keep the current plan when the planner cannot complete a comparison."""
         active = self.data["active_candidate"]
         comparison = self.current_comparison()
         if comparison:
             card = next(c for c in comparison["candidates"] if c["candidate_id"] == active)
             if card["contract"] == "conflict" or card["execution"] == "refuted" or card["dependencies"] == "incompatible":
-                raise ValueError("Planner ended without an admissible selected plan; current mechanism is refuted/incompatible")
+                self.emit("candidate_warning", reason="Current mechanism was refuted or incompatible; retaining the existing plan after planner timeout", candidate_id=active)
         self.data["selected_candidate"] = active
         self.data["pending"] = None
         self.data.update(retain_current_patch=True, switch_paths=[])

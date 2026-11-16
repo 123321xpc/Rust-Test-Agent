@@ -254,12 +254,17 @@ def prepare_rust_environment(root, benchmark_version, repo_path=None, instance_i
     env.pop("RUSTUP_TOOLCHAIN", None)
     pinned = next((name for name in ("rust-toolchain.toml", "rust-toolchain")
                    if (root / name).is_file()), None)
-    if not pinned:
-        if not benchmark_version:
-            raise ValueError("A benchmark Rust toolchain is required when the repository does not pin one")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", benchmark_version):
+    forced_version = env.pop("RUSTBENCH_EVAL_TOOLCHAIN_OVERRIDE", "").strip()
+    selected_version = forced_version or (benchmark_version if not pinned else None)
+    if selected_version:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", selected_version):
             raise ValueError("Invalid benchmark Rust toolchain")
-        (root.parent / "rust-toolchain").write_text(benchmark_version + "\n", encoding="utf-8")
+        if forced_version:
+            env["RUSTUP_TOOLCHAIN"] = selected_version
+        else:
+            (root.parent / "rust-toolchain").write_text(selected_version + "\n", encoding="utf-8")
+    elif not pinned:
+        raise ValueError("A benchmark Rust toolchain is required when the repository does not pin one")
     versions = []
     for executable in ("rustc", "cargo"):
         try:
@@ -270,10 +275,10 @@ def prepare_rust_environment(root, benchmark_version, repo_path=None, instance_i
             detail = getattr(exc, "stderr", "") or str(exc)
             raise RuntimeError(f"Cannot verify {executable} for the evaluation toolchain: {detail}") from exc
         versions.append(result.stdout.strip())
-    if not pinned and re.fullmatch(r"\d+\.\d+\.\d+", benchmark_version):
+    if selected_version and re.fullmatch(r"\d+\.\d+\.\d+", selected_version):
         actual = re.match(r"rustc\s+(\S+)", versions[0])
-        if not actual or actual.group(1) != benchmark_version:
-            raise RuntimeError(f"Expected rustc {benchmark_version}, but the isolated checkout reports {versions[0]}")
+        if not actual or actual.group(1) != selected_version:
+            raise RuntimeError(f"Expected rustc {selected_version}, but the isolated checkout reports {versions[0]}")
     rustc_match = re.match(r"rustc\s+(\S+)", versions[0])
     resolved_tc = rustc_match.group(1) if rustc_match else benchmark_version
     cache_info = configure_cargo_cache(
@@ -283,8 +288,8 @@ def prepare_rust_environment(root, benchmark_version, repo_path=None, instance_i
         toolchain=resolved_tc,
     )
     info = {
-        "source": pinned or "benchmark",
-        "selected": benchmark_version if not pinned else None,
+        "source": "evaluation_override" if forced_version else (pinned or "benchmark"),
+        "selected": selected_version,
         "rustc": versions[0],
         "cargo": versions[1],
         **cache_info,

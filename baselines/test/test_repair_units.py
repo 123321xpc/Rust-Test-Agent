@@ -10,6 +10,11 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def staged_repair_mode(monkeypatch):
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
+
+
 def load(name):
     spec = importlib.util.spec_from_file_location(name + "_units_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -145,14 +150,14 @@ def test_rollback_preserves_independent_completed_work(setup):
     assert coord.select()["unit_id"] == "b"
 
 
-def test_replan_retains_matching_evidence_and_reverts_changed_work(setup):
+def test_replan_retains_matching_evidence_and_preserves_current_work(setup):
     _, state, tools, coord, _, _ = setup
     for name in "abcd":
         close_unit(tools, coord, name)
     coord.configure(plan(b_description="Different registry contract"), [])
     assert [u["unit_id"] for u in coord.units if u["status"] == "verified"] == ["a", "c"]
     assert "{ 1 }" in (state.root / "src/c.rs").read_text()
-    assert "{ 0 }" in (state.root / "src/d.rs").read_text()
+    assert "{ 1 }" in (state.root / "src/d.rs").read_text()
 
 
 def test_evidence_reused_only_at_current_revision_and_exact_config(setup):
@@ -181,10 +186,10 @@ def test_zero_test_execution_never_completes_behavior_target(setup):
 def test_scope_global_restore_and_handoff_gates(setup):
     ma, state, _, coord, _, board = setup
     coord.select()
-    assert "outside active unit" in coord.before_tool("edit_file", {"path": "src/b.rs"})
-    assert "global checkpoint" in coord.before_tool("checkpoint", {"action": "restore", "name": "pre_fix"})
+    assert coord.before_tool("edit_file", {"path": "src/b.rs"}) is None
+    assert coord.before_tool("checkpoint", {"action": "restore", "name": "pre_fix"}) is None
     assert coord.before_tool("write_regression_test", {"path": "tests/test_regression_a.rs"}) is None
-    assert "outside active unit" in coord.before_tool("write_regression_test", {"path": "src/b.rs"})
+    assert coord.before_tool("write_regression_test", {"path": "src/b.rs"}) is None
     tools, holder = ma._make_handoff_tools("fixer", state, board, {"unit_coordinator": coord})
     handoffs = {t.name: t for t in tools}
     assert "pending" in handoffs["submit_for_qa"].invoke({"summary": "not done"})
@@ -194,19 +199,18 @@ def test_scope_global_restore_and_handoff_gates(setup):
     assert coord.active == "a"  # Claiming done is not verification.
 
 
-def test_browsing_boundary_is_enforced_not_a_notice(setup):
+def test_browsing_does_not_consume_repair_budget(setup):
     ma, state, tools, coord, _, board = setup
     coord.select()
     activity = {"files_read": [], "symbols_queried": [], "unit_coordinator": coord}
     wrapped = ma._wrap_tools_for_role("fixer", tools, ["read_lines"], [], {}, state,
                                       SimpleNamespace(calls_made=0), 0, 100, activity, blackboard=board)[0]
-    for _ in range(coord.TOOL_BOUNDARY):
+    for _ in range(100):
         wrapped.invoke({"path": "src/a.rs"})
-    with pytest.raises(ma._repair_units.UnitBoundary):
-        wrapped.invoke({"path": "src/a.rs"})
+    assert coord.steps == 0
 
 
-def test_clean_context_slices_share_attempt_budget_and_stop_browsing_stall(setup, monkeypatch):
+def test_fixer_preserves_attempt_budget_without_forcing_read_slices(setup, monkeypatch):
     ma, _, _, coord, _, _ = setup
     client = SimpleNamespace(calls_made=0, remaining_calls=100)
     caps = []
@@ -217,10 +221,11 @@ def test_clean_context_slices_share_attempt_budget_and_stop_browsing_stall(setup
         return None, "stage_cap_reached"
 
     monkeypatch.setattr(ma, "_run_role_agent", role)
-    result, outcome = ma._run_scheduled_fixer("system", "issue", [], {}, coordinator=coord,
+    holder = {}
+    result, outcome = ma._run_scheduled_fixer("system", "issue", [], holder, coordinator=coord,
                                              allow_escalate=True, client=client, stage_cap=40)
-    assert caps == [24, 16] and client.calls_made == 40
-    assert outcome == "unit_blocked" and result["action"] == "escalate"
+    assert caps == [40] and client.calls_made == 40
+    assert outcome == "stage_cap_reached" and result is None
 
 
 def test_repeated_coordinator_checks_also_trigger_replanning(setup, monkeypatch):
@@ -320,8 +325,12 @@ def test_full_orchestrator_closes_units_and_preserves_prerequisite_on_escalation
             if role == "navigator":
                 t["write_regression_test"].invoke({"path": "tests/test_regression_unit.rs", "content": "#[test] fn result() {}"})
                 t["submit_localization_bundle"].invoke({"summary": "cross-module repair", "needs_architecture_planning": True,
-                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "fix dependent modules", "nodes": [
-                        {"path": "src/a.rs", "symbol": "value"}, {"path": "src/b.rs", "symbol": "value"}]}]})
+                        "candidate_chains": [
+                            {"chain_id": "C1", "hypothesis": "fix dependent modules", "nodes": [
+                                {"path": "src/a.rs", "symbol": "value"}, {"path": "src/b.rs", "symbol": "value"}]},
+                            {"chain_id": "C2", "hypothesis": "fix dependent callers", "nodes": [
+                                {"path": "src/c.rs", "symbol": "value"}]},
+                        ]})
             elif role == "suggester":
                 p = plan()
                 t["submit_repair_plan"].invoke(dict(p, selected_chain_id="C1", arbitration_rationale="a precedes b, b precedes d"))
@@ -329,7 +338,7 @@ def test_full_orchestrator_closes_units_and_preserves_prerequisite_on_escalation
                     assert "repair_units" in inputs["messages"][0]["content"]
                     assert "{ 1 }" in (states[-1].root / "src/a.rs").read_text()
             elif role == "fixer":
-                prompt = inputs["messages"][0]["content"]
+                prompt = inputs["messages"][-1]["content"]
                 ledger = prompt.split("Coordinator Repair Units (only edit the current unit; do not restore pre_fix):\n", 1)[1].split("\n", 1)[0]
                 unit = json.loads(ledger)["current_unit"]
                 fixer_units.append(unit)
@@ -339,9 +348,11 @@ def test_full_orchestrator_closes_units_and_preserves_prerequisite_on_escalation
                     t["escalate_for_replan"].invoke({"reason": "b contract wrong; keep verified a"})
                 elif unit:
                     if unit == "b":
-                        assert "{ 0 }" in (states[-1].root / "src/b.rs").read_text()
+                        assert "{ 2 }" in (states[-1].root / "src/b.rs").read_text()
                         assert "{ 1 }" in (states[-1].root / "src/a.rs").read_text()
-                    edit(t, unit)
+                        t["edit_file"].invoke({"path": "src/b.rs", "old_text": "{ 2 }", "new_text": "{ 1 }"})
+                    else:
+                        edit(t, unit)
                     t["complete_repair_unit"].invoke({"summary": f"fixed {unit}"})
                 else:
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_unit")
@@ -360,6 +371,5 @@ def test_full_orchestrator_closes_units_and_preserves_prerequisite_on_escalation
     assert events.count("suggester") == 2 and events[-1] == "verifier"
     assert all(f"src/{name}.rs" in patch for name in "abcd")
     records = [json.loads(line) for line in trace_path.read_text().splitlines()]
-    rollback = next(e for e in records if e["event"] == "repair_unit_rollback" and e["affected_units"])
-    assert rollback["affected_units"] == ["b", "d"]
+    assert not any(e for e in records if e["event"] == "repair_unit_rollback" and e["affected_units"])
     assert any(e["event"] == "repair_unit_verification" and e["complete"] for e in records)

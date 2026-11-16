@@ -1,12 +1,26 @@
-# test: Rust-oriented Adaptive Multi-Agent System
+# test: Rust-oriented repair agent
 
-`test` resolves repository-level Rust issues using an adaptive multi-agent
-architecture (**Adaptive Locate–Suggest–Fix–Verify**) backed by a deterministic
-Rust Code Knowledge Graph (CKG), compiler diagnostic symbol lookup, and
-zero-dependency dynamic tracing. (Pass `--single-agent` to run the legacy
-single-agent LangChain ReAct loop for controlled ablations.)
+The default `continuous` mode uses one repair conversation for investigation,
+editing and verification. After repeated failures, it can consult a read-only
+Architect and then resume with its previous conversation and edits intact.
+The Verifier reviews the candidate patch and the issue contract. Set
+`RUSTBENCH_REPAIR_MODE=staged` to use the staged controller described below as
+an experimental comparison. `--single-agent` selects the legacy single-agent
+loop instead.
 
-## Multi-Agent Architecture
+Both modes retain existing edits across replanning and allow explicit checkpoint
+restores. Final QA checks affected crates and the workspace with the evaluation
+feature selection after removing temporary regression tests, then attempts bounded
+existing library and integration tests. Failed compile checks are compared with
+the unpatched checkout; a confirmed new compilation failure returns to repair,
+while an existing failure or timeout is recorded as inconclusive. Doctest line
+shifts are reported for review; mixed code/doc hunks are not discarded solely
+because their line counts changed.
+
+`test` is backed by a deterministic Rust Code Knowledge Graph (CKG), compiler
+diagnostic symbol lookup, and zero-dependency dynamic tracing.
+
+## Staged comparison mode
 
 1. **Layer 0 — Deterministic Rust Foundations**:
    - `rust_ckg.py` (`inspect_rust_neighborhood`): Zero-dependency token-aware Rust parser and incremental Code Knowledge Graph resolving `mod` trees, `pub use` re-export import paths, `impl Trait` / `#[derive]` relations, call edges, and candidate fault propagation chains.
@@ -16,7 +30,7 @@ single-agent LangChain ReAct loop for controlled ablations.)
 3. **Adaptive Routing Gate**: Chooses **Fast Path** (skipping Architect for simple, localized single-file bugs) or **Planned Path** (invoking Architect for multi-file, multi-chain, trait/lifetime, macro, new-API, or downstream-dependent tasks).
 4. **Agent 2 — Rust Architect / Suggester**: Runs in a clean context to arbitrate root cause vs. surface callers, audit trait/lifetime/API contracts, and emit a structured `RepairPlan`.
 5. **Agent 3 — Rust Fixer**: Executes dependency-closed repair units in bounded clean-context slices. The deterministic Coordinator checks each unit, records partial-patch evidence, and rolls back only failed units and their dependents on escalation.
-6. **Agent 4 — Patch QA & Verifier**: Enforces deterministic checks (paired Red-Green reproduction, post-strip `cargo check --tests` + downstream workspace checks, diff hygiene for `dbg!`/trace leftovers, doctest line-shift checks) followed by an independent LLM semantic audit against the issue contract before final submission.
+6. **Agent 4 — Patch QA & Verifier**: Records deterministic checks (paired Red-Green reproduction, post-strip cargo checks, existing-test smoke, diff hygiene, and doctest line-shift findings) and runs an independent LLM semantic audit. Confirmed new compilation failures and test-file conflicts return the patch to repair; inconclusive checks are recorded, and the best available patch may still be submitted when the budget is exhausted.
 
 ## Dependency-aware repair units
 
@@ -40,20 +54,17 @@ structured tool arguments, never shell commands). For example:
   units run sequentially; file-overlapping units and dependency cycles are joined
   for safe joint verification and file-level rollback. Group mutually dependent
   interface/caller hunks rather than checking an unbuildable half-interface.
-- Fixer calls `complete_repair_unit(summary=...)`; only actual successful targeted
-  checks close the unit. Default verification is ordinary `cargo_check` on the
+- Fixer calls `complete_repair_unit(summary=...)`; failed checks close the unit
+  as `completed_unverified`, without claiming they passed. Default verification is ordinary `cargo_check` on the
   affected manifests, avoiding future-API regression tests in intermediate units.
   Explicit runtime test targets must execute at least one test; `no_run` is only
   compilation evidence. Intermediate checks do **not** replace final paired
   Red–Green, post-strip checks, existing-test review, or independent QA.
-- Each clean-context Fixer slice uses at most 24 model requests, within the
-  existing **shared attempt and global budgets**. After 12 tool operations or 4
-  unchecked edits, the next operation yields to Coordinator for targeted checks
-  when there are changes. Fresh slices receive the ledger, current source/diff,
-  and compiler feedback. Two slices without progress trigger bounded escalation.
-- Escalation restores only the failed unit and transitive dependents. Unrelated
-  verified units survive. Replanning retains units with unchanged definitions,
-  prerequisites and input evidence; QA edits invalidate affected dependent units.
+- Fixer retains its conversation across unit checks. Read-only tools do not
+  force a context reset, and the global API budget still bounds the run.
+- Escalation and replanning retain the current working changes. Replanning
+  preserves evidence for units whose definitions and inputs are unchanged;
+  QA edits invalidate affected dependent units.
   Global `checkpoint(action="restore")` is disabled during unit repair. A partial
   rollback clears global Green/suite evidence but retains matching clean Red
   evidence and unrelated source edits. Exact-config checks at the same revision
@@ -91,12 +102,12 @@ equivalent primary assessments use scope and verification cost as tiebreakers.
 An uncertain, untested alternative does not displace an admissible current
 mechanism speculatively. If neither is admissible, request relocalization.
 
-Only the selected `candidate_id` may receive a detailed `submit_repair_plan`.
+The selected `candidate_id` guides the detailed `submit_repair_plan`.
 Keeping the current candidate preserves its partial Fast Path edits; selecting
 the alternative rolls back affected repair units/dependents while retaining
 unrelated verified units. Replanning/budget fallback cannot silently synthesize
 an unimplemented alternative. Final Red–Green, post-strip, and independent QA
-gates remain unchanged.
+results are recorded as advisory evidence instead of submission gates.
 
 Cargo tool results expose `candidate_evidence_id`; regression auto-runs also
 record evidence. The ledger records revision, candidate, episode and actual
@@ -122,28 +133,17 @@ file must be selected, except temporary regression tests created with
 deletions must also be selected.
 
 The agent is instructed to analyze the issue, write a regression test, implement
-the fix, and run the regression and relevant existing tests before generating a
-patch. It writes temporary integration tests through `write_regression_test` as
-new `tests/test_regression_<name>.rs` files, then submits source changes without
-those tests. This reduces conflicts with the benchmark's hidden test patch; it
-does not guarantee compatibility. After the last write, every temporary
-regression test must pass as an unfiltered `cargo_test` integration target with
-at least one test executed and no ignored tests. Existing test suites may be run
-and their failures reported, but passing them is not a submission requirement.
-A failed generated regression test invalidates its verification. Any write or
-revert invalidates all regression verification. Gate checks accept either the
-package manifest or a workspace manifest with `package="<name>"`. The agent must
-not modify existing tests merely to make the suite pass. Before submission,
-`generate_patch` temporarily removes the generated regression tests and runs
-`cargo check` on affected packages. This checks ordinary build targets, not the
-existing test targets. By default, the CLI runner enables `--require-reproduction` (use
-`--no-require-reproduction` to disable), requiring paired Red-Green verification:
-temporary regression tests must fail on the unpatched base checkout (verified
-either during the Red phase before source edits or automatically against the
-original files at submission time) and pass after the fix. If the model stops or
-reaches the API call limit after verification, the runner may submit the source
-patch automatically, subject to the same paired and post-strip checks (using the
-package and feature configuration verified during `cargo_test`). Benchmark evaluation is still necessary.
+the fix, and run relevant checks. Temporary integration tests created with
+`write_regression_test` are excluded from the submitted source patch. Red-Green
+reproduction, regression tests, existing-test smoke, post-strip compilation,
+diff hygiene, and independent QA provide evidence and warnings rather than hard
+submission gates. A failed or unrun check is not reported as a pass. Verifier
+objections can guide another repair attempt; when no further attempt is available,
+the current non-empty source diff can still be submitted. Repair units completed
+without passing checks are recorded as `completed_unverified`. If execution
+stops or the model request fails, the runner first attempts to preserve the
+current source diff, then a verified snapshot. Benchmark evaluation remains
+necessary to determine whether the patch resolves the task.
 
 The agent can use `read_lines` for numbered, inclusive line ranges, `search_code`
 for literal or regular-expression searches with optional `context_lines` (Rust
@@ -212,12 +212,11 @@ harness's `make_test_spec` to determine its default Rust toolchain. Use
 `--harness-root /path/to/Rust-bench` to point at the exact harness used for
 evaluation. For a non-default evaluation configuration, or when metadata is not
 available, pass its known toolchain with `--rust-toolchain 1.72.0` instead of
-`--dataset`. If the base checkout has `rust-toolchain.toml` or `rust-toolchain`,
-that repository pin takes precedence, as in the standard evaluation setup.
+`--dataset`. A repository toolchain pin takes precedence unless the evaluation
+script explicitly overrides it; the runner passes that override to the agent.
 The runner verifies `rustc --version` and `cargo --version` in the isolated
 checkout before calling the model and passes the same environment to all Rust
-tools. For an unpinned checkout, the benchmark default is configured in its
-temporary parent directory, allowing nested repository toolchain pins to work.
+tools.
 Rustup may install a missing toolchain; verification failure stops the run.
 No repository file or global rustup default is changed. The actual
 compiler and Cargo versions are recorded in the trace and provided to the agent.
@@ -230,7 +229,9 @@ instances.
 The CLI supports API call limits and a trace directory; run `--help` for details.
 Set `API_LIMIT` to a positive integer in the root `.env` to limit model HTTP
 requests per repair, including retries; it defaults to 70 when unset. The optional
-`--max-api-calls` can set a lower limit but cannot exceed `API_LIMIT`. When
+`--max-api-calls` can set a lower limit but cannot exceed `API_LIMIT`. Transient
+HTTP and transport failures are counted separately from stage progress; the
+global request limit still includes every retry. When
 remaining API calls drop below the warning threshold, tool outputs include a
 budget notice so the agent can finish verification and submit in time.
 Each run writes a JSONL trace under `<output directory>/traces/<run-id>.jsonl`

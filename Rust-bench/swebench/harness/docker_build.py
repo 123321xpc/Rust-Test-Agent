@@ -617,8 +617,8 @@ def build_container(
         #     )
         # else:
         tmpfs_mount_options = {
-    "/workspace": "size=20g,exec" 
-}
+            "/workspace": "size=40g,exec"
+        }
         container = client.containers.create(
             image=test_spec.instance_image_key,
             name=test_spec.get_instance_container_name(run_id),

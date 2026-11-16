@@ -398,20 +398,39 @@ def make_env_script_list(instance, specs, repo, repo_directory, env_name):
 
     return reqs_commands
 
+def make_test_patch_apply_command(test_patch):
+    delimiter = "EOF_114329324912"
+    return (
+        'test_patch_dir=$(mktemp -d)\n'
+        f'cat > "$test_patch_dir/test.patch" <<\'{delimiter}\'\n{test_patch}\n{delimiter}\n'
+        'if ! git apply --ignore-whitespace -v "$test_patch_dir/test.patch"; then\n'
+        '  echo "Test patch did not apply directly; trying a three-way merge"\n'
+        '  merge_dir=$(mktemp -d)\n'
+        '  if ! git clone --no-hardlinks -q . "$merge_dir" >/dev/null 2>&1; then '
+        'echo "ERROR: failed to apply test patch: cannot prepare three-way merge"; exit 1; fi\n'
+        '  if ! (cd "$merge_dir" && git apply --ignore-whitespace "$test_patch_dir/test.patch"); then '
+        'rm -rf "$merge_dir"; '
+        'echo "ERROR: failed to apply test patch"; exit 1; fi\n'
+        '  (cd "$merge_dir" && git add --force --all && '
+        'git diff --cached --binary HEAD > "$test_patch_dir/merged.patch") || '
+        '{ echo "ERROR: failed to apply test patch: cannot prepare three-way merge"; exit 1; }\n'
+        '  rm -rf "$merge_dir"\n'
+        '  git add --all && git apply --3way --index "$test_patch_dir/merged.patch" || '
+        '{ echo "ERROR: failed to apply test patch: three-way merge conflicted"; exit 1; }\n'
+        'fi'
+    )
+
+
 def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit, test_patch, tests_changed,time):
     """
     Applies the test patch and runs the tests.
     """
-    HEREDOC_DELIMITER = "EOF_114329324912"
     test_files = re.findall(DIFF_MODIFIED_FILE_REGEX, test_patch)
     # Reset test files to the state they should be in before the patch.
     reset_tests_command = [f"git reset --hard {base_commit}", "git clean -fd"]
     if instance["instance_id"] == "asterinas__asterinas-1138":
         reset_tests_command = f"git checkout {base_commit} {' '.join(test_files)} && rm -rf /testbed/osdk/my-first-os"
-    apply_test_patch_command = (
-        f"git apply --ignore-whitespace -v - <<'{HEREDOC_DELIMITER}' || "
-        f"{{ echo 'ERROR: failed to apply test patch'; exit 1; }}\n{test_patch}\n{HEREDOC_DELIMITER}"
-    )
+    apply_test_patch_command = make_test_patch_apply_command(test_patch)
     diff_cmd = "git diff"
     git_status_cmd = "git status"
 
@@ -484,7 +503,6 @@ def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit
 
 def make_pre_run_list(instance, specs, repo, repo_directory, base_commit, env_name,test_patch,tests_changed,time):
 
-    HEREDOC_DELIMITER = "EOF_114329324912"
     test_files = re.findall(DIFF_MODIFIED_FILE_REGEX, test_patch)
     # Reset test files to the state they should be in before the patch.
     reset_tests_command = [f"git reset --hard {base_commit}", "git clean -fd"]
@@ -578,10 +596,7 @@ def make_eval_script_list_wo_features(instance, specs, env_name, repo_directory,
     reset_tests_command = [f"git reset --hard {base_commit}", "git clean -fd"]
     if instance["instance_id"] == "asterinas__asterinas-1138":
         reset_tests_command = f"git checkout {base_commit} {' '.join(test_files)} && rm -rf /testbed/osdk/my-first-os"
-    apply_test_patch_command = (
-        f"git apply --ignore-whitespace -v - <<'{HEREDOC_DELIMITER}' || "
-        f"{{ echo 'ERROR: failed to apply test patch'; exit 1; }}\n{test_patch}\n{HEREDOC_DELIMITER}"
-    )
+    apply_test_patch_command = make_test_patch_apply_command(test_patch)
     diff_cmd = "git diff"
     git_status_cmd = "git status"
     test_commands = []
@@ -695,6 +710,14 @@ def _get_task_rust_version(instance: SWEbenchInstance) -> Optional[str]:
     return None
 
 
+def evaluation_toolchain_override(instance: SWEbenchInstance) -> Optional[str]:
+    version = _get_task_rust_version(instance)
+    specs = MAP_REPO_VERSION_TO_SPECS.get(instance.get("repo"), {}).get(instance.get("version"), default_config)
+    if version is None and specs is not default_config:
+        version = _get_task_rust_version({"rust_version": specs.get("rustc")})
+    return version
+
+
 def _preprocess_created_at_if_int(instance: SWEbenchInstance):
     """如果 instance["created_at"] 是整数时间戳，则将其原地转换为ISO格式字符串。"""
     
@@ -742,9 +765,7 @@ def _create_test_spec_base(
     env_name = "testbed"
     repo_directory = f"/{env_name}"
     specs = MAP_REPO_VERSION_TO_SPECS.get(repo, {}).get(version, default_config)
-    task_rust_version = _get_task_rust_version(instance)
-    if task_rust_version is None and specs is not default_config:
-        task_rust_version = _get_task_rust_version({"rust_version": specs.get("rustc")})
+    task_rust_version = evaluation_toolchain_override(instance)
     if task_rust_version:
         specs = {**specs, "task_rust_version": task_rust_version}
 

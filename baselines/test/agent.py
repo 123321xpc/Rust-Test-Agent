@@ -79,17 +79,17 @@ Follow this order:
    test_target set to each regression test (no filter). Then run targeted existing
    tests (lib=True with test_filter or relevant test_target); run the full package
    suite (tests=True) only when fast enough, avoiding repeated timeouts on huge
-   crates. Each temporary regression test must pass with at least one test executed
-   and 0 ignored. Existing tests may fail; report their failures, but do not
+    crates. Report the actual regression results, including unrun or failing tests.
+    Existing tests may fail; report their failures, but do not
    modify or remove them to satisfy the gate. If the issue states an existing test
    asserts outdated behavior contrary to the issue, do not weaken your fix to pass it.
    When modifying public APIs, types, or doc comments, you may also run cargo_test with doc=True to verify documentation examples.
-5. After verification passes, use generate_patch to preview changes, or call
-   generate_patch(submit=True) to automatically submit all verified source changes in one call.
+ 5. Use generate_patch to preview changes, or call
+    generate_patch(submit=True) to submit the current source changes in one call.
    Alternatively, submit explicitly with paths=[...]. Temporary
    regression tests are excluded automatically, and a post-strip verification
-   checks affected crates and downstream workspace dependents under both cargo check and cargo check --tests.
-   Any further write invalidates regression verification: rerun the required tests. Watch for budget
+    checks affected crates and downstream workspace dependents. Verification findings are advisory,
+    and unverified or failing checks do not block submission. Watch for budget
    notices and submit before API calls run out.
 Briefly describe the analysis, tests, and change.
 Do not run git or external shell commands to inspect history or host files.
@@ -182,47 +182,10 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
 
             tool_calls = getattr(msg, "tool_calls", None) if not isinstance(msg, dict) else msg.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
-                updated_tc = []
-                tc_changed = False
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        updated_tc.append(tc)
-                        continue
-                    name = tc.get("name")
-                    args = tc.get("args")
-                    if name in ("write_file", "write_regression_test", "edit_file") and isinstance(args, dict):
-                        args_copy = dict(args)
-                        for k in ("content", "old_text", "new_text"):
-                            new_val, changed = _trim_arg_str(args_copy.get(k))
-                            if changed:
-                                args_copy[k] = new_val
-                                tc_changed = True
-                        if isinstance(args_copy.get("edits"), list):
-                            new_edits = []
-                            edits_changed = False
-                            for item in args_copy["edits"]:
-                                if isinstance(item, dict):
-                                    item_copy = dict(item)
-                                    for ek in ("old_text", "new_text"):
-                                        nv, ch = _trim_arg_str(item_copy.get(ek))
-                                        if ch:
-                                            item_copy[ek] = nv
-                                            edits_changed = True
-                                    new_edits.append(item_copy)
-                                else:
-                                    new_edits.append(item)
-                            if edits_changed:
-                                args_copy["edits"] = new_edits
-                                tc_changed = True
-                        updated_tc.append({**tc, "args": args_copy})
-                    else:
-                        updated_tc.append(tc)
-                if content_changed or tc_changed:
+                updated_tc = tool_calls
+                if content_changed:
                     updates = {}
-                    if content_changed:
-                        updates["content"] = ai_content
-                    if tc_changed:
-                        updates["tool_calls"] = updated_tc
+                    updates["content"] = ai_content
                     if hasattr(msg, "model_copy"):
                         msg = msg.model_copy(update=updates)
                     elif isinstance(msg, dict):
@@ -370,10 +333,10 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
 
 def _continuation_prompt(state, client):
     prompt = (
-        "The repair is not submitted. Continue the required workflow: "
-        "write a regression test, fix the issue, and pass each temporary regression "
-        "test before submitting the patch. Report existing test failures; they do "
-        "not block submission. Investigate if regression tests cannot run."
+        "The repair is not submitted. Continue the repair workflow and submit the "
+        "current non-empty source diff when possible. Regression tests and existing "
+        "test failures are evidence and should guide the repair, but do not block "
+        "submission when the checks cannot complete."
     )
     if getattr(state, "_last_submit_error", ""):
         prompt += f" Previous submission attempt failed verification: {state._last_submit_error}."
@@ -392,7 +355,7 @@ def _continuation_prompt(state, client):
     return prompt
 
 
-def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None, multi_agent=True, dump_pre_fix_dir=None, replay_pre_fix_dir=None, intervention=None):
+def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None, multi_agent=True):
     configure_repair_git()
     kwargs = {}
     if instance_id is not None:
@@ -418,7 +381,12 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
             import functools
             compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2)
             if multi_agent:
-                patch = _multi_agent.run_multi_agent(
+                repair_runner = (
+                    _multi_agent.run_multi_agent
+                    if os.getenv("RUSTBENCH_REPAIR_MODE", "continuous").strip().lower() == "staged"
+                    else _multi_agent.run_continuous_repair
+                )
+                patch = repair_runner(
                     Path(repo),
                     issue,
                     model,
@@ -434,10 +402,9 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                     chat_model_factory=ChatOpenAI,
                     prompts_mod=_prompts,
                     role_callback_cls=RoleTraceCallback,
-                    dump_pre_fix_dir=dump_pre_fix_dir,
-                    replay_pre_fix_dir=replay_pre_fix_dir,
-                    intervention=intervention,
                 )
+                if not patch:
+                    patch = _multi_agent._relaxed_source_patch(state)
                 if not patch:
                     raise RuntimeError("Agent did not generate a non-empty patch")
                 return patch
@@ -465,6 +432,7 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                         fallback = getattr(state, "patch", "") or (
                             state.auto_submit_verified_patch() if hasattr(state, "auto_submit_verified_patch") else ""
                         )
+                        fallback = fallback or _multi_agent._relaxed_source_patch(state)
                         if fallback:
                             if trace:
                                 trace.record("auto_submit_on_limit", patch=fallback)
@@ -497,6 +465,11 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                                 if trace:
                                     trace.record("auto_submit_on_idle", patch=fallback)
                                 return fallback
+                        fallback = _multi_agent._relaxed_source_patch(state)
+                        if fallback:
+                            if trace:
+                                trace.record("auto_submit_on_idle", patch=fallback, relaxed=True)
+                            return fallback
                         raise RuntimeError("Agent stopped calling tools without submitting a verified patch")
                 else:
                     consecutive_no_tools = 0
@@ -504,6 +477,8 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                 messages = compress_fn(result["messages"]) + [{"role": "user", "content": _continuation_prompt(state, client)}]
         finally:
             client.close()
+        if not state.patch:
+            state.patch = _multi_agent._relaxed_source_patch(state)
         if not state.patch:
             raise RuntimeError("Agent did not generate a non-empty patch")
         return state.patch
@@ -531,13 +506,6 @@ def main():
                         help="Run legacy single-agent ReAct loop instead of adaptive multi-agent pipeline")
     parser.add_argument("--harness-root", default=str(Path(__file__).resolve().parents[2] / "Rust-bench"),
                         help="Rust-bench harness used for evaluation")
-    parser.add_argument("--dump-pre-fix", help="Directory where pre_fix checkpoint bundle should be exported after Navigator")
-    parser.add_argument("--replay-pre-fix", help="Directory where pre_fix checkpoint bundle should be loaded from to skip Navigator")
-    parser.add_argument("--intervene-feature", help="Target semantic feature for CAM causal intervention")
-    parser.add_argument("--intervene-action", choices=("drop", "weaken", "corrupt", "override", "truncate"), default="drop",
-                        help="Causal intervention action (default: drop)")
-    parser.add_argument("--intervene-value", help="Optional value string or JSON for causal intervention")
-    parser.add_argument("--intervention-file", help="Path to JSON file specifying {'feature': ..., 'action': ..., 'value': ...}")
     args = parser.parse_args()
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
@@ -571,25 +539,12 @@ def main():
     try:
         rust_version = (benchmark_toolchain(args.dataset, args.instance_id, args.harness_root)
                         if args.dataset else args.rust_toolchain)
-        intervention_spec = None
-        if args.intervention_file:
-            intervention_spec = json.loads(Path(args.intervention_file).read_text(encoding="utf-8"))
-        elif args.intervene_feature:
-            intervention_spec = {
-                "feature": args.intervene_feature,
-                "action": args.intervene_action,
-                "value": args.intervene_value,
-            }
-
         run_kwargs = {
             "trace": trace,
             "max_api_calls": max_api_calls,
             "rust_version": rust_version,
             "require_reproduction": args.require_reproduction,
             "instance_id": args.instance_id,
-            "dump_pre_fix_dir": args.dump_pre_fix,
-            "replay_pre_fix_dir": args.replay_pre_fix,
-            "intervention": intervention_spec,
         }
         if args.single_agent:
             run_kwargs["multi_agent"] = False

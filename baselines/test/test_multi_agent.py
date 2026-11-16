@@ -10,6 +10,11 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def staged_repair_mode(monkeypatch):
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
+
+
 def _load(name):
     spec = importlib.util.spec_from_file_location(name + "_ma_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -93,6 +98,28 @@ def test_verifier_conflict_requires_evidence_and_supports_no_plan():
     assert "plan exists" in response.lower()
     assert not holder["done"]
 
+    blackboard = {
+        "repair_plan": {"ordered_edits": [{"file": "src/lib.rs", "symbol": "timestamp_micros"}]},
+        "issue_contract": ma.extract_issue_contract("Add `timestamp_micros` to satisfy the requested behavior."),
+    }
+    tools, holder = ma._make_handoff_tools("verifier", None, blackboard, {})
+    submit = tools[0]
+    conflict = {
+        "decision": "APPROVE",
+        "summary": "The plan is stale but implementation is correct.",
+        "plan_consistency": "conflict",
+        "plan_conflicts": ["The plan did not include the final API edit."],
+    }
+    response = submit.invoke(conflict)
+    assert "explain how the conflict relates" in response.lower()
+    assert not holder["done"]
+    conflict["explanation"] = (
+        "The issue contract requests timestamp_micros, and the regression test verifies the final API behavior."
+    )
+    response = submit.invoke(conflict)
+    assert "recorded" in response.lower()
+    assert holder["payload"]["explanation"] == conflict["explanation"]
+
 
 def test_qa_repair_feedback_is_actionable_and_blocks_unverified_fallback():
     ma = _load("multi_agent")
@@ -122,6 +149,72 @@ def _setup_fake_repo(tmp_path):
     (repo / "src").mkdir()
     (repo / "src" / "lib.rs").write_text("pub fn bug() -> i32 { 0 }\n", encoding="utf-8")
     return repo
+
+
+def test_submission_gates_reject_docs_and_existing_tests_but_allow_production_edits():
+    ma = _load("multi_agent")
+    contract = ma.extract_issue_contract("Fix `bug` behavior")
+    docs = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n"
+    assert ma._detect_non_substantive_patch(docs, issue_contract=contract)
+
+    comments = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-// old\n+// new\n"
+    assert ma._detect_non_substantive_patch(comments, issue_contract=contract)
+
+    string_literal = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn bug() { let _ = 1; }\n+pub fn bug() { let _ = \"//\"; }\n"
+    assert ma._detect_non_substantive_patch(string_literal, issue_contract=contract) == []
+
+    template = "--- a/templates/install.sh.j2\n+++ b/templates/install.sh.j2\n@@ -1 +1 @@\n-echo old\n+echo new\n"
+    assert ma._detect_non_substantive_patch(template, issue_contract=contract) == []
+
+    state = SimpleNamespace(regression_tests=set(), in_module_regressions={}, originals={})
+    existing_test = "--- a/src/tests.rs\n+++ b/src/tests.rs\n@@ -1 +1 @@\n-#[test]\n+#[test]\n"
+    assert ma._detect_benchmark_test_conflicts(existing_test, state, contract)
+    test_contract = ma.extract_issue_contract("Update the existing snapshot test expected output")
+    assert ma._detect_benchmark_test_conflicts(existing_test, state, test_contract) == []
+
+
+def test_submission_gate_blocks_current_code_smoke_but_warns_baseline_and_environment():
+    ma = _load("multi_agent")
+    state = SimpleNamespace(_existing_test_failures=[], _revision=4)
+    patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn bug() { 0 }\n+pub fn bug() { 1 }\n"
+    selected = [Path("src/lib.rs")]
+    code = {"target": "test:unit", "status": "failed", "classification": "code", "baseline_status": "passed", "observed_revision": 4, "details": "error[E0061]: this function takes 1 argument"}
+    gate = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [code])
+    assert gate["blocking"] and "test:unit" in gate["blocking"][0]
+    baseline = dict(code, baseline_status="failed")
+    env = {"target": "test:network", "status": "environment_error", "classification": "environment", "observed_revision": 4, "details": "download failed"}
+    gate = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [baseline, env])
+    assert gate["blocking"] == []
+    assert len(gate["warnings"]) == 2
+
+
+def test_deterministic_qa_and_verified_fallback_cannot_bypass_smoke_gate(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {item.name: item for item in tools_list}
+    try:
+        tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_gate.rs",
+            "content": "#[test] fn regression_gate() { assert_eq!(demo::bug(), 1); }",
+        })
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+        state.pass_test(state.start_test(), test_target="test_regression_gate")
+        state.run_existing_test_smoke = lambda selected: [{
+            "target": "test:unit", "status": "failed", "classification": "code",
+            "baseline_status": "passed", "details": "error[E0061]: wrong argument count",
+        }]
+
+        qa = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix bug()"), run_doctest_on_shift=False)
+        assert qa["ok"] is False
+        assert "Submission gate failed" in qa["reason"]
+
+        raw = state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+        assert raw
+        assert ma._clean_and_audit_fallback_patch(state, ma.extract_issue_contract("Fix bug()"), raw) == ""
+    finally:
+        state.close()
 
 
 def test_multi_agent_fast_path_skips_suggester_and_submits(monkeypatch, tmp_path):
@@ -220,7 +313,7 @@ def test_visible_panic_mismatch_reaches_fixer_and_verifier(monkeypatch, tmp_path
         seen.append(role)
 
         def invoke(inputs, config):
-            prompt = inputs["messages"][0]["content"]
+            prompt = inputs["messages"][-1]["content"]
             if role == "navigator":
                 result = json.loads(tmap["cargo_test"].invoke({"test_target": "visible"}))
                 assert result["failure_details"][0]["kind"] == "panic_message_mismatch"
@@ -289,7 +382,7 @@ def test_multi_agent_planned_path_escalation_and_qa_rejection(monkeypatch, tmp_p
                     "summary": "need new method",
                     "candidate_chains": [
                         {"chain_id": "C1", "hypothesis": "h1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]},
-                        {"chain_id": "C2", "hypothesis": "h2", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]},
+                            {"chain_id": "C2", "hypothesis": "h2", "nodes": [{"path": "src/other.rs", "symbol": "bug"}]},
                     ],
                     "reproduction_status": "compile_reproduction",
                     "needs_architecture_planning": True,
@@ -309,14 +402,14 @@ def test_multi_agent_planned_path_escalation_and_qa_rejection(monkeypatch, tmp_p
                     tmap["escalate_for_replan"].invoke({"reason": "stuck on trait bound"})
                 elif fixer_runs["n"] == 2:
                     # Attempt 2 forgot timestamp_micros -> QA should reject!
-                    assert "pub fn bug() -> i32 { 0 }" in tmap["read_file"].invoke({"path": "src/lib.rs"})  # checkpoint restored!
-                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn timestamp_micros_opt() -> i32 { 1 }"})
+                    assert "pub fn bug() -> i32 { 999 }" in tmap["read_file"].invoke({"path": "src/lib.rs"})  # current edits are preserved across replanning
+                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 999 }", "new_text": "pub fn timestamp_micros_opt() -> i32 { 1 }"})
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_api")
                     tmap["submit_for_qa"].invoke({"summary": "added opt variant"})
                 else:
                     # Attempt 3 fixes QA objection
-                    assert "plan_conflicts" in inputs["messages"][0]["content"]
-                    assert "forbidden_edits" in inputs["messages"][0]["content"]
+                    assert "plan_conflicts" in inputs["messages"][-1]["content"]
+                    assert "forbidden_edits" in inputs["messages"][-1]["content"]
                     tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn timestamp_micros_opt() -> i32 { 1 }", "new_text": "pub fn timestamp_micros() -> i32 { 1 }"})
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_api")
                     tmap["submit_for_qa"].invoke({"summary": "added exact requested method"})
@@ -324,10 +417,10 @@ def test_multi_agent_planned_path_escalation_and_qa_rejection(monkeypatch, tmp_p
                 verifier_runs["n"] += 1
                 if verifier_runs["n"] == 1:
                     # Confirm deterministic contract warning was injected into prompt!
-                    assert "timestamp_micros" in inputs["messages"][0]["content"]
-                    assert "pick root and add the exact method" in inputs["messages"][0]["content"]
-                    assert "do not rename bug" in inputs["messages"][0]["content"]
-                    assert "+pub fn timestamp_micros_opt()" in inputs["messages"][0]["content"]
+                    assert "timestamp_micros" in inputs["messages"][-1]["content"]
+                    assert "pick root and add the exact method" in inputs["messages"][-1]["content"]
+                    assert "do not rename bug" in inputs["messages"][-1]["content"]
+                    assert "+pub fn timestamp_micros_opt()" in inputs["messages"][-1]["content"]
                     tmap["submit_qa_decision"].invoke({
                         "decision": "REJECT",
                         "summary": "Missing exact public method",
@@ -335,11 +428,13 @@ def test_multi_agent_planned_path_escalation_and_qa_rejection(monkeypatch, tmp_p
                         "objections": ["Issue asked for timestamp_micros, only timestamp_micros_opt was added."],
                         "plan_consistency": "conflict",
                         "plan_conflicts": ["forbidden_edits says do not rename bug; diff replaces bug in src/lib.rs"],
+                        "explanation": "The issue contract requires timestamp_micros, and verification shows the diff replaces bug contrary to the plan's forbidden edit.",
                     })
                 else:
                     tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "All requirements satisfied.",
                         "plan_consistency": "conflict",
-                        "plan_conflicts": ["forbidden_edits says do not rename bug; diff replaces bug in src/lib.rs"]})
+                        "plan_conflicts": ["forbidden_edits says do not rename bug; diff replaces bug in src/lib.rs"],
+                        "explanation": "The issue contract is satisfied by the final API, while verification confirms the stale plan conflict does not affect the requested behavior."})
             return {"messages": inputs["messages"]}
 
         return SimpleNamespace(invoke=invoke)
@@ -436,7 +531,7 @@ def test_multi_agent_auto_escalates_on_repeated_compile_errors_and_recovers(monk
                 })
             elif role == "suggester":
                 # Triggered after Fast Path Fixer escalates!
-                assert "E0308" in inputs["messages"][0]["content"]
+                assert "E0308" in inputs["messages"][-1]["content"]
                 tmap["submit_repair_plan"].invoke({
                     "selected_chain_id": "C1",
                     "arbitration_rationale": "return i32 instead of unit",
@@ -457,8 +552,8 @@ def test_multi_agent_auto_escalates_on_repeated_compile_errors_and_recovers(monk
                         tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": tmap["read_lines"].invoke({"path": "src/lib.rs"}).split(": ", 1)[1], "new_text": f"pub fn bug() -> i32 {{ {v} }}"})
                         tmap["cargo_check"].invoke({})
                 else:
-                    assert states[-1].stuck_status()["compile_repeats"] == 0
-                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                    assert states[-1].stuck_status()["compile_repeats"] <= 1
+                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { ()  }", "new_text": "pub fn bug() -> i32 { 1 }"})
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
                     tmap["submit_for_qa"].invoke({"summary": "fixed"})
             elif role == "verifier":
@@ -749,7 +844,7 @@ def test_reserve_reached_runs_single_rescue_without_zero_call_spin(monkeypatch, 
                 else:
                     # Rescue pass must NOT have escalate_for_replan and has remaining=3
                     assert "escalate_for_replan" not in tmap
-                    assert "LOW BUDGET RESCUE" in inputs["messages"][0]["content"]
+                    assert "LOW BUDGET RESCUE" in inputs["messages"][-1]["content"]
                     fake_client.calls_made = 29
                     fake_client.remaining_calls = 1
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
@@ -812,7 +907,7 @@ def test_single_quoted_prose_not_treated_as_lifetime_and_fast_path_ignores_test_
         state.close()
 
 
-def test_comment_only_doctest_line_shift_rejected_and_secondary_prune_plus_degraded_fallback(tmp_path):
+def test_mixed_code_doctest_shift_is_nonblocking_and_secondary_prune_works(tmp_path):
     ma = _load("multi_agent")
     tools_mod = _load("tools")
     repo = tmp_path / "doc_repo"
@@ -834,7 +929,7 @@ def test_comment_only_doctest_line_shift_rejected_and_secondary_prune_plus_degra
     try:
         tools["write_regression_test"].invoke({"path": "tests/test_regression_main.rs", "content": "#[test] fn a() {}"})
         tools["write_regression_test"].invoke({"path": "tests/test_regression_extra_tmp.rs", "content": "#[test] fn b() {}"})
-        # Adding a net doc-comment line above doctests shifts exact benchmark doctest lines -> rejected!
+        # A mixed code/doc hunk is reported as a warning but must remain submittable.
         tools["edit_file"].invoke({
             "path": "src/lib.rs",
             "edits": [
@@ -849,9 +944,8 @@ def test_comment_only_doctest_line_shift_rejected_and_secondary_prune_plus_degra
         assert pruned == ["tests/test_regression_extra_tmp.rs"]
         assert not (state.root / "tests" / "test_regression_extra_tmp.rs").exists()
 
-        det_bad = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix bug()"), run_doctest_on_shift=False)
-        assert det_bad["ok"] is False
-        assert "doctest" in det_bad["reason"].lower()
+        det_mixed = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix bug()"), run_doctest_on_shift=False)
+        assert det_mixed["ok"] is True
 
         # Revert doc comment to line-neutral (delta=0) -> passes deterministic QA!
         tools["edit_file"].invoke({
@@ -1133,6 +1227,7 @@ def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeyp
                     "summary": "need new method",
                     "candidate_chains": [
                         {"chain_id": "C1", "hypothesis": "h1", "nodes": [{"path": "src/lib.rs", "symbol": "bug", "role": "root_candidate"}]},
+                            {"chain_id": "C2", "hypothesis": "h2", "nodes": [{"path": "src/other.rs", "symbol": "bug"}]},
                     ],
                     "reproduction_status": "compile_reproduction",
                     "needs_architecture_planning": True,
@@ -1152,7 +1247,7 @@ def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeyp
                     tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 2 }"})
                     tmap["escalate_for_replan"].invoke({"reason": "need exact api name"})
                 else:
-                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn timestamp_micros() -> i32 { 1 }"})
+                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 2 }", "new_text": "pub fn timestamp_micros() -> i32 { 1 }"})
                     states[-1].pass_test(states[-1].start_test(), test_target="test_regression_api")
                     tmap["submit_for_qa"].invoke({"summary": "added timestamp_micros"})
             elif role == "verifier":
@@ -1197,7 +1292,7 @@ def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeyp
     nav_snap = next(s for s in snapshots if s["stage"] == "navigator_handoff")
     assert nav_snap["route"] == "planned"
     assert nav_snap["outcome"] == "completed"
-    assert nav_snap["features"]["candidate_chains"]["chain_count"] == 1
+    assert nav_snap["features"]["candidate_chains"]["chain_count"] == 2
     assert nav_snap["features"]["candidate_chains"]["root_candidates"][0]["path"] == "src/lib.rs"
 
     sug_snap = next(s for s in snapshots if s["stage"] == "suggester_handoff")
@@ -1218,232 +1313,5 @@ def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeyp
     assert ver_snaps[0]["features"]["objections"]["items"] == ["Verify edge case"]
     assert ver_snaps[1]["ver_prompt_chars"] > 0
 
-def test_p1_checkpoint_dump_and_load_roundtrip(tmp_path):
-    tools_mod = _load("tools")
-    repo = _setup_fake_repo(tmp_path)
-    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
-    tools = {t.name: t for t in tools_list}
-    try:
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_roundtrip.rs", "content": "#[test] fn r() {}"})
-        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 100 }"})
-        state.pass_test(state.start_test(), test_target="test_regression_roundtrip")
-
-        dump_dir = tmp_path / "dumped_state"
-        meta = state.dump_checkpoint_dir(dump_dir)
-        assert (dump_dir / "state.json").is_file()
-        assert (dump_dir / "files" / "tests" / "test_regression_roundtrip.rs").is_file()
-        assert (dump_dir / "originals" / "src" / "lib.rs").is_file()
-
-        # Mutate current state
-        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 100 }", "new_text": "pub fn bug() -> i32 { 999 }"})
-        assert "999" in (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
-
-        # Load back from dumped checkpoint
-        restored = state.load_checkpoint_dir(dump_dir)
-        assert "100" in (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
-        assert (state.root / "tests" / "test_regression_roundtrip.rs").is_file()
-        assert any(k[1] == "test_regression_roundtrip" for k in state._passed_regressions)
-    finally:
-        state.close()
 
 
-def test_p1_causal_interventions_across_all_actions(tmp_path):
-    ma = _load("multi_agent")
-    tools_mod = _load("tools")
-    repo = _setup_fake_repo(tmp_path)
-    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
-    tools = {t.name: t for t in tools_list}
-    try:
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_inv.rs", "content": "#[test] fn t() { assert!(false); }"})
-
-        blackboard = {
-            "issue_contract": {"requested_symbols": ["foo"]},
-            "localization": {
-                "candidate_chains": [
-                    {"chain_id": "C1", "hypothesis": "root bug", "nodes": [{"path": "src/lib.rs", "symbol": "bug", "line_start": 1, "line_end": 5, "vis": "pub", "role": "root_candidate"}]}
-                ],
-                "reproduction_status": "runtime_failure",
-            },
-            "repair_plan": {
-                "action": "plan",
-                "arbitration_rationale": "initial rationale",
-                "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "description": "do fix"}],
-                "api_checklist": ["foo"],
-            },
-            "shared_read_excerpts": {"src/lib.rs:1-10": "content line 1\ncontent line 2", "src/lib.rs:20-30": "other"},
-            "shared_ckg_notes": {"foo": "ckg note for foo"},
-        }
-
-        # 1. candidate_chains: weaken
-        r_weaken = ma.apply_causal_intervention(blackboard, state, {"feature": "candidate_chains", "action": "weaken"})
-        assert r_weaken["applied"] is True
-        nodes = blackboard["localization"]["candidate_chains"][0]["nodes"]
-        assert "symbol" not in nodes[0]
-        assert nodes[0]["path"] == "src/lib.rs"
-
-        # 2. candidate_chains: drop
-        r_drop = ma.apply_causal_intervention(blackboard, state, {"feature": "candidate_chains", "action": "drop"})
-        assert blackboard["localization"]["candidate_chains"] == []
-
-        # 3. arbitration_rationale: override (the bytes-377 pattern!)
-        r_rat = ma.apply_causal_intervention(
-            blackboard, state,
-            {"feature": "arbitration_rationale", "action": "override", "value": "Implement panic when cnt > remaining_mut"}
-        )
-        assert blackboard["repair_plan"]["arbitration_rationale"] == "Implement panic when cnt > remaining_mut"
-
-        # 4. shared_read_excerpts: drop (LaMAR context reduction)
-        r_reads = ma.apply_causal_intervention(blackboard, state, {"feature": "shared_read_excerpts", "action": "drop"})
-        assert blackboard["shared_read_excerpts"] == {}
-
-        # 5. api_checklist: override
-        r_api = ma.apply_causal_intervention(
-            blackboard, state,
-            {"feature": "api_checklist", "action": "override", "value": ["timestamp_micros", "timestamp_nanos"]}
-        )
-        assert blackboard["repair_plan"]["api_checklist"] == ["timestamp_micros", "timestamp_nanos"]
-
-        # 6. route: override
-        r_route = ma.apply_causal_intervention(blackboard, state, {"feature": "route", "action": "override", "value": "fast"})
-        assert blackboard["_forced_route"] == "fast"
-
-        # 7. repro_test: corrupt
-        r_corrupt = ma.apply_causal_intervention(blackboard, state, {"feature": "repro_test", "action": "corrupt"})
-        assert "dummy_corrupted" in (state.root / "tests" / "test_regression_inv.rs").read_text(encoding="utf-8")
-
-        # 8. repro_test: drop
-        r_drop_test = ma.apply_causal_intervention(blackboard, state, {"feature": "repro_test", "action": "drop"})
-        assert not (state.root / "tests" / "test_regression_inv.rs").exists()
-        assert blackboard["localization"]["reproduction_status"] == "not_reproduced"
-    finally:
-        state.close()
-
-
-def test_p1_dump_pre_fix_and_replay_with_causal_intervention(monkeypatch, tmp_path):
-    agent_mod = _load("agent")
-    repo = _setup_fake_repo(tmp_path)
-    states = []
-    orig_make_tools = agent_mod.make_tools
-
-    def cap_make_tools(r, *a, **kw):
-        t, s = orig_make_tools(r, *a, **kw)
-        s.post_strip_check = False
-        s.require_reproduction = False
-        states.append(s)
-        return t, s
-
-    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
-    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
-
-    roles_run_1 = []
-    roles_run_2 = []
-
-    def make_fake_create_agent(roles_collector, plan_override_value=None):
-        def fake_create_agent(model, tools, system_prompt):
-            tmap = {t.name: t for t in tools}
-            if "Navigator & Reproducer" in system_prompt:
-                role = "navigator"
-            elif "Rust Architect / Suggester" in system_prompt:
-                role = "suggester"
-            elif "Rust Fixer" in system_prompt:
-                role = "fixer"
-            else:
-                role = "verifier"
-            roles_collector.append(role)
-
-            def invoke(inputs, config):
-                if role == "navigator":
-                    tmap["write_regression_test"].invoke({"path": "tests/test_regression_p1.rs", "content": "#[test] fn t() {}"})
-                    tmap["submit_localization_bundle"].invoke({
-                        "summary": "bug found",
-                        "candidate_chains": [{"chain_id": "C1", "hypothesis": "return 0", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
-                        "reproduction_status": "runtime_failure",
-                        "needs_architecture_planning": True,
-                    })
-                elif role == "suggester":
-                    tmap["submit_repair_plan"].invoke({
-                        "selected_chain_id": "C1",
-                        "arbitration_rationale": "fix return",
-                        "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "description": "return 1"}],
-                    })
-                elif role == "fixer":
-                    # Fixer checks that intervention value was injected into prompt!
-                    if plan_override_value is not None:
-                        assert plan_override_value in inputs["messages"][0]["content"]
-                        assert '"description": "return 1"' in inputs["messages"][0]["content"]
-                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
-                    states[-1].pass_test(states[-1].start_test(), test_target="test_regression_p1")
-                    tmap["submit_for_qa"].invoke({"summary": "fixed"})
-                elif role == "verifier":
-                    tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok"})
-                return {"messages": inputs["messages"]}
-
-            return SimpleNamespace(invoke=invoke)
-        return fake_create_agent
-
-    # Run 1: Normal run with --dump-pre-fix
-    monkeypatch.setattr(agent_mod, "create_agent", make_fake_create_agent(roles_run_1))
-    dump_dir = tmp_path / "pre_fix_dump"
-    post_plan_dir = tmp_path / "post_plan_dump"
-    monkeypatch.setenv("RUSTBENCH_DUMP_POST_PLAN", str(post_plan_dir))
-    patch_1 = agent_mod.run_agent(
-        repo, "Fix bug()", "m", "k", max_api_calls=70,
-        dump_pre_fix_dir=dump_dir, instance_id="demo_p1",
-    )
-    assert "+pub fn bug() -> i32 { 1 }" in patch_1
-    assert roles_run_1 == ["navigator", "suggester", "fixer", "verifier"]
-
-    dump_dir = dump_dir / "demo_p1"
-    assert (dump_dir / "meta.json").is_file()
-    assert (dump_dir / "patch_state" / "state.json").is_file()
-    post_plan = json.loads((post_plan_dir / "meta.json").read_text(encoding="utf-8"))
-    assert post_plan["instance_id"] == "demo_p1"
-    assert post_plan["blackboard"]["repair_plan"]["arbitration_rationale"] == "fix return"
-
-    # Revert working repo back to base for Run 2
-    (repo / "src" / "lib.rs").write_text("pub fn bug() -> i32 { 0 }\n", encoding="utf-8")
-    if (repo / "tests" / "test_regression_p1.rs").exists():
-        (repo / "tests" / "test_regression_p1.rs").unlink()
-
-    # Run 2: Replay pre_fix with causal intervention on arbitration_rationale!
-    intervention_text = "INJECTED_CAUSAL_RATIONALE_MUST_APPEAR"
-    monkeypatch.setattr(agent_mod, "create_agent", make_fake_create_agent(roles_run_2, plan_override_value=intervention_text))
-
-    trace_replay_path = tmp_path / "replay_trace.jsonl"
-    trace_replay = agent_mod.TraceRecorder(trace_replay_path)
-    patch_2 = agent_mod.run_agent(
-        repo, "Fix bug()", "m", "k", max_api_calls=70,
-        replay_pre_fix_dir=dump_dir,
-        intervention={"feature": "arbitration_rationale", "action": "override", "value": intervention_text},
-        trace=trace_replay,
-        instance_id="demo_p1",
-    )
-    assert "+pub fn bug() -> i32 { 1 }" in patch_2
-    # Navigator was completely skipped in Run 2!
-    assert "navigator" not in roles_run_2
-    assert "suggester" in roles_run_2
-    assert "fixer" in roles_run_2
-    assert "verifier" in roles_run_2
-
-    replay_events = [json.loads(l)["event"] for l in trace_replay_path.read_text(encoding="utf-8").splitlines()]
-    assert "pre_fix_replayed" in replay_events
-    assert "causal_intervention" in replay_events
-    assert "qa_gate" in replay_events
-    audit = next(json.loads(l) for l in trace_replay_path.read_text(encoding="utf-8").splitlines()
-                 if json.loads(l)["event"] == "plan_consistency_audit")
-    assert audit["status"] == "not_checked"
-    assert audit["applied_interventions"] == [{"feature": "arbitration_rationale", "action": "override"}]
-
-    # A post-plan replay must skip both Navigator and Architect, while retaining
-    # all of the original plan except the explicitly overridden rationale.
-    (repo / "src" / "lib.rs").write_text("pub fn bug() -> i32 { 0 }\n", encoding="utf-8")
-    roles_run_3 = []
-    monkeypatch.setattr(agent_mod, "create_agent", make_fake_create_agent(roles_run_3, plan_override_value=intervention_text))
-    patch_3 = agent_mod.run_agent(
-        repo, "Fix bug()", "m", "k", max_api_calls=70,
-        replay_pre_fix_dir=post_plan_dir,
-        intervention={"feature": "arbitration_rationale", "action": "override", "value": intervention_text},
-        instance_id="demo_p1",
-    )
-    assert "+pub fn bug() -> i32 { 1 }" in patch_3
-    assert roles_run_3 == ["fixer", "verifier"]

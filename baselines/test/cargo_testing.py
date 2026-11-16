@@ -277,6 +277,8 @@ def make_cargo_test_tool(
             if test_filter.startswith('-'):
                 raise ValueError("test_filter must not start with a dash")
             command = ["cargo", "test", "--message-format=json", "--manifest-path", str(manifest)]
+            if (root / "Cargo.lock").is_file() or (manifest.parent / "Cargo.lock").is_file():
+                command.append("--locked")
             if package:
                 command.append("--package=" + package)
             if test_target:
@@ -327,9 +329,24 @@ def make_cargo_test_tool(
             failed_target = failed_target_match.group(1) if failed_target_match else ""
             started_counts = re.findall(r"^running (\d+) tests?\s*$", test_output, re.MULTILINE)
             tests_started = sum(int(c) for c in started_counts)
-            counts = re.findall(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", test_output, re.MULTILINE)
-            executed = sum(int(passed) + int(failed) for passed, failed, ignored in counts)
-            ignored_tests = sum(int(ignored) for _, _, ignored in counts)
+            summary_counts = re.findall(
+                r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;",
+                test_output,
+                re.MULTILINE,
+            )
+            detailed_counts = re.findall(
+                r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; "
+                r"(\d+) ignored; \d+ measured; (\d+) filtered out(?:;|$)",
+                test_output,
+                re.MULTILINE,
+            )
+            executed = sum(int(passed) + int(failed) for passed, failed, ignored in summary_counts)
+            ignored_tests = sum(int(ignored) for _, _, ignored in summary_counts)
+            filtered_tests = (
+                sum(int(filtered) for _, _, _, filtered in detailed_counts)
+                if summary_counts and len(detailed_counts) == len(summary_counts)
+                else None
+            )
             compile_errors = [d for d in diagnostics if d.get("level") == "error"]
             if no_run and result.returncode == 0:
                 pass
@@ -345,6 +362,7 @@ def make_cargo_test_tool(
                     tests=tests,
                     passed_tests=passed_tests,
                     ignored_tests=ignored_tests,
+                    filtered_tests=filtered_tests,
                     features=features,
                     all_features=all_features,
                     no_default_features=no_default_features,
@@ -363,6 +381,7 @@ def make_cargo_test_tool(
                     bin_target=bin_target,
                     tests=tests,
                     executed=executed,
+                    filtered_tests=filtered_tests,
                     failures=failures,
                     returncode=result.returncode,
                     failed_target=failed_target,
@@ -402,6 +421,7 @@ def make_cargo_test_tool(
                 "diagnostics": kept_diagnostics,
                 "tests_executed": executed,
                 "tests_ignored": ignored_tests,
+                "tests_filtered": filtered_tests,
                 "failed_tests": failures,
                 "failure_details": failure_details,
                 "test_output": compacted_output,

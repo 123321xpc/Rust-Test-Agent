@@ -557,6 +557,8 @@ def make_cargo_check_tool(root, resolve_path, env=None, on_result=None, ckg=None
             if not manifest.is_file() or manifest.name != "Cargo.toml":
                 return "Error: manifest_path must point to a Cargo.toml file in the working copy."
             command = ["cargo", "check", "--message-format=json", "--manifest-path", str(manifest)]
+            if (root / "Cargo.lock").is_file() or (manifest.parent / "Cargo.lock").is_file():
+                command.append("--locked")
             if package:
                 command.append(f"--package={package}")
             if features:

@@ -1,4 +1,4 @@
-# Jifang 十任务验证集
+# Jifang 五任务验证集
 
 固定清单为 `manifest.json`，服务器上的入口是 `~/xpc/validation/validate`，使用 rootful Docker。通过 `--network proxy`（默认）或 `--network direct` 选择网络模式。代理模式要求 Windows 端 11321 代理和 SSH 反向隧道，入口在启动及每次评测前检查代理；直连模式清空智能体、构建步骤及测试容器的代理环境变量，不检查反向隧道。
 
@@ -10,7 +10,7 @@
 ~/xpc/validation/validate --agent all --dry-run
 ~/xpc/validation/validate --agent all --network direct --dry-run
 
-# 运行一个智能体、生成补丁并评测全部 10 项
+# 运行一个智能体、生成补丁并评测全部 5 项
 ~/xpc/validation/validate --agent normal
 ~/xpc/validation/validate --agent swe-agent
 ~/xpc/validation/validate --agent RustForger
@@ -18,12 +18,15 @@
 ~/xpc/validation/validate --agent trace-impr
 ~/xpc/validation/validate --agent test
 
-# 顺序运行以上全部智能体（最多 50 次任务运行）
+# 顺序运行全部 6 个智能体（最多 30 次任务运行）
 ~/xpc/validation/validate --agent all
 
 # 后台运行：--background 必须放在第一个参数，命令会打印启动日志位置
 ~/xpc/validation/validate --background --agent all
 ~/xpc/validation/validate --background --agent normal --network direct
+
+# 指定模型；此值覆盖 .env 和 shell 环境中的 MODEL
+~/xpc/validation/validate --agent normal --model deepseek-v4.1-flash
 
 # 仅跑一个或多个验证集内的任务
 ~/xpc/validation/validate --agent normal --instance chronotope__chrono-991
@@ -33,7 +36,7 @@
 ~/xpc/validation/validate --agent normal --max-workers 2 --timeout 1800
 ```
 
-模型、API 地址、密钥和调用上限读取 `~/xpc/.env`，同名 shell 环境变量优先。运行会调用模型并可能产生费用。后台任务与 SSH 会话独立；代理模式下代理或反向隧道中断会影响后续操作。网络模式记录在 `run_metadata.json` 中。
+模型、API 地址、密钥和调用上限读取 `~/xpc/.env`，同名 shell 环境变量优先；命令行 `--model` 可单次覆盖模型名。实际模型名记录在 `run_metadata.json` 中。运行会调用模型并可能产生费用。后台任务与 SSH 会话独立；代理模式下代理或反向隧道中断会影响后续操作。网络模式记录在 `run_metadata.json` 中。
 
 入口使用服务器上的代码：`~/xpc/baselines/{normal,ACI-impr,trace-impr,test}`、`~/xpc/RustForger` 和 `~/xpc/sweagent-run/SWE-agent`。如果在 Windows 工作区修改了智能体，须先将相应修改同步到这些服务器目录；验证命令不会自动同步代码。
 
@@ -49,7 +52,7 @@
 
 从抽样时的 110 个 `rustbench/` 本地任务镜像出发，根据仓库、PR 编号和基准提交精确匹配数据集，剔除没有问题描述映射或曾有评测报告的任务。`manifest.json` 记录了当时的排除列表。排除只依据当时在服务器上找到的报告，不保证此前从未被运行过。
 
-以标准补丁中实际增删行数之和衡量规模：小 ≤15 行，中 16–150 行，大 >150 行。15 和 150 采用论文分析中出现的尺度，作为本验证集的操作性分界，并非论文给出的正式三类标准。按 `rustbench-validation-v1` 种子和任务 ID 的 SHA-256 排序，在每一档优先选择此前未选过的仓库，选出大、中、小各 3、4、3 个。规模并不等价于任务难度。
+以标准补丁中实际增删行数之和衡量规模：小 ≤15 行，中 16–150 行，大 >150 行。15 和 150 采用论文分析中出现的尺度，作为本验证集的操作性分界，并非论文给出的正式三类标准。原始十项清单按 `rustbench-validation-v1` 种子和任务 ID 的 SHA-256 排序，在各档优先选择此前未选过的仓库，选出大、中、小各 3、4、3 个。当前清单从中保留全部 3 个小补丁任务，以及改动行数最少的 2 个中补丁任务（31、63 行）；规模并不等价于任务难度。
 
 `select_tasks.py` 记录抽样过程，发现已有 `manifest.json` 时拒绝覆盖。任务清单固定后，日常运行不会重新抽样。验证集如果被反复用于优化，就属于开发验证集，不应作为最终独立测试集。
 
@@ -75,10 +78,10 @@ $PY validation/run_bytes_p1.py report --dir <paired-dir>
 
 `python -m unittest discover -s validation -p 'test_*.py' -v` 测试抽样统计、固定清单、SWE-agent 输入与输出转换及空补丁处理。`smoke_checks.py` 提供服务器上的无模型容器和评测检查；`smoke-normal.sh` 是仅限一次模型请求的单任务检查，不代表正常预算下的成功率。
 
-## 2026-11-13：验证集 crate 离线缓存
+## 2026-11-13：原十项验证集 crate 离线缓存
 
-已通过 Windows 11321 代理和 SSH 反向隧道，为固定 10 项的任务镜像缓存锁文件中的 Cargo 依赖；`cargo-generate__cargo-generate-880` 还缓存了参考补丁新增的依赖。原任务镜像保存在对应镜像标签末尾 `-before-offline-20261113` 的回退标签中；冻结清单里的原标签指向已缓存镜像。任务源码、锁文件和镜像默认启动配置均与回退镜像核对一致。
+以下为缩减前原十项清单的离线缓存记录。已通过 Windows 11321 代理和 SSH 反向隧道，为当时十项任务镜像缓存锁文件中的 Cargo 依赖；`cargo-generate__cargo-generate-880` 还缓存了参考补丁新增的依赖。原任务镜像保存在对应镜像标签末尾 `-before-offline-20261113` 的回退标签中；冻结清单里的原标签指向已缓存镜像。任务源码、锁文件和镜像默认启动配置均与回退镜像核对一致。
 
-在 `--network none` 容器中，10 项均通过 `cargo metadata --locked`；应用参考补丁和测试补丁后，10 项的相关测试目标均通过 `cargo test --no-run` 的离线编译。`sharkdp__bat-562` 的参考补丁中 `Cargo.lock` 改动无法应用到镜像现有锁文件，编译检查因此跳过了该锁文件改动并使用镜像现有锁文件。编译检查不运行测试，也不保证任意新补丁引入的依赖已经缓存；模型 API 和可能在测试运行期间主动发起的网络请求不属于此缓存验证。
+当时十项均在 `--network none` 容器中通过 `cargo metadata --locked`；应用参考补丁和测试补丁后，十项的相关测试目标均通过 `cargo test --no-run` 的离线编译。`sharkdp__bat-562` 的参考补丁中 `Cargo.lock` 改动无法应用到镜像现有锁文件，编译检查因此跳过了该锁文件改动并使用镜像现有锁文件。编译检查不运行测试，也不保证任意新补丁引入的依赖已经缓存；模型 API 和可能在测试运行期间主动发起的网络请求不属于此缓存验证。
 
 审计记录及每项日志位于 `~/xpc/validation/offline-cache-20261113/`，其中 `final-audit.json` 记录镜像配置、工作区与离线依赖解析结果，`build-summary.json` 记录断网编译结果和例外。

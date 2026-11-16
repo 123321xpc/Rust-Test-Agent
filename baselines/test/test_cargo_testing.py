@@ -156,6 +156,57 @@ def test_cargo_test_tests_flag_and_mutex(project, monkeypatch):
     assert json.loads(tool.invoke({"tests": True, "test_target": "works"}))["status"] == "error"
 
 
+def test_filtered_test_count_is_aggregated_and_forwarded(project, monkeypatch):
+    root, _ = project
+    seen = []
+    diag_mod = load("rust_diagnostics")
+    test_tool = load("cargo_testing").make_cargo_test_tool(
+        root,
+        lambda path: (root / path).resolve(),
+        diag_mod._simplify,
+        on_success=lambda token, **kwargs: seen.append(kwargs),
+    )
+    output = (
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n"
+        "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 3 filtered out\n"
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, output, ""),
+    )
+
+    result = json.loads(test_tool.invoke({"tests": True}))
+
+    assert result["tests_executed"] == 3
+    assert result["tests_ignored"] == 1
+    assert result["tests_filtered"] == 5
+    assert seen[0]["filtered_tests"] == 5
+
+
+def test_filtered_test_count_is_forwarded_on_failure(project, monkeypatch):
+    root, _ = project
+    seen = []
+    diag_mod = load("rust_diagnostics")
+    test_tool = load("cargo_testing").make_cargo_test_tool(
+        root,
+        lambda path: (root / path).resolve(),
+        diag_mod._simplify,
+        on_failure=lambda token, **kwargs: seen.append(kwargs),
+    )
+    output = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out;\n"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 101, output, ""),
+    )
+
+    result = json.loads(test_tool.invoke({"test_target": "sample", "test_filter": "fails"}))
+
+    assert result["tests_filtered"] == 1
+    assert seen[0]["filtered_tests"] == 1
+
+
 def test_passing_long_test_output_compacts_to_summary(project, monkeypatch):
     _, tool = project
     lines = ["running 50 tests"] + [f"test test_case_with_long_name_{i} ... ok" for i in range(50)]
@@ -220,6 +271,8 @@ def test_cargo_test_passes_features_to_on_success_and_compile_errors_to_on_failu
     res_ok = json.loads(test_tool.invoke({"test_target": "sample", "features": ["extra"]}))
     assert res_ok["status"] == "passed"
     assert seen_success[0]["features"] == ["extra"]
+    assert seen_success[0]["filtered_tests"] == 0
+    assert res_ok["tests_filtered"] == 0
 
     err_json = json.dumps({
         "reason": "compiler-message",

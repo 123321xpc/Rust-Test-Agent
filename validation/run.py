@@ -149,6 +149,14 @@ def run_logged(args, log_path, cwd, env):
 def run_baseline(agent, task, row, folder, env):
     (folder / 'issue.txt').write_text(row['problem_statement'], encoding='utf-8')
     args = docker_base(task, env)
+    if agent == 'test':
+        from swebench.harness.test_spec import evaluation_toolchain_override
+        override = evaluation_toolchain_override(row)
+        if override:
+            args += ['-e', f'RUSTBENCH_EVAL_TOOLCHAIN_OVERRIDE={override}']
+        config = json.loads((HARNESS / 'swebench/harness/logs/config.json').read_text(encoding='utf-8'))
+        if task['instance_id'] in config.get('test', []) or task['instance_id'] in config.get('nightly_wo_features', []):
+            args += ['-e', 'RUSTBENCH_ALL_FEATURES=0']
     agent_path = ROOT / 'baselines' / agent
     args += ['-v', f'{agent_path}:{agent_path}:ro', '-v', f'{folder}:/run/task:rw']
     # Discard original Git history within the disposable task container.
@@ -243,6 +251,7 @@ def evaluate(agent, tasks, folder, run_id, env, workers, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent', required=True, choices=(*AGENTS, 'all'), help='Agent to run; all runs all registered agents')
+    parser.add_argument('--model', help='Override the MODEL value from the environment and .env file')
     parser.add_argument('--instance', action='append', help=f'Restrict to {SET_NAME} instance ID; repeat for multiple')
     parser.add_argument('--max-workers', type=int, default=2, help='Concurrent evaluation workers (default: 2)')
     parser.add_argument('--timeout', type=int, default=1800, help='Evaluation timeout in seconds (default: 1800)')
@@ -264,9 +273,13 @@ def main():
         return 0
     if args.max_workers < 1 or args.timeout < 1:
         parser.error('--max-workers and --timeout must be positive')
+    if args.model is not None and not args.model.strip():
+        parser.error('--model must not be empty')
     agents = list(AGENTS) if args.agent == 'all' else [args.agent]
     rows = {r['instance_id']: r for r in read_jsonl(ROOT / 'data/rustbench-all.jsonl')}
     env = child_env(args.network)
+    if args.model is not None:
+        env['MODEL'] = args.model
     preflight(tasks, rows, agents, env)
     if args.dry_run:
         print(f'Preflight passed: {len(tasks)} cached images, agents: {", ".join(agents)}, network: {args.network}')

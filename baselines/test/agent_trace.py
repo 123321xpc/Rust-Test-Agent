@@ -22,6 +22,7 @@ class TraceRecorder(BaseCallbackHandler):
         self.output_tokens = 0
         self.total_tokens = 0
         self.responses_without_usage = 0
+        self.transient_failures = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _clean(self, value):
@@ -46,7 +47,11 @@ class TraceRecorder(BaseCallbackHandler):
         with self.lock:
             if event == 'api_request':
                 self.api_calls += 1
+            elif event == 'api_error' and data.get('transient'):
+                self.transient_failures += 1
             elif event == 'api_response':
+                if data.get('transient'):
+                    self.transient_failures += 1
                 body = data.get('body')
                 usage = body.get('usage') if isinstance(body, dict) else None
                 if isinstance(usage, dict) and isinstance(usage.get('prompt_tokens'), int) and isinstance(usage.get('completion_tokens'), int):
@@ -63,7 +68,8 @@ class TraceRecorder(BaseCallbackHandler):
         with self.lock:
             return dict(api_calls=self.api_calls, input_tokens=self.input_tokens,
                         output_tokens=self.output_tokens, total_tokens=self.total_tokens,
-                        responses_without_usage=self.responses_without_usage)
+                        responses_without_usage=self.responses_without_usage,
+                        transient_failures=self.transient_failures)
 
 
     def on_chat_model_start(self, serialized, messages, *, run_id, parent_run_id=None, **kwargs):
@@ -103,12 +109,18 @@ class TraceHTTPClient(httpx.Client):
         self.recorder = recorder
         self.max_calls = max_calls
         self._calls = 0
+        self._transient_failures = 0
         self._calls_lock = threading.Lock()
 
     @property
     def calls_made(self):
         with self._calls_lock:
             return self._calls
+
+    @property
+    def stage_calls_made(self):
+        with self._calls_lock:
+            return self._calls - self._transient_failures
 
     @property
     def remaining_calls(self):
@@ -130,12 +142,20 @@ class TraceHTTPClient(httpx.Client):
             response = super().send(request, **kwargs)
             response.read()
         except Exception as exc:
+            transient = isinstance(exc, httpx.TransportError)
+            if transient:
+                with self._calls_lock:
+                    self._transient_failures += 1
             if self.recorder:
-                self.recorder.record('api_error', request_id=request_id, error=str(exc))
+                self.recorder.record('api_error', request_id=request_id, error=str(exc), transient=transient)
             raise
+        transient = response.status_code in (408, 409, 429) or response.status_code >= 500
+        if transient:
+            with self._calls_lock:
+                self._transient_failures += 1
         if self.recorder:
             self.recorder.record('api_response', request_id=request_id, status=response.status_code,
-                                 body=_body(response.content))
+                                 body=_body(response.content), transient=transient)
         return response
 
 

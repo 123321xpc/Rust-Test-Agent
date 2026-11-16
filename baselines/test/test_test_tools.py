@@ -81,6 +81,133 @@ def test_revert_file_restores_modified_deleted_created_and_regression_files(norm
     assert tools["generate_patch"].invoke({}) == "No changes to submit."
 
 
+def test_write_file_rejects_erasing_existing_rust_source_without_force(normal):
+    _, tools, state = normal
+    (state.root / "src").mkdir()
+    (state.root / "src" / "lib.rs").write_text("pub fn keep() -> i32 { 1 }\n", encoding="utf-8")
+    try:
+        result = tools["write_file"].invoke({"path": "src/lib.rs", "content": "//! temporary note\n"})
+        assert "Refusing to replace an existing Rust source" in result
+        assert "pub fn keep" in (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
+        result = tools["write_file"].invoke({
+            "path": "src/lib.rs", "content": "//! intentional reset\n", "force": True,
+        })
+        assert result.startswith("Updated src/lib.rs")
+    finally:
+        state.close()
+
+
+def test_revert_preserves_recovery_checkpoint_when_dropping_last_substantive_change(normal):
+    _, tools, state = normal
+    source = state.root / "src" / "lib.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text("pub fn keep() -> i32 { 1 }\n", encoding="utf-8")
+    stat_result = source.stat()
+    state.originals[Path("src/lib.rs")] = (source.read_bytes(), stat_result.st_mode, stat_result.st_mtime_ns)
+    try:
+        tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn keep() -> i32 { 2 }\n"})
+        result = tools["revert_file"].invoke({"path": "src/lib.rs"})
+        assert "Preserved the prior working copy as checkpoint" in result
+        assert state.changed_paths() == []
+        recovery = [name for name in state._checkpoints if name.startswith("__recovery_before_revert_")]
+        assert recovery
+        state.restore_checkpoint(recovery[0])
+        assert "{ 2 }" in (state.root / "src/lib.rs").read_text(encoding="utf-8")
+    finally:
+        state.close()
+
+
+def test_checkpoint_restore_preserves_only_substantive_change(normal):
+    _, tools, state = normal
+    source = state.root / "src" / "lib.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text("pub fn keep() -> i32 { 1 }\n", encoding="utf-8")
+    stat_result = source.stat()
+    state.originals[Path("src/lib.rs")] = (source.read_bytes(), stat_result.st_mode, stat_result.st_mtime_ns)
+    try:
+        assert "Saved checkpoint 'baseline'" in state.save_checkpoint("baseline")
+        tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn keep() -> i32 { 2 }\n"})
+        result = tools["checkpoint"].invoke({"action": "restore", "name": "baseline"})
+        assert "Preserved the prior working copy as checkpoint" in result
+        recovery = [name for name in state._checkpoints if name.startswith("__recovery_before_restore_")]
+        assert recovery
+        assert "{ 1 }" in source.read_text(encoding="utf-8")
+        state.restore_checkpoint(recovery[0])
+        assert "{ 2 }" in source.read_text(encoding="utf-8")
+    finally:
+        state.close()
+
+
+def test_existing_test_smoke_checks_multiple_targets_and_compares_baseline(tmp_path, monkeypatch):
+    repo = tmp_path / "smoke_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (repo / "tests" / "cli.rs").write_text("#[test] fn cli() {}\n", encoding="utf-8")
+    (repo / "tests" / "integration.rs").write_text("#[test] fn integration() {}\n", encoding="utf-8")
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "smoke_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    spec = importlib.util.spec_from_file_location("tools_smoke_compare", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/cargo")
+    try:
+        tools["write_file"].invoke({"path": "src/main.rs", "content": "fn main() { let _patched = true; }\n"})
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            source = (state.root / "src/main.rs").read_text(encoding="utf-8")
+            if "_patched" in source:
+                return SimpleNamespace(returncode=1, stdout="test result: FAILED. 0 passed; 1 failed\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="test result: ok. 1 passed; 0 failed\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        results = state.run_existing_test_smoke([Path("src/main.rs")], timeout=3)
+        assert {item["target"] for item in results} == {"test:cli", "test:integration"}
+        assert all(item["status"] == "failed" for item in results)
+        assert all(item["classification"] == "code" for item in results)
+        assert all(item["baseline_status"] == "passed" for item in results)
+        assert len(calls) == 4
+        assert "_patched" in (state.root / "src/main.rs").read_text(encoding="utf-8")
+    finally:
+        state.close()
+
+
+def test_existing_test_smoke_does_not_attribute_baseline_failure_to_patch(tmp_path, monkeypatch):
+    repo = tmp_path / "smoke_baseline_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (repo / "tests" / "integration.rs").write_text("#[test] fn integration() {}\n", encoding="utf-8")
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "smoke_baseline_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    spec = importlib.util.spec_from_file_location("tools_smoke_baseline", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/cargo")
+    try:
+        tools["write_file"].invoke({"path": "src/main.rs", "content": "fn main() { let _patched = true; }\n"})
+        calls = iter([
+            SimpleNamespace(returncode=1, stdout="test result: FAILED. 0 passed; 1 failed\n", stderr=""),
+            SimpleNamespace(returncode=1, stdout="test result: FAILED. 0 passed; 1 failed\n", stderr=""),
+        ])
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(calls))
+        results = state.run_existing_test_smoke([Path("src/main.rs")], timeout=3)
+        assert len(results) == 1
+        assert results[0]["status"] == "failed"
+        assert results[0]["classification"] == "unknown"
+        assert results[0]["baseline_status"] == "failed"
+    finally:
+        state.close()
+
+
 def test_budget_notice_injected_when_remaining_calls_low(normal):
     _, tools, state = normal
     client = SimpleNamespace(max_calls=10, remaining_calls=2)
@@ -137,32 +264,42 @@ def test_paths_and_lifetime(normal, tmp_path):
     assert not temp_root.exists()
 
 
-def test_patch_requires_successful_nonempty_test_after_last_write(normal, monkeypatch):
+def test_patch_submission_preserves_verification_evidence_after_last_write(normal, monkeypatch):
     _, tools, state = normal
     (state.root / "Cargo.toml").write_text('[package]\nname = "sample"\nversion = "0.1.0"\n')
     tools["write_file"].invoke({"path": "edit.rs", "content": "fixed\n"})
     tools["write_regression_test"].invoke({"path": "tests/normal_regression_fix.rs", "content": "test"})
     generate = tools["generate_patch"]
     cargo_test = tools["cargo_test"]
-    assert "After the last write" in generate.invoke({})
-    assert "After the last write" in generate.invoke({"paths": ["edit.rs"]})
+    assert "Pending verification: pass regression tests" in generate.invoke({})
+    assert generate.invoke({"paths": ["edit.rs"]}).startswith("diff --git")
+    assert not state.verified()
+
+    real_run = subprocess.run
 
     def result(returncode, output):
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-            returncode=returncode, stdout=output, stderr=""))
+        def run(command, *args, **kwargs):
+            if command[0] == "cargo":
+                return SimpleNamespace(returncode=returncode, stdout=output, stderr="")
+            return real_run(command, *args, **kwargs)
+        monkeypatch.setattr(subprocess, "run", run)
 
     result(1, "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
     assert json.loads(cargo_test.invoke({}))["status"] == "failed"
-    assert "After the last write" in generate.invoke({})
+    assert "Pending verification: pass regression tests" in generate.invoke({})
     result(0, "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
     assert json.loads(cargo_test.invoke({}))["tests_executed"] == 0
-    assert "After the last write" in generate.invoke({})
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("cargo", 1)))
+    assert "Pending verification: pass regression tests" in generate.invoke({})
+    def timeout_cargo(command, *args, **kwargs):
+        if command[0] == "cargo":
+            raise subprocess.TimeoutExpired("cargo", 1)
+        return real_run(command, *args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", timeout_cargo)
     assert json.loads(cargo_test.invoke({}))["status"] == "timeout"
-    assert "After the last write" in generate.invoke({})
+    assert "Pending verification: pass regression tests" in generate.invoke({})
     result(0, "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
     assert json.loads(cargo_test.invoke({}))["tests_executed"] == 1
-    assert "After the last write" in generate.invoke({})
+    assert "Pending verification: pass regression tests" in generate.invoke({})
     cargo_test.invoke({"test_target": "normal_regression_fix"})
     monkeypatch.undo()
     assert "Unsubmitted preview" in generate.invoke({})
@@ -176,7 +313,7 @@ def test_patch_requires_successful_nonempty_test_after_last_write(normal, monkey
     monkeypatch.undo()
     assert generate.invoke({"paths": ["edit.rs"]}).startswith("diff --git")
     tools["write_file"].invoke({"path": "edit.rs", "content": "changed again\n"})
-    assert not state.patch and "After the last write" in generate.invoke({})
+    assert not state.patch and "Pending verification: pass regression tests" in generate.invoke({})
 
 
 def test_gate_requires_matching_package_regression(normal):
@@ -203,6 +340,112 @@ def test_gate_requires_matching_package_regression(normal):
     state.fail_test(token, manifest_path="member/Cargo.toml", test_target="normal_regression_issue")
     state.pass_test(state.start_test(), manifest_path="member/Cargo.toml")
     assert not state.verified()
+
+
+def test_filtered_standalone_regression_counts_only_when_target_was_fully_run(normal):
+    _, tools, state = normal
+    state.require_reproduction = True
+    tools["write_regression_test"].invoke({
+        "path": "tests/normal_regression_filtered.rs",
+        "content": "#[test] fn reproduces_issue() {}\n#[test] fn another_case() {}",
+    })
+    target = "normal_regression_filtered"
+
+    state.fail_test(
+        state.start_test(),
+        test_target=target,
+        test_filter="reproduces_issue",
+        failures=["reproduces_issue"],
+        filtered_tests=1,
+        executed=1,
+        returncode=101,
+    )
+    assert not state.reproduced_cleanly()
+
+    state.fail_test(
+        state.start_test(),
+        test_target=target,
+        test_filter="reproduces_issue",
+        failures=["reproduces_issue"],
+        filtered_tests=0,
+        executed=1,
+        returncode=101,
+    )
+    assert state.reproduced_cleanly()
+
+    tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn fixed() {}\n"})
+    state.pass_test(
+        state.start_test(),
+        test_target=target,
+        test_filter="reproduces_issue",
+        passed_tests=["reproduces_issue"],
+        filtered_tests=1,
+        executed=1,
+    )
+    assert not state.verified()
+    assert (Path("Cargo.toml"), target) not in state._passed_regressions
+
+    state.pass_test(
+        state.start_test(),
+        test_target=target,
+        test_filter="reproduces_issue",
+        passed_tests=["reproduces_issue"],
+        filtered_tests=0,
+        executed=2,
+    )
+    assert state.verified()
+
+    state.fail_test(
+        state.start_test(),
+        test_target=target,
+        test_filter="another_case",
+        failures=["another_case"],
+        filtered_tests=1,
+        executed=1,
+        returncode=101,
+    )
+    assert not state.verified()
+    assert (Path("Cargo.toml"), target) not in state._passed_regressions
+
+
+def test_cargo_toml_edit_reports_only_locked_lockfile_update_errors(normal, monkeypatch):
+    _, tools, state = normal
+    manifest = state.root / "Cargo.toml"
+    lockfile = state.root / "Cargo.lock"
+    lockfile.write_text("# existing lockfile\n", encoding="utf-8")
+    calls = []
+
+    def cargo_metadata(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                101,
+                "",
+                "error: cannot update the lock file because --locked was passed to prevent this\n",
+            )
+        return subprocess.CompletedProcess(command, 101, "", "error: no matching package found offline\n")
+
+    monkeypatch.setattr(shutil, "which", lambda _: "cargo")
+    monkeypatch.setattr(subprocess, "run", cargo_metadata)
+
+    warning = tools["write_file"].invoke({
+        "path": "Cargo.toml",
+        "content": "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    })
+    assert "Cargo.lock constraint" in warning
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert "--offline" in command and "--locked" in command
+    assert "--no-deps" not in command
+    assert kwargs["timeout"] == 20
+
+    second = tools["write_file"].invoke({
+        "path": "Cargo.toml",
+        "content": "[package]\nname = \"demo\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    })
+    assert "Cargo.lock constraint" not in second
+    assert len(calls) == 2
 
 
 def test_regression_tool_rejects_existing_files_and_other_writes(normal):
@@ -283,7 +526,7 @@ def test_red_phase_reproduction_tracking(normal):
     assert not state.reproduced()
 
 
-def test_require_reproduction_gate_enforcement(normal):
+def test_require_reproduction_reports_pending_verification(normal):
     _, tools, state = normal
     state.require_reproduction = True
     tools["write_file"].invoke({"path": "edit.rs", "content": "fixed\n"})
@@ -293,7 +536,9 @@ def test_require_reproduction_gate_enforcement(normal):
     state.pass_test(token, test_target="normal_regression_bug")
     state.pass_test(state.start_test())
     assert not state.verified()
-    assert "confirm failure (Red phase)" in tools["generate_patch"].invoke({})
+    preview = tools["generate_patch"].invoke({})
+    assert "Unsubmitted preview" in preview
+    assert "confirm failure (Red phase)" in preview
 
     # Now simulate a prior reproduction run
     token = state.start_test()
@@ -342,8 +587,9 @@ def test_post_strip_check_catches_unstripped_dependency(normal):
 
     # Attempt to submit patch with broken src/lib.rs
     out = tools["generate_patch"].invoke({"paths": ["Cargo.toml", "src/lib.rs"]})
-    assert "Post-strip verification failed" in out
-    assert not state.patch
+    assert out.startswith("diff --git")
+    assert state.patch == out
+    assert "Post-strip verification failed" in state._last_submit_error
 
 
 def test_feedback_precision_displays_runnable_commands(normal):
@@ -402,6 +648,9 @@ def test_git_worktree_isolation_and_direct_diff(tmp_path):
     (repo / "keep.rs").write_bytes(b"keep me\n")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    supports_worktree = subprocess.run(
+        ["git", "worktree", "list"], cwd=repo, capture_output=True, text=True
+    ).returncode == 0
 
     spec = importlib.util.spec_from_file_location("test_tools_git_test", Path(__file__).with_name("tools.py"))
     module = importlib.util.module_from_spec(spec)
@@ -410,7 +659,7 @@ def test_git_worktree_isolation_and_direct_diff(tmp_path):
     tool_map = {t.name: t for t in tools}
     try:
         assert state._is_git is True
-        assert state._is_worktree is True
+        assert state._is_worktree is supports_worktree
         assert (state.root / ".git").exists()
         assert "tokio-rs__bytes" in state.rust_env["CARGO_TARGET_DIR"]
 
@@ -436,8 +685,11 @@ def test_git_worktree_isolation_and_direct_diff(tmp_path):
     finally:
         state.close()
 
-    wt_list = subprocess.run(["git", "worktree", "list"], cwd=repo, check=True, capture_output=True, text=True).stdout
-    assert "test-agent-" not in wt_list
+    if supports_worktree:
+        wt_list = subprocess.run(["git", "worktree", "list"], cwd=repo, check=True, capture_output=True, text=True).stdout
+        assert "test-agent-" not in wt_list
+    else:
+        assert not state.root.exists()
 
 
 def test_patch_state_uses_deterministic_workspace_path(tmp_path):
@@ -523,10 +775,11 @@ def test_paired_reproduction_catches_fake_test_and_accepts_real_bug_test(tmp_pat
         run_res = json.loads(tool_map["cargo_test"].invoke({"test_target": "normal_regression_fake"}))
         assert run_res["status"] == "passed"
 
-        # generate_patch must trigger paired check against originals and REJECT the fake test
         preview = tool_map["generate_patch"].invoke({})
+        assert "Unsubmitted preview" in preview
         assert "Paired reproduction check failed" in preview
         assert not state.patch
+        assert not state.reproduced_cleanly()
 
         # Case B: Agent replaces with a REAL regression test asserting answer() == 2 (fails on original code 1, passes on fixed code 2)
         tool_map["write_regression_test"].invoke({
@@ -688,11 +941,11 @@ def test_post_strip_check_catches_downstream_workspace_breakage(tmp_path):
         }))
         assert res["status"] == "passed"
 
-        # Submission must fail post-strip check because downstream workspace crate app_bin broke!
         submit_out = tool_map["generate_patch"].invoke({"paths": ["core_lib/src/lib.rs"]})
-        assert "downstream workspace check failed" in submit_out
-        assert "app_bin" in submit_out
-        assert not state.patch
+        assert submit_out.startswith("diff --git")
+        assert state.patch == submit_out
+        assert "downstream workspace check failed" in state._last_submit_error
+        assert "app_bin" in state._last_submit_error
     finally:
         state.close()
 
@@ -727,7 +980,7 @@ def test_write_and_edit_file_prohibit_test_and_bench_files(normal):
     assert "prohibited" in err4
 
 
-def test_soft_reproduction_fallback_on_low_budget_and_auto_submit(tmp_path):
+def test_unreproduced_patch_submission_at_high_and_low_budget(tmp_path):
     repo = tmp_path / "soft_repro_repo"
     repo.mkdir()
     (repo / "src").mkdir()
@@ -755,18 +1008,21 @@ def test_soft_reproduction_fallback_on_low_budget_and_auto_submit(tmp_path):
 
         state.set_budget(FakeClient(50))
         out_high = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
-        assert "Paired reproduction check failed" in out_high
-        assert not state.patch
+        assert out_high.startswith("diff --git")
+        assert state.patch == out_high
+        assert "Paired reproduction check failed" in state._last_submit_error
+        assert not state.reproduced_cleanly()
 
         state.set_budget(FakeClient(15))
         out_low = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
         assert out_low.startswith("diff --git")
         assert state.patch == out_low
+        assert not state.reproduced_cleanly()
     finally:
         state.close()
 
 
-def test_auto_submit_soft_fallback_respects_allow_snapshot_fallback(tmp_path):
+def test_auto_submit_requires_clean_red_reproduction(tmp_path):
     repo = tmp_path / "auto_soft_repo"
     repo.mkdir()
     (repo / "src").mkdir()
@@ -793,10 +1049,8 @@ def test_auto_submit_soft_fallback_respects_allow_snapshot_fallback(tmp_path):
 
         # Without fallback (premature idle): does not bypass strict red check
         assert state.auto_submit_verified_patch(allow_snapshot_fallback=False) == ""
-        # With fallback (budget limit / repeated idle): submits verified source patch
-        patch = state.auto_submit_verified_patch(allow_snapshot_fallback=True)
-        assert patch.startswith("diff --git")
-        assert "+pub fn val() -> i32 { 2 }" in patch
+        # A passing temporary test on the original code never becomes a soft Red proof.
+        assert state.auto_submit_verified_patch(allow_snapshot_fallback=True) == ""
     finally:
         state.close()
 

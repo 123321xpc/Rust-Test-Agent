@@ -10,6 +10,11 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def staged_repair_mode(monkeypatch):
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
+
+
 def load(name):
     spec = importlib.util.spec_from_file_location(name + "_candidate_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -263,7 +268,7 @@ def test_retaining_a_preserves_fast_path_edits_and_their_rollback_baseline(sched
     assert coord.select()["unit_id"] == "state"
     assert coord.verify(complete=True)[0]
     coord.rollback({"state"})
-    assert "{ 0 }" in (state.root / "src/a.rs").read_text()
+    assert "{ 1 }" in (state.root / "src/a.rs").read_text()
 
 
 def test_b_switch_invalidates_affected_units_even_with_identical_plan_specs(scheduled):
@@ -282,17 +287,16 @@ def test_b_switch_invalidates_affected_units_even_with_identical_plan_specs(sche
     for name in "ac":
         assert "{ 1 }" in (state.root / f"src/{name}.rs").read_text()
     for name in "bd":
-        assert "{ 0 }" in (state.root / f"src/{name}.rs").read_text()
+        assert "{ 1 }" in (state.root / f"src/{name}.rs").read_text()
 
 
-def test_repeated_scope_requests_yield_before_writing_unplanned_files(scheduled):
+def test_repeated_scope_requests_extend_current_unit(scheduled):
     ma, fixture, state, _, p, coord = scheduled
     coord.configure(fixture.plan(), [])
     coord.select()
-    assert "outside active unit" in coord.before_tool("edit_file", {"path": "src/extra.rs"})
-    with pytest.raises(ma._repair_units.UnitBoundary, match="comparison"):
-        coord.before_tool("edit_file", {"path": "src/more.rs"})
-    assert p.data["pending"]["kind"] == "scope_growth"
+    assert coord.before_tool("edit_file", {"path": "src/extra.rs"}) is None
+    assert coord.before_tool("edit_file", {"path": "src/more.rs"}) is None
+    assert {"src/extra.rs", "src/more.rs"} <= set(coord._unit(coord.active)["paths"])
     assert not (state.root / "src/extra.rs").exists() and not (state.root / "src/more.rs").exists()
 
 
@@ -348,7 +352,7 @@ def test_orchestrator_implements_only_selected_b_after_brief_comparison(tmp_path
                 t["submit_localization_bundle"].invoke({"summary": "ambiguous", "candidate_chains": board()["localization"]["candidate_chains"],
                     "unresolved_chain_ids": ["C1", "C2"], "ambiguity_reason": "Either owner or propagation might explain the issue"})
             elif role == "suggester":
-                assert '"kind": "ambiguous_chains"' in inputs["messages"][0]["content"]
+                assert '"kind": "ambiguous_chains"' in inputs["messages"][-1]["content"]
                 result = json.loads(t["compare_repair_candidates"].invoke({"candidates_brief": cards(a_contract="conflict", b_affected_paths=["src/b.rs", "src/c.rs"])}))
                 assert result["selected_candidate"] == "B"
                 t["submit_repair_plan"].invoke({"selected_chain_id": "C2", "candidate_id": "B", "arbitration_rationale": "B meets requested contract",
@@ -401,7 +405,7 @@ def test_orchestrator_counterevidence_retains_a_without_reimplementing_it(tmp_pa
                     "content": "#[test] fn result() { assert_eq!(unit_fixture::a::value(), 2); }"})
                 t["submit_localization_bundle"].invoke({"summary": "localized state", "candidate_chains": [board()["localization"]["candidate_chains"][0]]})
             elif role == "suggester":
-                assert "verification_counterevidence" in inputs["messages"][0]["content"]
+                assert "verification_counterevidence" in inputs["messages"][-1]["content"]
                 result = json.loads(t["compare_repair_candidates"].invoke({"candidates_brief": cards(
                     a_affected_paths=["src/a.rs"], b_contract="conflict",
                     a_execution="supported", a_evidence_ids=observations,

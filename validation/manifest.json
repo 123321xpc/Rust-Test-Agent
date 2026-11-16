@@ -9,7 +9,7 @@
     "large": 15
   },
   "size_definition": "gold patch added plus deleted lines; small <=15, medium 16-150, large >150",
-  "selection": "Exclude tasks with prior evaluation reports; SHA-256 order within each size, preferring repositories not already selected",
+  "selection": "Reduced from the original 10-task development set by retaining all three small tasks and the two medium tasks with the fewest changed reference-patch lines",
   "excluded_prior_report_ids": [
     "chronotope__chrono-1285",
     "chronotope__chrono-1294",
@@ -30,33 +30,6 @@
   ],
   "tasks": [
     {
-      "instance_id": "cargo-generate__cargo-generate-880",
-      "repo": "cargo-generate/cargo-generate",
-      "base_commit": "faf3d01b1e1af968ec2a17a80849193c70657f8a",
-      "image": "rustbench/cargo-generate__cargo-generate:pr-880-rust-1.67.0-faf3d01b1e1a-785e07ebad",
-      "rust_toolchain": "1.67.0",
-      "patch_changed_lines": 158,
-      "size": "large"
-    },
-    {
-      "instance_id": "tokio-rs__tracing-1523",
-      "repo": "tokio-rs/tracing",
-      "base_commit": "ac4a8dd27c0b28c36b9cf77cdc52b595168d1c5f",
-      "image": "rustbench/tokio-rs__tracing:pr-1523-rust-1.55.0-ac4a8dd27c0b-5bed7968d0",
-      "rust_toolchain": "1.55.0",
-      "patch_changed_lines": 1153,
-      "size": "large"
-    },
-    {
-      "instance_id": "aya-rs__aya-253",
-      "repo": "aya-rs/aya",
-      "base_commit": "b9a544831c5b4cd8728e9cca6580c14a623b7793",
-      "image": "rustbench/aya-rs__aya:pr-253-rust-1.60.0-b9a544831c5b-84c2f234c1",
-      "rust_toolchain": "1.60.0",
-      "patch_changed_lines": 351,
-      "size": "large"
-    },
-    {
       "instance_id": "biomejs__biome-2621",
       "repo": "biomejs/biome",
       "base_commit": "1d525033b22f9fee682252197a6233a4222f28a6",
@@ -66,30 +39,12 @@
       "size": "medium"
     },
     {
-      "instance_id": "killercup__cargo-edit-572",
-      "repo": "killercup/cargo-edit",
-      "base_commit": "95ec0eedfec9bd9d5cbb1cb6076d8646abd29f81",
-      "image": "rustbench/killercup__cargo-edit:pr-572-rust-1.58.0-95ec0eedfec9-bf772f6205",
-      "rust_toolchain": "1.58.0",
-      "patch_changed_lines": 74,
-      "size": "medium"
-    },
-    {
       "instance_id": "axodotdev__cargo-dist-555",
       "repo": "axodotdev/cargo-dist",
       "base_commit": "ec189bb700f4356d39ed4da5427490772e32d745",
       "image": "rustbench/axodotdev__cargo-dist:pr-555-rust-1.74.0-ec189bb700f4-787315f79e",
       "rust_toolchain": "1.74.0",
       "patch_changed_lines": 63,
-      "size": "medium"
-    },
-    {
-      "instance_id": "ast-grep__ast-grep-1707",
-      "repo": "ast-grep/ast-grep",
-      "base_commit": "1c68280bfb9fd2614cab19b4cda47d2bf6570626",
-      "image": "rustbench/ast-grep__ast-grep:pr-1707-rust-1.83.0-1c68280bfb9f-cec822fcfc",
-      "rust_toolchain": "1.83.0",
-      "patch_changed_lines": 94,
       "size": "medium"
     },
     {

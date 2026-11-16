@@ -339,10 +339,9 @@ def test_compress_history_messages_handles_cargo_check_and_assistant_tool_args(a
     compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=3, test_cutoff_steps=2)
     assert len(compressed) == len(msgs)
 
-    # Check AI message 1 has compacted content
+    # Mutation payloads remain intact so a later model turn cannot copy a history placeholder into a file.
     ai_args = compressed[1].tool_calls[0]["args"]
-    assert "earlier write omitted" in ai_args["content"]
-    assert len(ai_args["content"]) < len(big_code)
+    assert ai_args["content"] == big_code
 
     # Check cargo_check tool message (index 4) is compacted
     check_obj = json.loads(compressed[4].content)

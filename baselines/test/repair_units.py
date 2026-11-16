@@ -93,9 +93,11 @@ def normalize_units(plan: dict | None, fallback_paths: list[str]) -> list[dict]:
 
 
 class RepairUnitCoordinator:
-    SLICE_CALLS = 24
-    TOOL_BOUNDARY = 12
-    UNCHECKED_EDITS = 4
+    UNCHECKED_EDITS = 6
+    READ_ONLY_TOOLS = frozenset({
+        "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
+        "inspect_rust_neighborhood", "rust_error_explain", "rust_trace",
+    })
 
     def __init__(self, state, tools_by_name, blackboard, trace=None, candidate_policy=None):
         self.state, self.tools, self.blackboard, self.trace = state, tools_by_name, blackboard, trace
@@ -151,20 +153,15 @@ class RepairUnitCoordinator:
         key = json.dumps(specs, sort_keys=True)
         policy = self.candidate_policy
         switch_paths = set(policy.data.pop("switch_paths", []) if policy else [])
-        retain_partial = policy.data.pop("retain_current_patch", False) if policy else False
+        if policy:
+            policy.data.pop("retain_current_patch", None)
         if key == self.plan_key and not switch_paths:
             return
-        current = self._unit(self.active) if self.active else None
-        partial_paths = self.delta_paths(current) if current and retain_partial else []
-        # When A wins the brief comparison, a first formal plan must not erase
-        # its partially implemented Fast Path. B is applied only after selection.
-        partial_paths = [p for p in partial_paths if p.as_posix() in self.planned_scope or p in self.state.regression_tests]
-        partial_snapshot = self.state._capture_snapshot() if partial_paths else None
-        partial_baseline = current["baseline"] if partial_paths else None
         old = {u["unit_id"]: u for u in self.units}
+        replan_baseline = self.state._capture_snapshot() if self.units else None
         keep = {s["unit_id"] for s in specs if s["unit_id"] in old
                 and old[s["unit_id"]]["spec"] == s
-                and old[s["unit_id"]]["status"] == "verified"
+                and old[s["unit_id"]]["status"] in {"verified", "completed_unverified"}
                 and self.evidence_valid(old[s["unit_id"]])
                 and not set(s["paths"]) & switch_paths}
         # A retained unit must also retain all of its verified prerequisites.
@@ -173,24 +170,14 @@ class RepairUnitCoordinator:
             if reduced == keep:
                 break
             keep = reduced
-        self.rollback(set(old) - keep, "Plan changed; invalidated units and dependents", expand=True)
         self.units = [old[s["unit_id"]] if s["unit_id"] in keep else
-                      dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=None, touched=set())
+                      dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=replan_baseline, touched=set())
                       for s in specs]
-        if partial_snapshot:
-            self.state.restore_partial_snapshot(partial_snapshot, partial_paths)
-            for unit in self.units:
-                owned = {p.as_posix() for p in partial_paths} & set(unit["paths"])
-                if owned:
-                    unit.update(baseline=partial_baseline, touched=owned)
-            temporary = {p.as_posix() for p in partial_paths if p in self.state.regression_tests and p.as_posix() not in self.planned_scope}
-            if temporary:
-                self.units[-1]["touched"].update(temporary)
-                if self.units[-1]["baseline"] is None:
-                    self.units[-1]["baseline"] = partial_baseline
+        partial_paths = [p.as_posix() for p in self.state.changed_paths()]
+        self.check_cache.clear()
         self.active = None
         self.plan_key = key
-        self.publish("repair_unit_plan", retained_units=sorted(keep), preserved_partial_paths=[p.as_posix() for p in partial_paths])
+        self.publish("repair_unit_plan", retained_units=sorted(keep), preserved_partial_paths=partial_paths)
 
     def evidence_valid(self, unit):
         return unit.get("inputs") == self._images((unit.get("inputs") or {}).keys())
@@ -198,11 +185,11 @@ class RepairUnitCoordinator:
     def select(self):
         if self.active:
             return self._unit(self.active)
-        stale = {u["unit_id"] for u in self.units if u["status"] == "verified" and not self.evidence_valid(u)}
+        stale = {u["unit_id"] for u in self.units if u["status"] in {"verified", "completed_unverified"} and not self.evidence_valid(u)}
         if stale:
             self.invalidate(stale, "Unit or prerequisite inputs changed")
-        done = {u["unit_id"] for u in self.units if u["status"] == "verified"}
-        ready = next((u for u in self.units if u["status"] != "verified" and set(u["depends_on"]) <= done), None)
+        done = {u["unit_id"] for u in self.units if u["status"] in {"verified", "completed_unverified"}}
+        ready = next((u for u in self.units if u["status"] not in {"verified", "completed_unverified"} and set(u["depends_on"]) <= done), None)
         if ready:
             self.active = ready["unit_id"]
             ready["status"] = "active"
@@ -220,7 +207,7 @@ class RepairUnitCoordinator:
         self.publish("repair_unit_invalidated")
 
     def all_done(self):
-        return bool(self.units) and all(u["status"] == "verified" and self.evidence_valid(u) for u in self.units)
+        return bool(self.units) and all(u["status"] in {"verified", "completed_unverified"} and self.evidence_valid(u) for u in self.units)
 
     def can_submit(self):
         if self.all_done():
@@ -228,11 +215,7 @@ class RepairUnitCoordinator:
         return bool(self.active) and all(u["status"] == "verified" or u["unit_id"] == self.active for u in self.units)
 
     def before_tool(self, name, kwargs):
-        if name == "checkpoint" and kwargs.get("action", "save").lower() == "restore":
-            return "Error: global checkpoint restores are disabled during unit repair. Escalate; Coordinator rolls back only failed units."
         if name not in ("edit_file", "write_file", "revert_file", "write_regression_test"):
-            if self.steps >= self.TOOL_BOUNDARY or self.unchecked_edits >= self.UNCHECKED_EDITS:
-                raise UnitBoundary("Bounded exploration/unchecked edits reached; Coordinator verification boundary")
             return None
         path = str(kwargs.get("target_src") or kwargs.get("path") or "").replace("\\", "/")
         relative = Path(path)
@@ -247,28 +230,28 @@ class RepairUnitCoordinator:
                 self.invalidate(owners, "QA/refinement changed unit inputs; recheck dependent units")
                 self.select()
         unit = self._unit(self.active) if self.active else None
-        if not unit and self.units[-1]["strict_scope"] and not temporary:
-            if self.candidate_policy:
-                self.candidate_policy.scope_attempt(path)
-                if self.candidate_policy.data["pending"]:
-                    raise UnitBoundary("Candidate comparison required before extending repair scope")
-            return f"Error: {path} has no repair unit. Call escalate_for_replan to add it to the plan."
-        if unit and unit["strict_scope"] and not temporary and path not in unit["paths"]:
-            if self.candidate_policy:
-                self.candidate_policy.scope_attempt(path)
-                if self.candidate_policy.data["pending"]:
-                    raise UnitBoundary("Candidate comparison required before extending repair scope")
-            return f"Error: {path} is outside active unit {self.active}. Call escalate_for_replan to change/group unit scope."
-        if self.steps >= self.TOOL_BOUNDARY or self.unchecked_edits >= self.UNCHECKED_EDITS:
-            raise UnitBoundary("Bounded exploration/unchecked edits reached; Coordinator verification boundary")
+        if unit and path and not temporary and path not in unit["paths"]:
+            unit["paths"] = sorted(set(unit["paths"]) | {path})
+            self.planned_scope.add(path)
+            stale = {other["unit_id"] for other in self.units
+                     if other is not unit and path in other["paths"]}
+            for uid in self._dependents(stale):
+                other = self._unit(uid)
+                if other is not unit:
+                    other.update(status="pending", evidence=[], blocker="Overlapping file changed")
         return None
 
     def observe(self, name, arguments, out, revision_before):
         evidence_id = None
         if self.candidate_policy:
             evidence_id = self.candidate_policy.observe(name, arguments, out)
-        self.steps += 1
+        if name not in self.READ_ONLY_TOOLS:
+            self.steps += 1
         if self.state._revision != revision_before:
+            if name == "checkpoint" and str(arguments.get("action", "save")).lower() == "restore":
+                self.invalidate({u["unit_id"] for u in self.units}, "Checkpoint restored; recheck units")
+                self.check_cache.clear()
+                return evidence_id
             self.unchecked_edits += 1
             if self.active:
                 path = arguments.get("target_src") or arguments.get("path")
@@ -347,7 +330,7 @@ class RepairUnitCoordinator:
         unit["completed_changes"] = [p.as_posix() for p in self.delta_paths(unit)]
         unit["blocker"] = "" if ok else "Targeted unit verification failed"
         self.steps = self.unchecked_edits = 0
-        if ok and complete:
+        if complete:
             paths = {p for uid in self._closure(self.active) for p in self._unit(uid)["paths"]}
             paths.update(unit["completed_changes"])
             # Manifest/lockfile changes also invalidate earlier compilation evidence.
@@ -358,10 +341,10 @@ class RepairUnitCoordinator:
                     for file in ("Cargo.toml", "Cargo.lock"):
                         if (parent / file).is_file():
                             paths.add((parent / file).relative_to(self.state.root).as_posix())
-            unit.update(status="verified", inputs=self._images(paths), summary=summary)
+            unit.update(status="verified" if ok else "completed_unverified", inputs=self._images(paths), summary=summary)
             self.active = None
-        self.publish("repair_unit_verification", complete=bool(ok and complete))
-        return ok, json.dumps({"unit_id": unit["unit_id"], "checks": evidence, "complete": bool(ok and complete)}, ensure_ascii=False)
+        self.publish("repair_unit_verification", complete=complete, verified=bool(ok))
+        return ok, json.dumps({"unit_id": unit["unit_id"], "checks": evidence, "complete": complete, "verified": bool(ok)}, ensure_ascii=False)
 
     def rollback(self, ids=None, reason="Unit failed", *, expand=True):
         if ids is None:
@@ -404,5 +387,5 @@ class RepairUnitCoordinator:
                 + json.dumps(ledger, ensure_ascii=False)
                 + ("\nCurrent unit work:\n" + json.dumps(active["work"], ensure_ascii=False) if active else "")
                 + "\nFinish a dependency-closed unit with complete_repair_unit(summary). Coordinator runs targeted Cargo checks. "
-                  "For new scope/dependencies, escalate_for_replan; verified unrelated units are preserved. "
+                  "Edit related files as needed. Checkpoints may be restored explicitly. "
                   "After all units close, run final regression/existing tests and submit_for_qa.")

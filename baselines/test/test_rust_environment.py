@@ -47,8 +47,14 @@ def test_verify_toolchain_without_modifying_repo(tmp_path, monkeypatch, pinned):
         return SimpleNamespace(stdout=f"{command[0]} 1.72.0\n")
     monkeypatch.setattr(environment.subprocess, "run", run)
     env, info = environment.prepare_rust_environment(root, "1.72.0")
-    assert "RUSTUP_TOOLCHAIN" not in env
-    assert info["source"] == ("rust-toolchain.toml" if pinned else "benchmark")
+    if pinned:
+        assert "RUSTUP_TOOLCHAIN" not in env
+        assert info["source"] == "rust-toolchain.toml"
+        assert info["selected"] is None
+    else:
+        assert "RUSTUP_TOOLCHAIN" not in env
+        assert info["source"] == "benchmark"
+        assert info["selected"] == "1.72.0"
     assert [call[0] for call in calls] == [["rustc", "--version"], ["cargo", "--version"]]
     assert all(call[1]["env"] == env for call in calls)
     assert sorted(path.name for path in root.iterdir()) == (["rust-toolchain.toml"] if pinned else [])
@@ -71,6 +77,27 @@ def test_mismatched_override_stops_run(tmp_path, monkeypatch):
     monkeypatch.setattr(environment.subprocess, "run", lambda command, **kwargs:
                         SimpleNamespace(stdout=f"{command[0]} 1.99.1\n"))
     with pytest.raises(RuntimeError, match="Expected rustc 1.72.0"):
+        environment.prepare_rust_environment(root, "1.72.0")
+
+
+def test_evaluation_override_takes_precedence_over_repo_pin(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "stable"\n', encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_EVAL_TOOLCHAIN_OVERRIDE", "1.72.0")
+    monkeypatch.setattr(environment.subprocess, "run", lambda command, **kwargs:
+                        SimpleNamespace(stdout=f"{command[0]} 1.72.0\n"))
+    env, info = environment.prepare_rust_environment(root, "1.80.0")
+    assert env["RUSTUP_TOOLCHAIN"] == "1.72.0"
+    assert info["source"] == "evaluation_override"
+
+
+def test_invalid_explicit_override_is_rejected_even_with_repo_pin(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "stable"\n', encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_EVAL_TOOLCHAIN_OVERRIDE", "1.72.0; other")
+    with pytest.raises(ValueError, match="Invalid benchmark Rust toolchain"):
         environment.prepare_rust_environment(root, "1.72.0")
 
 

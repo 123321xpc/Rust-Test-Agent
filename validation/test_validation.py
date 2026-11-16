@@ -52,10 +52,10 @@ class ValidationTests(unittest.TestCase):
     def test_manifest_has_fixed_strata_and_distinct_repositories(self):
         manifest = json.loads((HERE / 'manifest.json').read_text(encoding='utf-8'))
         tasks = manifest['tasks']
-        self.assertEqual(len(tasks), 10)
-        self.assertEqual(len({t['instance_id'] for t in tasks}), 10)
-        self.assertEqual(len({t['repo'] for t in tasks}), 10)
-        self.assertEqual([sum(t['size'] == s for t in tasks) for s in ('large', 'medium', 'small')], [3, 4, 3])
+        self.assertEqual(len(tasks), 5)
+        self.assertEqual(len({t['instance_id'] for t in tasks}), 5)
+        self.assertEqual(len({t['repo'] for t in tasks}), 5)
+        self.assertEqual([sum(t['size'] == s for t in tasks) for s in ('large', 'medium', 'small')], [0, 2, 3])
         self.assertTrue(all(t['instance_id'] not in manifest['excluded_prior_report_ids'] for t in tasks))
 
     def test_sweagent_task_hides_reference_patches_and_reads_prediction(self):

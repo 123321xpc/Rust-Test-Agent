@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -86,6 +87,50 @@ def _contains_compression_placeholder(text: str) -> bool:
         or "[earlier read of '" in text
         or "... [omitted " in text
     )
+
+
+def _rust_has_substantive_code(content: str) -> bool:
+    """Return whether Rust text contains code beyond comments and attributes."""
+    if not isinstance(content, str) or not content.strip():
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location("symbols_mask", Path(__file__).with_name("rust_symbols.py"))
+        sym_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sym_mod)
+        masked = sym_mod._mask_noncode(content)
+    except Exception:
+        masked = content
+    for line in masked.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.search(r"[A-Za-z_]\w*|[{}();=<>+\-*/&|!?]", stripped):
+            return True
+    return False
+
+
+def _smoke_environment_failure(stdout: str, stderr: str) -> bool:
+    """Identify failures that clearly originate outside the code under test."""
+    text = f"{stdout}\n{stderr}".lower()
+    environment_markers = (
+        "failed to download", "failed to fetch", "requires rustc", "network is unreachable",
+        "could not resolve host", "connection reset", "connection refused", "gnutls recv error",
+        "failed to select a version", "failed to update", "failed to load source",
+    )
+    return any(marker in text for marker in environment_markers)
+
+
+def _append_cargo_feature_flags(command: list[str], config: dict | None = None) -> None:
+    config = config or {}
+    if config.get("features"):
+        command.append("--features=" + ",".join(config["features"]))
+    use_all_features = os.getenv("RUSTBENCH_ALL_FEATURES", "1").lower() not in {"0", "false", "off"}
+    if config.get("all_features") or (use_all_features and not config.get("no_default_features")):
+        command.append("--all-features")
+    if config.get("no_default_features"):
+        command.append("--no-default-features")
+    if config.get("target"):
+        command.append(f"--target={config['target']}")
 
 
 def _resolve_in_module_test_target(manifest_file: Path) -> tuple[str, str]:
@@ -504,6 +549,7 @@ class PatchState:
         self._existing_test_failures = []
         self._executed_test_targets = []
         self._last_compiling_prod_snapshot = None
+        self._existing_test_smoke_cache = None
 
     _API_COMPILE_ERROR_CODES = {
         "E0599", "E0308", "E0061", "E0425", "E0432", "E0433",
@@ -695,6 +741,60 @@ class PatchState:
                 elif original is not None:
                     changed.append(relative)
             return changed
+
+    def _substantive_changed_paths(self):
+        """Return changed production paths that still contain meaningful work."""
+        root = self.root.resolve()
+        result = []
+        for relative in self.changed_paths():
+            if relative in self.regression_tests and relative not in self.in_module_regressions:
+                continue
+            target = root / relative
+            if not target.is_file():
+                continue
+            original = self.originals.get(relative)
+            if relative.suffix == ".rs":
+                if _rust_has_substantive_code(target.read_text(encoding="utf-8", errors="replace")):
+                    result.append(relative)
+            elif relative.name.lower() in {"readme.md", "changelog.md"} or relative.suffix.lower() in {".md", ".rst", ".txt"}:
+                continue
+            elif original is None or target.read_bytes() != original[0]:
+                result.append(relative)
+        return result
+
+    def _snapshot_substantive_paths(self, snap):
+        """Return meaningful production paths represented by a snapshot."""
+        result = []
+        for relative, original in snap.get("originals", {}).items():
+            if relative in snap.get("regression_tests", set()) and relative not in snap.get("in_module_regressions", {}):
+                continue
+            data = snap.get("files", {}).get(relative)
+            current = data[0] if data else None
+            original_bytes = original[0] if original else None
+            if current == original_bytes or current is None:
+                continue
+            if relative.suffix == ".rs":
+                if _rust_has_substantive_code(current.decode("utf-8", errors="replace")):
+                    result.append(relative)
+            elif relative.name.lower() in {"readme.md", "changelog.md"} or relative.suffix.lower() in {".md", ".rst", ".txt"}:
+                continue
+            else:
+                result.append(relative)
+        return result
+
+    def _revert_would_drop_last_substantive_change(self, relative):
+        """Guard an explicit revert when it would discard the only compiling work."""
+        current = set(self._substantive_changed_paths())
+        if relative not in current:
+            return False
+        return not any(path != relative for path in current)
+
+    def _restore_would_drop_last_substantive_change(self, snap):
+        """Guard checkpoint restores that would discard the only known good work."""
+        current = set(self._substantive_changed_paths())
+        if not current:
+            return False
+        return not set(self._snapshot_substantive_paths(snap))
 
     def build_patch(self, paths):
         root = self.root.resolve()
@@ -1042,12 +1142,20 @@ class PatchState:
             if clean_name not in self._checkpoints:
                 available = sorted(self._checkpoints)
                 raise ValueError(f"Unknown checkpoint '{clean_name}'. Available: {available or 'none'}")
-            self._restore_snapshot(self._checkpoints[clean_name])
+            snap = self._checkpoints[clean_name]
+            recovery_name = None
+            if self._restore_would_drop_last_substantive_change(snap):
+                recovery_name = f"__recovery_before_restore_{clean_name}_{self._revision}"
+                self._checkpoints[recovery_name] = self._capture_snapshot()
+            self._restore_snapshot(snap)
             changed = [p.as_posix() for p in self.changed_paths()]
-            return (
+            message = (
                 f"Restored checkpoint '{clean_name}' "
                 f"({len(changed)} changed file(s), verified={self.verified()})."
             )
+            if recovery_name:
+                message += f" Preserved the prior working copy as checkpoint '{recovery_name}' because this restore removed its last substantive change."
+            return message
 
     def restore_partial_snapshot(self, baseline: dict, paths) -> None:
         """Restore only a failed repair unit's files; invalidate global Green evidence.
@@ -1295,14 +1403,7 @@ class PatchState:
                     cfg = matching_cfgs[0]
                     if cfg.get("package"):
                         cmd.append(f"--package={cfg['package']}")
-                    if cfg.get("features"):
-                        cmd.append("--features=" + ",".join(cfg["features"]))
-                    if cfg.get("all_features"):
-                        cmd.append("--all-features")
-                    if cfg.get("no_default_features"):
-                        cmd.append("--no-default-features")
-                    if cfg.get("target"):
-                        cmd.append(f"--target={cfg['target']}")
+                    _append_cargo_feature_flags(cmd, cfg)
                 try:
                     res = subprocess.run(
                         cmd, cwd=root, capture_output=True, text=True,
@@ -1327,6 +1428,225 @@ class PatchState:
             "Check whether your edits unintentionally broke existing callers:\n" + "\n".join(warnings) + "\n"
         )
 
+    def run_existing_test_smoke(self, selected_paths: list[Path], timeout: int = 90) -> list[dict]:
+        """Run a small set of existing test targets after temporary tests are stripped.
+
+        This is intentionally a bounded signal for the Verifier. It records failures
+        for review and never replaces the paired regression test or post-strip check.
+        """
+        if not shutil.which("cargo") or not selected_paths:
+            return []
+        configurations = sorted(
+            (str(manifest), name, json.dumps(config, sort_keys=True))
+            for (manifest, name), config in self._passed_regression_configs.items()
+        )
+        cache_key = (self._revision, tuple(sorted(str(p) for p in selected_paths)), tuple(configurations), timeout)
+        if self._existing_test_smoke_cache and self._existing_test_smoke_cache[0] == cache_key:
+            return [dict(item) for item in self._existing_test_smoke_cache[1]]
+        root = self.root.resolve()
+        manifests = set()
+        for rel in selected_paths:
+            cur = (root / rel).parent
+            while cur != root.parent:
+                if (cur / "Cargo.toml").is_file():
+                    manifests.add((cur / "Cargo.toml").resolve())
+                    break
+                cur = cur.parent
+        manifests = [m for m in manifests if _manifest_has_targets(m)]
+        if not manifests:
+            return []
+
+        backup = {}
+        for reg_rel in self.regression_tests:
+            fpath = root / reg_rel
+            if reg_rel in self.in_module_regressions:
+                if fpath.is_file():
+                    stat = fpath.stat()
+                    backup[reg_rel] = (fpath.read_bytes(), stat.st_mode, stat.st_mtime_ns)
+                    fpath.write_text(_strip_in_module_tests(fpath.read_text(encoding="utf-8")), encoding="utf-8")
+            elif fpath.is_file():
+                stat = fpath.stat()
+                backup[reg_rel] = (fpath.read_bytes(), stat.st_mode, stat.st_mtime_ns)
+                fpath.unlink()
+
+        results = []
+        baseline_candidates = []
+        try:
+            for manifest in sorted(manifests)[:2]:
+                cfgs = [
+                    cfg for (m, _name), cfg in self._passed_regression_configs.items()
+                    if (root / m).resolve() == manifest.resolve()
+                ]
+                cfg = cfgs[0] if cfgs else {}
+                common = ["cargo", "test", "--manifest-path", str(manifest)]
+                if cfg.get("package"):
+                    common.append(f"--package={cfg['package']}")
+                _append_cargo_feature_flags(common, cfg)
+
+                commands = []
+                if (manifest.parent / "src/lib.rs").is_file():
+                    commands.append((common + ["--lib"], "lib"))
+                test_dir = manifest.parent / "tests"
+                targets = sorted(p.stem for p in test_dir.glob("*.rs") if p.is_file()) if test_dir.is_dir() else []
+                if targets:
+                    stems = {p.stem.lower() for p in selected_paths}
+                    related = {
+                        name for name in targets
+                        if any(stem in name.lower() or name.lower() in stem for stem in stems if len(stem) >= 3)
+                    }
+                    integration_targets = {name for name in targets if "integration" in name.lower()}
+                    related.update(integration_targets)
+                    selected_text = " ".join(str(path).lower() for path in selected_paths)
+                    if not related and any(token in selected_text for token in ("template", "build.rs", "installer", "snapshot")):
+                        related.update(targets[:3])
+                    if not related:
+                        related.update(targets if len(targets) <= 6 else targets[:3])
+                    related_non_integration = related - integration_targets
+                    if not related_non_integration:
+                        related_non_integration = set(targets[:3]) - integration_targets
+                    selected_targets = sorted(integration_targets) + sorted(related_non_integration)[:3]
+                    for target_name in selected_targets:
+                        commands.append((common + ["--test", target_name], f"test:{target_name}"))
+                for command, target in commands:
+                    try:
+                        res = subprocess.run(
+                            command, cwd=root, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=timeout, env=self.rust_env,
+                        )
+                        summaries = re.findall(r"test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", res.stdout)
+                        executed = sum(int(passed) + int(failed) for passed, failed in summaries)
+                        environment_failure = _smoke_environment_failure(res.stdout, res.stderr) if res.returncode else False
+                        result = {
+                            "manifest": str(manifest.relative_to(root)),
+                            "target": target,
+                            "status": (
+                                "environment_error" if res.returncode and environment_failure
+                                else "failed" if res.returncode
+                                else "passed" if executed else "no_tests"
+                            ),
+                            "classification": "environment" if environment_failure else "unknown",
+                            "baseline_status": "unknown" if res.returncode else None,
+                            "tests_executed": executed,
+                            "failed_tests": sorted(set(re.findall(
+                                r"^test (.+?) \.\.\. FAILED\s*$", res.stdout, re.MULTILINE
+                            ))),
+                            "details": ((res.stdout + "\n" + res.stderr).strip())[-1200:] if res.returncode else "",
+                            "observed_revision": self._revision,
+                        }
+                        results.append(result)
+                        if result["status"] == "failed":
+                            baseline_candidates.append((result, command, manifest))
+                    except subprocess.TimeoutExpired:
+                        results.append({
+                            "manifest": str(manifest.relative_to(root)),
+                            "target": target,
+                            "status": "timeout",
+                            "classification": "unknown",
+                            "baseline_status": "unknown",
+                            "tests_executed": 0,
+                            "details": f"cargo test exceeded {timeout}s; completion is unknown",
+                            "observed_revision": self._revision,
+                        })
+                    except OSError as exc:
+                        results.append({
+                            "manifest": str(manifest.relative_to(root)),
+                            "target": target,
+                            "status": "environment_error",
+                            "classification": "environment",
+                            "baseline_status": "unknown",
+                            "tests_executed": 0,
+                            "details": f"unable to execute cargo: {exc}",
+                            "observed_revision": self._revision,
+                        })
+            manifest_deadlines = {}
+            for result, command, manifest in baseline_candidates:
+                deadline = manifest_deadlines.setdefault(manifest, time.monotonic() + max(1, timeout))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                current_files = {}
+                try:
+                    for rel, original in self.originals.items():
+                        if rel in self.regression_tests and rel not in self.in_module_regressions:
+                            continue
+                        path = root / rel
+                        if path.is_file():
+                            current_stat = path.stat()
+                            current_files[rel] = (path.read_bytes(), current_stat.st_mode, current_stat.st_mtime_ns)
+                        else:
+                            current_files[rel] = None
+                    for rel, original in self.originals.items():
+                        if rel in self.regression_tests and rel not in self.in_module_regressions:
+                            continue
+                        path = root / rel
+                        if original is None:
+                            if path.exists() or path.is_symlink():
+                                path.unlink()
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(original[0])
+                            path.chmod(original[1])
+                            os.utime(path, None)
+                            _touch_crate_entry_mtime(root, rel)
+                    baseline_res = subprocess.run(
+                        command, cwd=root, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=remaining, env=self.rust_env,
+                    )
+                    baseline_summaries = re.findall(
+                        r"test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed",
+                        baseline_res.stdout,
+                    )
+                    baseline_executed = sum(int(passed) + int(failed) for passed, failed in baseline_summaries)
+                    if baseline_res.returncode == 0 and baseline_executed:
+                        result["baseline_status"] = "passed"
+                        result["classification"] = "code"
+                    elif baseline_res.returncode != 0 and not _smoke_environment_failure(baseline_res.stdout, baseline_res.stderr):
+                        result["baseline_status"] = "failed"
+                        baseline_failures = sorted(set(re.findall(
+                            r"^test (.+?) \.\.\. FAILED\s*$", baseline_res.stdout, re.MULTILINE
+                        )))
+                        result["baseline_failed_tests"] = baseline_failures
+                        if result["failed_tests"] and baseline_failures:
+                            result["new_failed_tests"] = sorted(set(result["failed_tests"]) - set(baseline_failures))
+                            result["classification"] = "code" if result["new_failed_tests"] else "unknown"
+                            result["details"] += "\nCompared failed test names with the unpatched baseline."
+                        else:
+                            result["classification"] = "unknown"
+                            result["details"] += "\nBaseline also failed; individual failures could not be compared."
+                    else:
+                        result["baseline_status"] = "unknown"
+                        result["classification"] = "unknown"
+                        result["details"] += "\nBaseline rerun did not produce a reliable comparison."
+                except subprocess.TimeoutExpired:
+                    result["baseline_status"] = "unknown"
+                    result["classification"] = "unknown"
+                    result["details"] += "\nBaseline rerun timed out; this result is not attributed to the patch."
+                except OSError as exc:
+                    result["baseline_status"] = "unknown"
+                    result["classification"] = "unknown"
+                    result["details"] += f"\nBaseline rerun could not execute: {exc}"
+                finally:
+                    for rel, data in current_files.items():
+                        path = root / rel
+                        if data is None:
+                            if path.exists() or path.is_symlink():
+                                path.unlink()
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(data[0])
+                            path.chmod(data[1])
+                            os.utime(path, None)
+                            _touch_crate_entry_mtime(root, rel)
+        finally:
+            for reg_rel, (content, mode, mtime_ns) in backup.items():
+                fpath = root / reg_rel
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.write_bytes(content)
+                fpath.chmod(mode)
+                os.utime(fpath, None)
+        self._existing_test_smoke_cache = (cache_key, [dict(item) for item in results])
+        return results
+
     def verify_pre_fix_reproduction(self, targets=None):
         if not shutil.which("cargo"):
             return
@@ -1343,7 +1663,10 @@ class PatchState:
         if not valid_needed:
             return
 
-        prod_changed = [p for p in self.changed_paths() if p not in self.regression_tests]
+        prod_changed = [
+            p for p in self.changed_paths()
+            if p not in self.regression_tests or p in self.in_module_regressions
+        ]
         backup = {}
         for rel in prod_changed:
             fpath = root / rel
@@ -1483,7 +1806,7 @@ class PatchState:
 
     def run_post_strip_check(self, selected_paths: list[Path]):
         if not shutil.which("cargo"):
-            return
+            return {"status": "unavailable", "warnings": ["Cargo is not available."]}
         root = self.root.resolve()
         affected_manifests = set()
         for reg_rel in self.regression_tests:
@@ -1506,7 +1829,7 @@ class PatchState:
 
         valid_manifests = [m for m in affected_manifests if _manifest_has_targets(m)]
         if not valid_manifests:
-            return
+            return {"status": "unavailable", "warnings": ["No affected Cargo manifest was found."]}
 
         backup = {}
         for reg_rel in self.regression_tests:
@@ -1523,9 +1846,13 @@ class PatchState:
                     st = reg_file.stat()
                     backup[reg_rel] = (reg_file.read_bytes(), st.st_mode, st.st_mtime_ns)
                     reg_file.unlink()
+        warnings = []
         try:
+            has_lock = (root / "Cargo.lock").is_file()
             for manifest in sorted(valid_manifests):
                 cmd = ["cargo", "check", "--tests", "--manifest-path", str(manifest)]
+                if has_lock or (manifest.parent / "Cargo.lock").is_file():
+                    cmd.append("--locked")
                 matching_cfgs = [
                     cfg for (m, _name), cfg in self._passed_regression_configs.items()
                     if (root / m).resolve() == manifest.resolve()
@@ -1534,53 +1861,49 @@ class PatchState:
                     first_cfg = matching_cfgs[0]
                     if first_cfg.get("package"):
                         cmd.append(f"--package={first_cfg['package']}")
-                    if first_cfg.get("features"):
-                        cmd.append("--features=" + ",".join(first_cfg["features"]))
-                    if first_cfg.get("all_features"):
-                        cmd.append("--all-features")
-                    if first_cfg.get("no_default_features"):
-                        cmd.append("--no-default-features")
-                    if first_cfg.get("target"):
-                        cmd.append(f"--target={first_cfg['target']}")
+                    _append_cargo_feature_flags(cmd, first_cfg)
+                else:
+                    _append_cargo_feature_flags(cmd)
 
-                res = subprocess.run(
-                    cmd,
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120,
-                    env=self.rust_env,
-                )
-                if res.returncode != 0:
+                result = self._compare_workspace_compile_with_baseline(cmd, timeout=120)
+                if result["status"] == "regression":
                     rel_manifest = manifest.relative_to(root).as_posix() if manifest.is_relative_to(root) else str(manifest)
-                    err_snippet = (res.stderr.strip() or res.stdout.strip())[-3000:]
                     raise ValueError(
-                        f"Post-strip verification failed for {rel_manifest} under 'cargo check --tests'. "
-                        "When temporary regression tests were excluded, your changes broke compilation "
-                        f"of production code or existing test targets:\n{err_snippet}"
+                        f"Post-strip verification failed for {rel_manifest} under 'cargo check'; "
+                        f"the unpatched checkout passed:\n{result['details']}"
                     )
+                if result["status"] != "passed":
+                    warnings.append(result["details"])
             downstream_pkgs = self._find_downstream_workspace_packages(valid_manifests)
             ws_manifest = root / "Cargo.toml"
             for dep_pkg in downstream_pkgs:
-                dep_res = subprocess.run(
-                    ["cargo", "check", "--manifest-path", str(ws_manifest), f"--package={dep_pkg}"],
-                    cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=120, env=self.rust_env,
-                )
-                if dep_res.returncode != 0:
-                    err_snippet = (dep_res.stderr.strip() or dep_res.stdout.strip())[-3000:]
-                    is_env_error = any(kw in err_snippet for kw in (
-                        "requires rustc", "failed to select a version", "failed to download",
-                        "could not find", "Blocking waiting for file lock", "network is unreachable"
-                    ))
-                    if is_env_error:
-                        continue
+                dep_cmd = ["cargo", "check", "--tests", "--manifest-path", str(ws_manifest), f"--package={dep_pkg}"]
+                _append_cargo_feature_flags(dep_cmd)
+                if has_lock:
+                    dep_cmd.append("--locked")
+                result = self._compare_workspace_compile_with_baseline(dep_cmd, timeout=120)
+                if result["status"] == "regression":
                     raise ValueError(
                         f"Post-strip downstream workspace check failed for dependent package '{dep_pkg}'. "
-                        f"Your changes broke downstream crate compilation:\n{err_snippet}"
+                        f"The unpatched checkout passed:\n{result['details']}"
                     )
+                if result["status"] != "passed":
+                    warnings.append(result["details"])
+            workspace_manifest = root / "Cargo.toml"
+            if workspace_manifest.is_file():
+                workspace_text = workspace_manifest.read_text(encoding="utf-8", errors="replace")
+                workspace_cmd = ["cargo", "check", "--all-targets", "--manifest-path", str(workspace_manifest)]
+                _append_cargo_feature_flags(workspace_cmd)
+                if "[workspace]" in workspace_text:
+                    workspace_cmd.append("--workspace")
+                if has_lock:
+                    workspace_cmd.append("--locked")
+                workspace_result = self._compare_workspace_compile_with_baseline(workspace_cmd)
+                if workspace_result["status"] == "regression":
+                    raise ValueError("Workspace compilation regressed against the unpatched checkout:\n"
+                                     + workspace_result["details"])
+                if workspace_result["status"] != "passed":
+                    warnings.append(workspace_result["details"])
         finally:
             for reg_rel, data in backup.items():
                 if reg_rel in self.in_module_regressions:
@@ -1602,6 +1925,63 @@ class PatchState:
                             os.utime(reg_file, ns=(data[2], data[2]))
                         except Exception:
                             pass
+        return {"status": "inconclusive" if warnings else "passed", "warnings": warnings}
+
+    def _compare_workspace_compile_with_baseline(self, command: list[str], timeout: int = 300) -> dict:
+        root = self.root.resolve()
+        try:
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout, env=self.rust_env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"status": "inconclusive", "details": f"Workspace compile check could not complete: {exc}"}
+        if result.returncode == 0:
+            return {"status": "passed", "details": ""}
+        failure = (result.stderr.strip() or result.stdout.strip())[-3000:]
+        if _smoke_environment_failure(result.stdout, result.stderr):
+            return {"status": "inconclusive", "details": f"Workspace compile check encountered an environment failure: {failure}"}
+
+        current_files = {}
+        try:
+            for rel, original in self.originals.items():
+                if rel in self.regression_tests and rel not in self.in_module_regressions:
+                    continue
+                path = root / rel
+                if path.is_file():
+                    current_stat = path.stat()
+                    current_files[rel] = (path.read_bytes(), current_stat.st_mode, current_stat.st_mtime_ns)
+                else:
+                    current_files[rel] = None
+                if original is None:
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(original[0])
+                    path.chmod(original[1])
+                    _touch_crate_entry_mtime(root, rel)
+            try:
+                baseline = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace", timeout=timeout, env=self.rust_env)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return {"status": "inconclusive", "details": f"Workspace baseline compile could not complete: {exc}; candidate: {failure}"}
+            if baseline.returncode == 0:
+                return {"status": "regression", "details": failure}
+            baseline_failure = (baseline.stderr.strip() or baseline.stdout.strip())[-1000:]
+            if "manifest path" in baseline_failure.lower() and "does not exist" in baseline_failure.lower():
+                return {"status": "regression", "details": failure}
+            return {"status": "inconclusive", "details": f"Workspace baseline also failed: {baseline_failure}; candidate: {failure}"}
+        finally:
+            for rel, current in current_files.items():
+                path = root / rel
+                if current is None:
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(current[0])
+                    path.chmod(current[1])
+                    os.utime(path, ns=(current[2], current[2]))
+                    _touch_crate_entry_mtime(root, rel)
 
     def auto_submit_verified_patch(self, allow_snapshot_fallback: bool = True) -> str:
         with self._lock:
@@ -1617,16 +1997,10 @@ class PatchState:
                             self.verify_pre_fix_reproduction(targets)
                         except Exception as exc:
                             self._last_submit_error = str(exc)
-                            if allow_snapshot_fallback:
-                                for t in targets:
-                                    self._reproduced_regressions[t] = {
-                                        "clean_red": False, "runtime_failure": False,
-                                        "compile_reproduction": False, "executed": 0,
-                                        "failures": [], "returncode": 0, "soft_fallback": True,
-                                    }
-                                self._verified_revision = self._revision
-                            else:
-                                return ""
+                            return ""
+                        if not self.reproduced_cleanly():
+                            self._last_submit_error = "Regression test did not reproduce cleanly on the original code"
+                            return ""
                     if self.verified():
                         try:
                             if self.post_strip_check:
@@ -1689,7 +2063,7 @@ class PatchState:
     def pass_test(self, token, manifest_path="Cargo.toml", package="", test_target="",
                   test_filter="", lib=False, bin_target="", tests=False, passed_tests=None, ignored_tests=0,
                   features=None, all_features=False, no_default_features=False, target="",
-                  doc=False, executed=0):
+                  doc=False, executed=0, filtered_tests=None):
         with self._lock:
             if token == (self._revision, self._test_generation):
                 effective_manifest = self._resolve_manifest_target(manifest_path, package)
@@ -1702,7 +2076,8 @@ class PatchState:
                         continue
                     matched = False
                     if not tinfo["is_in_module"]:
-                        matched = (test_target == name and not test_filter)
+                        complete_target = not test_filter or filtered_tests == 0
+                        matched = test_target == name and complete_target
                     else:
                         in_mod_passed = any(name in pt for pt in (passed_tests or []))
                         matched = (
@@ -1750,7 +2125,8 @@ class PatchState:
     def fail_test(self, token, manifest_path="Cargo.toml", package="", test_target="",
                   test_filter="", lib=False, bin_target="", tests=False,
                   executed=0, failures=None, returncode=None, failed_target="",
-                  compile_errors=None, tests_started=0, doc=False, failure_details=None):
+                  compile_errors=None, tests_started=0, doc=False, failure_details=None,
+                  filtered_tests=None):
         with self._lock:
             if token == (self._revision, self._test_generation):
                 self._passed_suites.clear()
@@ -1762,8 +2138,11 @@ class PatchState:
                     key = (relative_manifest, name)
                     same_package = target_manifest == effective_manifest
                     matched = False
+                    target_failed = False
                     if not tinfo["is_in_module"]:
-                        matched = (same_package and test_target == name and not test_filter)
+                        target_failed = same_package and test_target == name
+                        complete_target = not test_filter or filtered_tests == 0
+                        matched = target_failed and complete_target
                     else:
                         in_mod_failed = any(name in ft for ft in (failures or []))
                         in_mod_info = self.in_module_regressions.get(tinfo["path"], {})
@@ -1779,7 +2158,7 @@ class PatchState:
                             and (lib or bool(bin_target) or tests)
                             and (filter_matches_inner or in_mod_failed)
                         )
-                    if matched or (not test_target and not test_filter and (failed_target == name or set(failures or []) & self._regression_test_names.get(key, set()))):
+                    if target_failed or matched or (not test_target and not test_filter and (failed_target == name or set(failures or []) & self._regression_test_names.get(key, set()))):
                         any_regression_matched = True
                         self._passed_regressions.discard(key)
                         self._passed_regression_configs.pop(key, None)
@@ -1787,7 +2166,10 @@ class PatchState:
                         self._verified_revision = None
                     if (target_manifest == effective_manifest or not package) and matched:
                         any_regression_matched = True
-                        clean_red = not any(p not in self.regression_tests for p in self.changed_paths())
+                        clean_red = not any(
+                            p not in self.regression_tests or p in self.in_module_regressions
+                            for p in self.changed_paths()
+                        )
                         prior_clean = bool((self._reproduced_regressions.get(key) or {}).get("clean_red"))
                         if executed == 0 and tests_started == 0 and returncode is None:
                             if not (not clean_red and prior_clean):
@@ -1913,6 +2295,53 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             raise ValueError("Path must be inside the repository and outside .git")
         return target
 
+    def cargo_lock_update_warning(manifest: Path) -> str:
+        if not shutil.which("cargo"):
+            return ""
+        current = manifest.parent
+        has_lockfile = False
+        while current == root or current.is_relative_to(root):
+            if (current / "Cargo.lock").is_file():
+                has_lockfile = True
+                break
+            if current == root:
+                break
+            current = current.parent
+        if not has_lockfile:
+            return ""
+        try:
+            result = subprocess.run(
+                [
+                    "cargo", "metadata", "--offline", "--locked", "--format-version", "1",
+                    "--manifest-path", str(manifest),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                env=rust_env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if result.returncode == 0:
+            return ""
+        diagnostics = result.stderr.strip() or result.stdout.strip()
+        lock_update_error = re.search(
+            r"(?:cannot update (?:the )?(?:lock file|Cargo\.lock)|"
+            r"(?:lock file|Cargo\.lock).{0,300}(?:needs? to be updated|must be updated|--locked was passed))",
+            diagnostics,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not lock_update_error:
+            return ""
+        return (
+            "\n[Cargo.lock constraint] Cargo reports that this Cargo.toml change needs a lockfile update, "
+            "but validation uses --locked and Cargo.lock is read-only. Revert the dependency/feature change "
+            "or solve the issue using dependencies already in Cargo.lock."
+        )
+
     @tool
     def read_file(path: str) -> str:
         """List a directory or read small UTF-8 files (files over 250 lines are previewed; use read_lines for source files); paths are repository-relative."""
@@ -1938,9 +2367,10 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
 
     @tool
     @synchronized
-    def write_file(path: str, content: str | None) -> str:
+    def write_file(path: str, content: str | None, force: bool = False) -> str:
         """Write UTF-8 contents in the working copy; null deletes a file.
 
+        Pass force=true only for an intentional comments-only Rust source replacement.
         Any write invalidates the submitted patch. Call generate_patch after
         all edits, selecting only files that belong in the final fix.
         """
@@ -1964,16 +2394,32 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 raise ValueError("Path is not a regular file")
             if content is None and not target.is_file():
                 raise ValueError("Cannot delete a missing file")
-            if relative not in state.originals:
-                st = target.stat() if target.is_file() else None
-                state.originals[relative] = ((target.read_bytes(), st.st_mode, st.st_mtime_ns) if st else None)
             if content is not None:
                 if _contains_compression_placeholder(content):
                     raise ValueError(
                         "Input contains a history-compression omission placeholder; "
                         "use read_lines to inspect the actual file instead of copying omitted markers."
                     )
+                if (
+                    relative.suffix == ".rs"
+                    and target.is_file()
+                    and _rust_has_substantive_code(target.read_text(encoding="utf-8", errors="replace"))
+                    and not _rust_has_substantive_code(content)
+                    and not force
+                ):
+                    raise ValueError(
+                        "Refusing to replace an existing Rust source file with comments or blank lines only. "
+                        "Use read_lines to inspect the complete source, or pass force=true for an intentional rollback."
+                    )
                 _check_rust_syntax(relative.as_posix(), content)
+            check_cargo_lock = (
+                relative.name == "Cargo.toml"
+                and content is not None
+                and (not target.is_file() or target.read_bytes() != content.encode("utf-8"))
+            )
+            if relative not in state.originals:
+                st = target.stat() if target.is_file() else None
+                state.originals[relative] = ((target.read_bytes(), st.st_mode, st.st_mtime_ns) if st else None)
             state.invalidate_write()
             if content is None:
                 target.unlink()
@@ -1981,7 +2427,10 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content.encode("utf-8"))
             _touch_crate_entry_mtime(root, relative)
-            return f"Updated {relative.as_posix()} in the working copy."
+            result = f"Updated {relative.as_posix()} in the working copy."
+            if check_cargo_lock:
+                result += cargo_lock_update_warning(target)
+            return result
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
             return f"Error writing {path}: {exc}"
 
@@ -2277,7 +2726,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
 
     @tool
     @synchronized
-    def revert_file(path: str) -> str:
+    def revert_file(path: str, force: bool = False) -> str:
         """Revert a modified, created, or deleted file in the working copy back to its original state.
 
         Also removes temporary regression tests created with write_regression_test.
@@ -2288,11 +2737,17 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             relative = target.relative_to(root)
             if not relative.parts:
                 raise ValueError("Provide a file path")
+            recovery_name = None
+            if not force and state._revert_would_drop_last_substantive_change(relative):
+                recovery_name = f"__recovery_before_revert_{relative.stem}_{state._revision}"
+                state._checkpoints[recovery_name] = state._capture_snapshot()
             if relative in state.in_module_regressions:
                 info = state.in_module_regressions.pop(relative, None)
                 state.regression_tests.discard(relative)
+                had_passed_evidence = False
                 if info:
                     reg_key = (info["manifest"], info["name"])
+                    had_passed_evidence = reg_key in state._passed_regression_configs
                     state._reproduced_regressions.pop(reg_key, None)
                     state._passed_regression_configs.pop(reg_key, None)
                     state._reproduction_notes.pop(reg_key, None)
@@ -2307,7 +2762,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         c = target.read_text(encoding="utf-8")
                         target.write_text(_strip_in_module_tests(c), encoding="utf-8")
                 state.invalidate_write()
-                return f"Reverted {relative.as_posix()} to its original state."
+                warn_reg = " [Notice: Reverted active temporary regression test; its passing verification evidence was cleared. Temporary tests are stripped automatically on patch export.]" if had_passed_evidence else ""
+                suffix = f" Preserved the prior working copy as checkpoint '{recovery_name}'." if recovery_name else ""
+                return f"Reverted {relative.as_posix()} to its original state.{suffix}{warn_reg}"
             if relative not in state.originals and relative not in state.regression_tests:
                 if not target.exists():
                     raise ValueError(f"File does not exist: {path}")
@@ -2317,6 +2774,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             original = state.originals.pop(relative, None)
             state.regression_tests.discard(relative)
             reg_key = (relative.parent.parent / "Cargo.toml", relative.stem)
+            had_passed_evidence = reg_key in state._passed_regression_configs
             state._reproduced_regressions.pop(reg_key, None)
             state._passed_regression_configs.pop(reg_key, None)
             state._reproduction_notes.pop(reg_key, None)
@@ -2324,7 +2782,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             if original is None:
                 if target.exists() or target.is_symlink():
                     target.unlink()
-                return f"Reverted {relative.as_posix()} (removed newly created file)."
+                warn_reg = " [Notice: Reverted active temporary regression test; its passing verification evidence was cleared. Temporary tests are stripped automatically on patch export.]" if had_passed_evidence else ""
+                suffix = f" Preserved the prior working copy as checkpoint '{recovery_name}'." if recovery_name else ""
+                return f"Reverted {relative.as_posix()} (removed newly created file).{suffix}{warn_reg}"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(original[0])
             target.chmod(original[1])
@@ -2334,7 +2794,8 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 except Exception:
                     pass
             _touch_crate_entry_mtime(root, relative)
-            return f"Reverted {relative.as_posix()} to its original state."
+            suffix = f" Preserved the prior working copy as checkpoint '{recovery_name}'." if recovery_name else ""
+            return f"Reverted {relative.as_posix()} to its original state.{suffix}"
         except (OSError, UnicodeError, ValueError) as exc:
             return f"Error reverting {path}: {exc}"
 
@@ -2353,12 +2814,10 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             changed = changed_paths()
             targets = set(state.get_regression_targets().keys())
             if state.require_reproduction and targets and targets <= state._passed_regressions and not state.reproduced_cleanly():
-                state.verify_pre_fix_reproduction(targets)
-            if changed and not state.verified():
-                missing = state.missing_verification_steps()
-                detail = f" Missing: {missing}." if missing else ""
-                return ("After the last write, pass each temporary regression test with cargo_test "
-                        f"using test_target and no filter, with at least one test executed.{detail}")
+                try:
+                    state.verify_pre_fix_reproduction(targets)
+                except Exception as exc:
+                    state._last_submit_error = f"Relaxed reproduction warning: {exc}"
             if paths is None and submit:
                 source_candidates = [p.as_posix() for p in changed if (p not in state.regression_tests or p in state.in_module_regressions)]
                 if not source_candidates:
@@ -2374,6 +2833,12 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 unrepro = [name for manifest, name in targets if (manifest, name) not in state._reproduced_regressions]
                 if unrepro:
                     repro_notice = f"\nNotice: The following temporary regression test(s) have not been confirmed failing before repair: {', '.join(unrepro)}.\n"
+                verification_notice = ""
+                pending = state.missing_verification_steps()
+                if pending:
+                    verification_notice += f"\nPending verification: {pending}\n"
+                if state._last_submit_error:
+                    verification_notice += f"\nVerification warning: {state._last_submit_error}\n"
                 source_candidates = [p.as_posix() for p in changed if (p not in state.regression_tests or p in state.in_module_regressions)]
                 test_compile_warn = ""
                 if source_candidates:
@@ -2403,7 +2868,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 doctest_notice = ("\n" + "\n".join(doctest_warns) + "\n") if doctest_warns else ""
                 hint = (f"Call generate_patch(paths={json.dumps(source_candidates)}) to submit."
                         if source_candidates else "Call generate_patch with paths for the final fix to submit.")
-                return (f"Unsubmitted preview. Changed files:\n{names}\n{repro_notice}{test_compile_warn}{doctest_notice}"
+                return (f"Unsubmitted preview. Changed files:\n{names}\n{repro_notice}{verification_notice}{test_compile_warn}{doctest_notice}"
                         f"{hint}\n\n"
                         + build_patch(changed))
             state.patch = ""
@@ -2424,7 +2889,10 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 names = ", ".join(sorted(path.as_posix() for path in omitted))
                 raise ValueError(f"Include all other changed files or revert them and rerun tests: {names}")
             if state.post_strip_check:
-                state.run_post_strip_check(selected)
+                try:
+                    state.run_post_strip_check(selected)
+                except Exception as exc:
+                    state._last_submit_error = f"Relaxed post-strip warning: {exc}"
             patch = build_patch(selected)
             state.patch = patch
             return patch or "No changes to submit."

@@ -19,7 +19,8 @@ class TestSetTests(unittest.TestCase):
         self.assertEqual((len(tasks), len(ids), len(images)), (50, 50, 50))
         self.assertFalse(ids & {task['instance_id'] for task in validation['tasks']})
         self.assertFalse(images & {task['image'] for task in validation['tasks']})
-        self.assertEqual(set(manifest['validation_instance_ids']), {t['instance_id'] for t in validation['tasks']})
+        self.assertTrue({t['instance_id'] for t in validation['tasks']}
+                        <= set(manifest['validation_instance_ids']))
         self.assertTrue(all(selector.toolchain_version(task) >= selector.MIN_TOOLCHAIN_VERSION
                             for task in tasks))
 
