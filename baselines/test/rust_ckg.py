@@ -1038,7 +1038,7 @@ class RustCodeGraph:
         exclude_tests: bool = True,
         max_neighbors: int = 12,
     ) -> dict[str, Any]:
-        """Inspect a symbol (foo, Type::method) or file (src/lib.rs, src/lib.rs:42) with neighborhood relations."""
+        """Inspect a symbol (foo, Type::method) or file (src/lib.rs, src/lib.rs:42, src/lib.rs:symbol)."""
         clean = target.strip()
         if not clean:
             return {"error": "Provide a symbol name, Type::method, or file[:line]"}
@@ -1047,11 +1047,15 @@ class RustCodeGraph:
 
         file_part = clean
         line_num: int | None = None
-        if ":" in clean and not clean.startswith("::") and "::" not in clean:
+        symbol_name: str | None = None
+        if ":" in clean and not clean.startswith("::"):
             fp, lp = clean.rsplit(":", 1)
             if lp.isdigit():
                 file_part = fp.strip()
                 line_num = int(lp)
+            elif fp.strip().endswith(".rs") and lp.strip():
+                file_part = fp.strip()
+                symbol_name = lp.strip()
 
         if file_part.endswith(".rs"):
             fpath = (self.root / file_part).resolve()
@@ -1063,18 +1067,33 @@ class RustCodeGraph:
                 enclosing_items = [it for it in items if it["line"] <= line_num <= it.get("end_line", it["line"])]
                 enclosing_items.sort(key=lambda x: (x.get("end_line", x["line"]) - x["line"], -x["line"]))
                 focus_items = enclosing_items[:3]
+            elif symbol_name is not None:
+                wanted = symbol_name.removeprefix("r#")
+                wanted_base = wanted.split("::")[-1]
+                wanted_owner = wanted.split("::")[-2] if "::" in wanted else ""
+                focus_items = [
+                    it for it in items
+                    if it.get("name", "").removeprefix("r#") in (wanted, wanted_base)
+                    and (not wanted_owner or wanted_owner in (it.get("enclosing") or ""))
+                ]
+                if not focus_items:
+                    return {
+                        "error": f"Symbol not found in {file_part}: {symbol_name}",
+                        "target": clean,
+                        "available_symbols": [it.get("name", "") for it in items[:40]],
+                    }
             else:
                 focus_items = items[:25]
             result: dict[str, Any] = {
                 "target": clean,
-                "mode": "file_line" if line_num is not None else "file",
+                "mode": "file_line" if line_num is not None else ("file_symbol" if symbol_name else "file"),
                 "module_path": pf.module_path,
                 "crate": self.crate_for_path(pf.rel_path),
                 "items": focus_items,
                 "reexports": pf.reexports[:15],
                 "impl_blocks": [ib for ib in pf.impl_blocks if not (exclude_tests and ib.get("is_test"))][:15],
             }
-            if line_num is not None and focus_items:
+            if (line_num is not None or symbol_name is not None) and focus_items:
                 fn_item = next((x for x in focus_items if x["kind"] == "fn"), None)
                 if fn_item:
                     nb = self.query_neighborhood(fn_item["name"], kind="fn", hops=hops, exclude_tests=exclude_tests, max_neighbors=max_neighbors)
@@ -1276,6 +1295,9 @@ def make_rust_ckg_tool(root: Path, graph: RustCodeGraph | None = None):
         exclude_tests: bool = True,
     ) -> str:
         """Inspect a Rust symbol, Type::method, or file[:line] via the Rust Code Knowledge Graph (CKG).
+
+        Target forms: "foo", "Type::method", "src/lib.rs", "src/lib.rs:42" (line),
+        "src/lib.rs:method" or "src/lib.rs:Type::method" (symbol inside that file).
 
         Returns definitions (with visibility and exact line spans), public pub use import paths,
         related impl Trait / #[derive] blocks, callers, and callees in one structured call.

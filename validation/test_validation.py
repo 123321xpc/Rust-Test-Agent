@@ -120,6 +120,7 @@ class ValidationTests(unittest.TestCase):
                 {'event': 'handoff_feature_snapshot', 'stage': 'navigator_handoff', 'from_role': 'navigator', 'to_role': 'fixer', 'attempt': 1, 'route': 'fast', 'outcome': 'completed', 'auto_synthesized': False, 'features': {'candidate_chains': {'chain_count': 1, 'root_candidates': [{'path': 'src/lib.rs'}]}, 'reproduction_status': {'status': 'runtime_failure', 'clean_red_count': 1}, 'repro_test_contents': {'char_len': 120}, 'shared_read_excerpts': {'char_len': 400}, 'shared_ckg_notes': {'char_len': 200}}},
                 {'event': 'handoff_feature_snapshot', 'stage': 'fixer_handoff', 'from_role': 'fixer', 'to_role': 'qa', 'attempt': 1, 'outcome': 'completed', 'fix_prompt_breakdown': {'total_chars': 2200, 'issue_chars': 300}, 'features': {'changed_files': {'paths': ['src/lib.rs']}, 'regression_verification': {'verified': True}, 'stuck_status': {'compile_repeats': 0, 'test_repeats': 0}, 'env_blocker': {'value': False}, 'deterministic_qa': {'present': True, 'ok': True, 'missing_contract_apis': [], 'doctest_shifts': []}}},
                 {'event': 'handoff_feature_snapshot', 'stage': 'verifier_handoff', 'from_role': 'verifier', 'to_role': 'submission', 'attempt': 1, 'decision': 'APPROVE', 'ver_prompt_chars': 1500, 'features': {'missing_requirements': {'items': []}, 'objections': {'items': []}}},
+                {'event': 'coordination_metrics', 'milestones_achieved': 5, 'milestones_total': 5, 'overall_kpi': 0.25, 'duplicate_work_rate': 0.0, 'zero_delta_handoffs': 0, 'pruned_replans': 0, 'coordination_efficiency_per_call': 0.4167, 'coordination_efficiency_per_100k_tokens': 10.0},
                 {'event': 'agent_metrics', 'api_calls': 12, 'total_tokens': 50000},
             ]
             (run_dir / 'test' / 'inst__a-1' / 'traces' / 'a.jsonl').write_text('\n'.join(json.dumps(x) for x in t_a) + '\n', encoding='utf-8')
@@ -161,9 +162,11 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(by_id['inst__b-2']['failure_attribution'], 'doctest_or_pass_to_pass_regression')
             self.assertEqual(by_id['inst__c-3']['failure_attribution'], 'no_source_edits')
             self.assertEqual(rep['prompt_char_averages']['fix_prompt_breakdown']['total_chars'], 2200)
+            self.assertEqual(rep['coordination_summary']['avg_overall_kpi'], 0.25)
             md = analyzer.format_markdown_report(rep)
             self.assertIn('inst__a-1', md)
             self.assertIn('doctest_or_pass_to_pass_regression', md)
+            self.assertIn('Multi-Agent Coordination Metrics', md)
 
 
 

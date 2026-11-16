@@ -27,7 +27,7 @@ def make_repo(tmp_path):
 def test_default_continuous_repair_preserves_context_and_changes(tmp_path, monkeypatch, consult):
     agent = load("agent")
     repo = make_repo(tmp_path)
-    monkeypatch.delenv("RUSTBENCH_REPAIR_MODE", raising=False)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
     monkeypatch.setattr(agent, "ChatOpenAI", Mock())
     make_tools = agent.make_tools
     states = []
@@ -157,7 +157,7 @@ def test_workspace_all_features_distinguishes_new_and_baseline_failures(tmp_path
 def test_continuous_repair_uses_remaining_budget_for_multiple_qa_rejections(tmp_path, monkeypatch):
     agent = load("agent")
     repo = make_repo(tmp_path)
-    monkeypatch.delenv("RUSTBENCH_REPAIR_MODE", raising=False)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
     monkeypatch.setattr(agent, "ChatOpenAI", Mock())
     original_make_tools = agent.make_tools
     states = []
@@ -202,3 +202,185 @@ def test_continuous_repair_uses_remaining_budget_for_multiple_qa_rejections(tmp_
     patch = agent.run_agent(repo, "Fix value", "unused", "unused", max_api_calls=100)
     assert "+pub fn value() -> i32 { 4 }" in patch
     assert calls == {"fixer": 4, "verifier": 4}
+
+
+def test_trace_recorder_counts_responses_api_usage(tmp_path):
+    import httpx
+    trace_mod = load("agent_trace")
+    recorder = trace_mod.TraceRecorder(tmp_path / "resp_metrics.jsonl")
+    client = trace_mod.TraceHTTPClient(recorder)
+    responses = iter([
+        httpx.Response(200, json={"usage": {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150}}),
+        httpx.Response(200, json={"usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
+    ])
+    client._transport = httpx.MockTransport(lambda request: next(responses))
+    client._mounts = {}
+    try:
+        client.post("https://example.test/v1/responses", json={})
+        client.post("https://example.test/v1/chat/completions", json={})
+    finally:
+        client.close()
+    metrics = recorder.metrics()
+    assert metrics["input_tokens"] == 130
+    assert metrics["output_tokens"] == 35
+    assert metrics["total_tokens"] == 165
+    assert metrics["responses_without_usage"] == 0
+
+
+def test_continuous_repair_verifier_gets_full_signals_tools_and_escalates_repeated_qa_rejects(tmp_path, monkeypatch):
+    agent = load("agent")
+    repo = make_repo(tmp_path)
+    (repo / "src/lexer.rs").write_text("pub fn lex() -> i32 { 0 }\n", encoding="utf-8")
+    (repo / "src/lib.rs").write_text("pub mod lexer;\npub fn value() -> i32 { lexer::lex() }\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
+    monkeypatch.setattr(agent, "ChatOpenAI", Mock())
+    make_tools = agent.make_tools
+    states = []
+    seen = []
+    verifier_prompts = []
+    advisor_prompts = []
+
+    def capture(*args, **kwargs):
+        tools, state = make_tools(*args, **kwargs)
+        state.post_strip_check = False
+        state.require_reproduction = False
+        state.run_existing_test_smoke = lambda _selected: []
+        states.append(state)
+        return tools, state
+
+    monkeypatch.setattr(agent, "make_tools", capture)
+    ver_calls = {"n": 0}
+    fix_calls = {"n": 0}
+
+    def create(model, tools, system_prompt):
+        tool_map = {item.name: item for item in tools}
+        if "one continuous repair conversation" in system_prompt:
+            role = "fixer"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "advisor"
+        else:
+            role = "verifier"
+        seen.append(role)
+
+        def invoke(inputs, config):
+            msg = inputs["messages"][-1]["content"]
+            if role == "fixer":
+                fix_calls["n"] += 1
+                if fix_calls["n"] == 1:
+                    tool_map["read_lines"].invoke({"path": "src/lexer.rs", "start_line": 1, "end_line": 1})
+                    tool_map["write_regression_test"].invoke({
+                        "path": "tests/test_regression_lex.rs", "content": "#[test] fn t() {}",
+                    })
+                    tool_map["edit_file"].invoke({
+                        "path": "src/lib.rs", "old_text": "lexer::lex()", "new_text": "lexer::lex() + 1",
+                    })
+                elif fix_calls["n"] == 2:
+                    tool_map["edit_file"].invoke({
+                        "path": "src/lib.rs", "old_text": "lexer::lex() + 1", "new_text": "lexer::lex() + 2",
+                    })
+                else:
+                    tool_map["edit_file"].invoke({
+                        "path": "src/lexer.rs", "old_text": "{ 0 }", "new_text": "{ 1 }",
+                    })
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_lex")
+                tool_map["submit_for_qa"].invoke({"summary": "updated"})
+            elif role == "verifier":
+                ver_calls["n"] += 1
+                verifier_prompts.append(msg)
+                assert "search_code" in tool_map and "read_file" in tool_map
+                if ver_calls["n"] <= 2:
+                    assert "Issue-Referenced Source Files Untouched by Diff: ['src/lexer.rs']" in msg or "src/lexer.rs" in msg
+                    tool_map["submit_qa_decision"].invoke({
+                        "decision": "REJECT",
+                        "summary": "Core lexer.rs file untouched",
+                        "missing_requirements": ["Update src/lexer.rs directly"],
+                        "objections": ["Downstream shim in lib.rs only"],
+                    })
+                else:
+                    tool_map["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "Fixed root cause"})
+            else:
+                advisor_prompts.append(msg)
+                assert "Issue Contract:" in msg
+                assert "Recent Verifier QA Rejections:" in msg
+                assert "Pre-loaded Source Excerpts" in msg
+                tool_map["submit_repair_plan"].invoke({
+                    "selected_chain_id": "C1",
+                    "arbitration_rationale": "Fix root cause in src/lexer.rs",
+                    "ordered_edits": [{"file": "src/lexer.rs", "description": "return 1"}],
+                })
+            return {"messages": inputs["messages"] + [{"role": "assistant", "content": "done"}]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent, "create_agent", create)
+    patch = agent.run_agent(repo, "Bug in `src/lexer.rs`: `lex` returns wrong value", "unused", "unused", max_api_calls=100)
+    assert "+pub fn lex() -> i32 { 1 }" in patch
+    assert seen == ["fixer", "verifier", "fixer", "verifier", "advisor", "fixer", "verifier"]
+    assert len(advisor_prompts) == 1
+    assert "Untouched" in verifier_prompts[0]
+
+
+def test_continuous_repair_bounces_passed_on_original_regression_test(tmp_path, monkeypatch):
+    agent = load("agent")
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
+    monkeypatch.setattr(agent, "ChatOpenAI", Mock())
+    make_tools = agent.make_tools
+    states = []
+    seen = []
+
+    def capture(*args, **kwargs):
+        tools, state = make_tools(*args, **kwargs)
+        state.post_strip_check = False
+        state.require_reproduction = True
+        state.run_existing_test_smoke = lambda _selected: []
+        # Simulate pre-fix reproduction check reporting the regression test passed on unpatched original code
+        def fake_verify(targets=None):
+            for k in (targets or state.get_regression_targets().keys()):
+                state._reproduced_regressions.pop(k, None)
+                state._reproduction_notes[k] = "passed on unpatched original code"
+            raise ValueError("Paired reproduction check failed: passed on original")
+        state.verify_pre_fix_reproduction = fake_verify
+        states.append(state)
+        return tools, state
+
+    monkeypatch.setattr(agent, "make_tools", capture)
+    fix_calls = {"n": 0}
+
+    def create(model, tools, system_prompt):
+        tool_map = {item.name: item for item in tools}
+        role = "fixer" if "one continuous repair conversation" in system_prompt else "verifier"
+        seen.append(role)
+
+        def invoke(inputs, config):
+            if role == "fixer":
+                fix_calls["n"] += 1
+                if fix_calls["n"] == 1:
+                    tool_map["write_regression_test"].invoke({
+                        "path": "tests/test_regression_value.rs", "content": "#[test] fn t() { assert!(true); }",
+                    })
+                    tool_map["edit_file"].invoke({"path": "src/lib.rs", "old_text": "{ 0 }", "new_text": "{ 1 }"})
+                    states[-1].pass_test(states[-1].start_test(), test_target="test_regression_value")
+                    tool_map["submit_for_qa"].invoke({"summary": "first try"})
+                else:
+                    assert "PASSED on the unpatched original checkout" in inputs["messages"][-1]["content"]
+                    # Now simulate genuine Red-Green reproduction
+                    key = next(iter(states[-1].get_regression_targets().keys()))
+                    states[-1].verify_pre_fix_reproduction = lambda _t=None: None
+                    states[-1]._reproduction_notes.pop(key, None)
+                    states[-1]._reproduced_regressions[key] = {
+                        "clean_red": True, "runtime_failure": True, "compile_reproduction": False,
+                        "test_sha256": states[-1]._target_sha256(key),
+                    }
+                    states[-1].pass_test(states[-1].start_test(), test_target="test_regression_value")
+                    tool_map["submit_for_qa"].invoke({"summary": "reproduced and fixed"})
+            else:
+                tool_map["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok"})
+            return {"messages": inputs["messages"] + [{"role": "assistant", "content": "ok"}]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent, "create_agent", create)
+    patch = agent.run_agent(repo, "Make value return 1", "unused", "unused", max_api_calls=100)
+    assert "+pub fn value() -> i32 { 1 }" in patch
+    assert seen == ["fixer", "fixer", "verifier"]

@@ -28,7 +28,8 @@ def test_edits_produce_applicable_complete_patch_without_mutating_checkout(norma
     repo, tools, state = normal
     assert set(tools) == {"read_file", "write_file", "write_regression_test", "edit_file", "revert_file",
                           "checkpoint", "generate_patch", "read_lines", "search_code", "cargo_workspace",
-                          "cargo_check", "cargo_test", "rust_symbols", "inspect_rust_neighborhood", "rust_error_explain", "rust_trace"}
+                          "cargo_check", "cargo_test", "rust_symbols", "inspect_rust_neighborhood", "rust_error_explain",
+                          "rust_trace", "verifier_probe"}
     write = tools["write_file"]
     write.invoke({"path": "edit.rs", "content": "intermediate\n"})
     write.invoke({"path": "edit.rs", "content": "after\n"})
@@ -79,6 +80,128 @@ def test_revert_file_restores_modified_deleted_created_and_regression_files(norm
     assert not state.regression_tests
     assert state.changed_paths() == []
     assert tools["generate_patch"].invoke({}) == "No changes to submit."
+
+
+def test_red_phase_regression_is_locked_after_confirmed_failure(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        "[package]\nname = \"lockdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+    write_test = tools["write_regression_test"]
+    write_test.invoke({"path": "tests/normal_regression_lock.rs", "content": "fn main() {}\n"})
+    key = ("Cargo.toml", "normal_regression_lock")
+    state.fail_test(
+        state.start_test(), manifest_path="Cargo.toml", test_target="normal_regression_lock",
+        executed=1, failures=["normal_regression_lock"], returncode=101,
+    )
+    report = state.locked_regression_report()
+    assert report["locked"], "a confirmed Red-phase regression must be locked"
+    assert report["locked"][0]["name"] == "normal_regression_lock"
+    assert report["locked"][0]["status"] == "intact"
+    assert not report["tampered"]
+    assert key in state._locked_regressions
+
+
+def test_locked_regression_cannot_be_rewritten_or_reverted(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        "[package]\nname = \"lockdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+    write_test = tools["write_regression_test"]
+    write_test.invoke({"path": "tests/normal_regression_lock2.rs", "content": "fn main() {}\n"})
+    state.fail_test(
+        state.start_test(), manifest_path="Cargo.toml", test_target="normal_regression_lock2",
+        executed=1, failures=["normal_regression_lock2"], returncode=101,
+    )
+    assert state._locked_regressions
+    rewrite = write_test.invoke({
+        "path": "tests/normal_regression_lock2.rs",
+        "content": "fn main() { /* weakened */ }\n",
+    })
+    assert "locked" in rewrite.lower() and "Error" in rewrite
+    revert = tools["revert_file"].invoke({"path": "tests/normal_regression_lock2.rs"})
+    assert "locked" in revert.lower() and "Error" in revert
+    assert not state.reproduced(), "a blocked revert must clear the Red-phase evidence"
+    violations = state.locked_regression_report()["violations"]
+    assert any(v["action"] == "rewrite_locked_regression" for v in violations)
+    assert any(v["action"] == "revert_locked_regression" for v in violations)
+
+
+def test_locked_regression_detects_tampering_in_report(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        "[package]\nname = \"lockdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+    tools["write_regression_test"].invoke({
+        "path": "tests/normal_regression_tamper.rs", "content": "fn main() {}\n",
+    })
+    state.fail_test(
+        state.start_test(), manifest_path="Cargo.toml", test_target="normal_regression_tamper",
+        executed=1, failures=["normal_regression_tamper"], returncode=101,
+    )
+    assert not state.locked_regression_report()["tampered"]
+    target = state.root / "tests" / "normal_regression_tamper.rs"
+    target.write_text("fn main() { assert!(false); }\n", encoding="utf-8")
+    report = state.locked_regression_report()
+    assert report["tampered"]
+    assert report["tampered_entries"][0]["status"] == "modified"
+
+
+def test_verifier_probe_rejects_unknown_probe_type(normal):
+    _, tools, _state = normal
+    out = tools["verifier_probe"].invoke({"probe_type": "nonsense"})
+    assert "probe_type must be" in out
+
+
+@pytest.mark.parametrize(
+    ("assertion_code", "expected_status", "expected_passed", "expected_failed"),
+    [
+        ("assert_eq!(probe_demo::value(), 1);", "passed", 1, 0),
+        ("assert_eq!(probe_demo::value(), 2);", "failed", 0, 1),
+        ("#[test]\nfn complete_probe_test() { assert_eq!(probe_demo::value(), 1); }", "passed", 1, 0),
+        ("#[test]\nfn complete_probe_test() { assert_eq!(probe_demo::value(), 2); }", "failed", 0, 1),
+        ("#[test]\n#[ignore]\nfn ignored_probe_test() {}", "no_tests", 0, 0),
+    ],
+)
+def test_verifier_probe_executes_assertions_and_cleans_temp_test(
+    normal, assertion_code, expected_status, expected_passed, expected_failed,
+):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        "[package]\nname = \"probe_demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+    (state.root / "src").mkdir(parents=True, exist_ok=True)
+    (state.root / "src" / "lib.rs").write_text("pub fn value() -> i32 { 1 }\n", encoding="utf-8")
+    probe_file = state.root / "tests" / "test_verifier_probe_tmp.rs"
+
+    result = tools["verifier_probe"].invoke({
+        "probe_type": "assertion",
+        "manifest_path": "Cargo.toml",
+        "assertion_code": assertion_code,
+        "timeout": 60,
+    })
+    payload = json.loads(result)
+    assert payload["status"] == expected_status
+    assert payload["tests_passed"] == expected_passed
+    assert payload["tests_failed"] == expected_failed
+    assert not probe_file.exists()
+
+
+def test_verifier_probe_preserves_existing_target_file(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text("[package]\nname = 'probe_demo'\nversion = '0.1.0'\n", encoding="utf-8")
+    probe_file = state.root / "tests" / "test_verifier_probe_tmp.rs"
+    probe_file.parent.mkdir(parents=True, exist_ok=True)
+    probe_file.write_text("existing test", encoding="utf-8")
+
+    result = tools["verifier_probe"].invoke({"probe_type": "assertion", "assertion_code": "assert!(true);"})
+
+    assert "already active" in result
+    assert probe_file.read_text(encoding="utf-8") == "existing test"
 
 
 def test_write_file_rejects_erasing_existing_rust_source_without_force(normal):
@@ -204,8 +327,114 @@ def test_existing_test_smoke_does_not_attribute_baseline_failure_to_patch(tmp_pa
         assert results[0]["status"] == "failed"
         assert results[0]["classification"] == "unknown"
         assert results[0]["baseline_status"] == "failed"
+        assert results[0]["baseline_label"] == "BASELINE_UNCONFIRMED_NOT_PREEXISTING"
     finally:
         state.close()
+
+
+def test_existing_test_smoke_flags_snapshot_change_under_same_test_name(tmp_path, monkeypatch):
+    """Identical failing test names with different snapshot output must be attributed to the patch."""
+    repo = tmp_path / "smoke_snapshot_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (repo / "tests" / "integration.rs").write_text("#[test] fn integration() {}\n", encoding="utf-8")
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "smoke_snapshot_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    spec = importlib.util.spec_from_file_location("tools_smoke_snapshot", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/cargo")
+    try:
+        tools["write_file"].invoke({"path": "src/main.rs", "content": "fn main() { let _patched = true; }\n"})
+        patched = SimpleNamespace(
+            returncode=1,
+            stdout=(
+                "test integration ... FAILED\n"
+                "---- integration stdout ----\n"
+                "Snapshot Summary\n"
+                "- old rendered value\n"
+                "+ new rendered value\n"
+                "test result: FAILED. 0 passed; 1 failed\n"
+            ),
+            stderr="",
+        )
+        baseline = SimpleNamespace(
+            returncode=1,
+            stdout=(
+                "test integration ... FAILED\n"
+                "---- integration stdout ----\n"
+                "Snapshot Summary\n"
+                "- old rendered value\n"
+                "test result: FAILED. 0 passed; 1 failed\n"
+            ),
+            stderr="",
+        )
+        calls = iter([patched, baseline])
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(calls))
+        results = state.run_existing_test_smoke([Path("src/main.rs")], timeout=3)
+        assert len(results) == 1
+        assert results[0]["classification"] == "code"
+        assert results[0]["baseline_status"] == "failed"
+        assert results[0]["new_failed_tests"] == ["integration"]
+    finally:
+        state.close()
+
+
+def test_unlocked_regression_can_be_rewritten_but_only_once(normal):
+    """An Architect-released oracle may be corrected; the release works only once."""
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        "[package]\nname = \"lockdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+    write_test = tools["write_regression_test"]
+    write_test.invoke({"path": "tests/normal_regression_unlock.rs", "content": "fn main() {}\n"})
+    state.fail_test(
+        state.start_test(), manifest_path="Cargo.toml", test_target="normal_regression_unlock",
+        executed=1, failures=["normal_regression_unlock"], returncode=101,
+    )
+    assert state._locked_regressions
+
+    refused = state.unlock_regression("normal_regression_unlock", "too short")
+    assert not refused["ok"]
+    assert "20 chars" in refused["error"]
+
+    released = state.unlock_regression(
+        "normal_regression_unlock",
+        "The locked test asserted the wrong expected value for the parsed date.",
+        approved_by="architect",
+    )
+    assert released["ok"]
+    assert released["unlocked"] == "normal_regression_unlock"
+    assert not state._locked_regressions
+
+    rewrite = write_test.invoke({
+        "path": "tests/normal_regression_unlock.rs",
+        "content": "fn main() { /* corrected oracle */ }\n",
+    })
+    assert rewrite.startswith("Updated") or "locked" not in rewrite.lower()
+
+    again = state.unlock_regression(
+        "normal_regression_unlock",
+        "Trying to release the same oracle a second time for extra latitude.",
+    )
+    assert not again["ok"]
+    assert "already unlocked" in again["error"]
+
+
+def test_changed_line_numbers_reports_only_modified_lines():
+    spec = importlib.util.spec_from_file_location("tools_changed_lines", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    old = "a\nb\nc\n"
+    new = "a\nB\nc\n"
+    assert module._changed_line_numbers(old, new) == [2]
+    assert module._changed_line_numbers(old, old) == []
+    assert module._changed_line_numbers("", "x\ny\n") == [1, 2]
 
 
 def test_budget_notice_injected_when_remaining_calls_low(normal):
@@ -1518,5 +1747,59 @@ def test_bin_only_in_module_verification_aborted_red_and_snapshot_red_preservati
         assert state.reproduced_cleanly()
         state.restore_checkpoint("fix")
         assert state.reproduced_cleanly()
+    finally:
+        state.close()
+
+
+def test_smoke_ignores_snapshot_template_text_and_keeps_snapshot_diff(tmp_path, monkeypatch):
+    repo = tmp_path / "insta_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (repo / "tests" / "integration.rs").write_text("#[test] fn snap() {}\n", encoding="utf-8")
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "insta_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    spec = importlib.util.spec_from_file_location("tools_insta_smoke", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/cargo")
+    try:
+        tools["write_file"].invoke({"path": "src/main.rs", "content": "fn main() { let _patched = true; }\n"})
+        insta_stdout = (
+            "running 1 test\n"
+            "test err_snap ... FAILED\n\n"
+            "failures:\n\n"
+            "---- err_snap stdout ----\n"
+            "Snapshot Summary\n"
+            "Snapshot: err_snap\n"
+            "-old snapshot\n"
+            "+new results\n"
+            "  10 │+  err \"failed to download\"\n"
+            "  11 │+  × Expected an array, an object, or a literal\n"
+            "To update snapshots run `cargo insta review`\n"
+            "thread 'err_snap' panicked at insta/src/runtime.rs:563:9\n\n"
+            "failures:\n    err_snap\n\n"
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+            + "\n".join(f"stored new snapshot /tmp/repo/tests/s_{i}.snap.new" for i in range(30))
+        )
+        calls = iter([
+            SimpleNamespace(returncode=101, stdout=insta_stdout, stderr=""),
+            SimpleNamespace(returncode=0, stdout="test result: ok. 1 passed; 0 failed\n", stderr=""),
+        ])
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(calls))
+        results = state.run_existing_test_smoke([Path("src/main.rs")], timeout=3)
+        assert len(results) == 1
+        assert results[0]["status"] == "failed"
+        assert results[0]["classification"] == "code"
+        assert "Expected an array, an object, or a literal" in results[0]["details"]
+        assert "stored new snapshot /tmp/repo/tests/s_29.snap.new" not in results[0]["details"]
+
+        assert module._smoke_environment_failure(
+            "thread 'aka_musl' panicked: Connection timed out\n",
+            "fatal: unable to access 'https://github.com/x/y': Failed to connect to github.com",
+        )
     finally:
         state.close()

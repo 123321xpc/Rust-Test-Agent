@@ -107,3 +107,44 @@ def test_ckg_incremental_cache_updates_on_file_edit(tmp_path):
     lib.write_text("pub fn alpha() {}\npub fn beta() { alpha(); }\n", encoding="utf-8")
     res2 = graph.query_neighborhood("alpha")
     assert any(c["caller"] == "beta" for c in res2["callers"])
+
+
+def test_query_neighborhood_resolves_symbol_inside_a_file(tmp_path):
+    """`file.rs:symbol` must return the symbol's definition, not an empty result."""
+    ckg = _load_ckg()
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "symfile"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text(
+        "pub fn consume_string() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    2\n}\n",
+        encoding="utf-8",
+    )
+    graph = ckg.RustCodeGraph(root)
+    res = graph.query_neighborhood("src/lib.rs:consume_string")
+    assert res.get("mode") == "file_symbol"
+    assert not res.get("error")
+    assert [it["name"] for it in res["items"]] == ["consume_string"]
+
+
+def test_query_neighborhood_reports_unknown_symbol_in_file(tmp_path):
+    ckg = _load_ckg()
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "symfile2"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text("pub fn present() -> u32 {\n    1\n}\n", encoding="utf-8")
+    graph = ckg.RustCodeGraph(root)
+    res = graph.query_neighborhood("src/lib.rs:absent")
+    assert res.get("error")
+    assert "present" in res.get("available_symbols", [])
+
+
+def test_query_neighborhood_line_form_still_works(tmp_path):
+    ckg = _load_ckg()
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "symfile3"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text("pub fn present() -> u32 {\n    1\n}\n", encoding="utf-8")
+    graph = ckg.RustCodeGraph(root)
+    res = graph.query_neighborhood("src/lib.rs:2")
+    assert res.get("mode") == "file_line"
+    assert res["items"]

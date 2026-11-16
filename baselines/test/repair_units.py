@@ -22,6 +22,8 @@ class RepairUnitSpec(BaseModel):
     edit_indices: list[int] = Field(description="Zero-based indices into ordered_edits; group mutually dependent hunks")
     depends_on: list[str] = Field(default_factory=list)
     verification: list[VerificationTarget] = Field(default_factory=list, description="Targeted Cargo checks after this unit closes; defaults to affected manifests")
+    expected_outcome: str = Field(default="", description="Expected compiler or test outcome when this unit closes")
+    refutation_signals: list[str] = Field(default_factory=list, description="Error codes or failure substrings that refute this unit's causal hypothesis")
 
 
 class UnitBoundary(Exception):
@@ -58,8 +60,11 @@ def normalize_units(plan: dict | None, fallback_paths: list[str]) -> list[dict]:
         checks = item.get("verification") or []
         for check in checks:
             VerificationTarget.model_validate(check)
+        ref_signals = [str(s).strip() for s in (item.get("refutation_signals") or []) if str(s).strip()]
         units.append({"members": {item["unit_id"]}, "description": item.get("description", ""),
                       "paths": paths, "work": work, "deps": deps, "verification": checks,
+                      "expected_outcome": str(item.get("expected_outcome") or "").strip(),
+                      "refutation_signals": ref_signals,
                       "strict_scope": explicit})
     required = {i for i, e in enumerate(edits) if e.get("action") != "preserve"}
     if explicit and required - covered:
@@ -84,6 +89,8 @@ def normalize_units(plan: dict | None, fallback_paths: list[str]) -> list[dict]:
         a["description"] += " / " + b["description"]
         a["work"] += b["work"]
         a["verification"] += b["verification"]
+        a["expected_outcome"] = " / ".join(x for x in (a["expected_outcome"], b["expected_outcome"]) if x)
+        a["refutation_signals"] = list(dict.fromkeys(a["refutation_signals"] + b["refutation_signals"]))
     owner = {m: "+".join(sorted(u["members"])) for u in units for m in u["members"]}
     for u in units:
         u["unit_id"] = "+".join(sorted(u.pop("members")))
@@ -114,6 +121,7 @@ class RepairUnitCoordinator:
     def status(self):
         return {"current_unit": self.active, "units": [
             {k: u.get(k) for k in ("unit_id", "description", "paths", "depends_on", "status",
+                                   "expected_outcome", "refutation_signals", "refuted_by",
                                    "completed_changes", "summary", "evidence", "blocker")}
             for u in self.units]}
 
@@ -296,6 +304,19 @@ class RepairUnitCoordinator:
                 parent = parent.parent
         return [{"tool": "cargo_check", "arguments": {"manifest_path": m}} for m in sorted(manifests or {"Cargo.toml"})]
 
+    def detect_refutation(self, unit, evidence):
+        """Return the matching refutation signal when failed check output refutes the unit hypothesis."""
+        signals = unit.get("refutation_signals") or []
+        if not signals:
+            return ""
+        failed_text = "\n".join(str(e.get("output") or "") for e in evidence if not e.get("ok")).lower()
+        if not failed_text:
+            return ""
+        for sig in signals:
+            if sig.lower() in failed_text:
+                return sig
+        return ""
+
     def verify(self, *, complete=False, summary=""):
         if not self.active:
             return self.all_done(), "No active unit; perform final regression and independent QA."
@@ -326,10 +347,25 @@ class RepairUnitCoordinator:
                              "ok": bool(ok), "kind": "behavior" if behavior else "compile",
                              "output": str(out)[-1800:]})
         ok = bool(evidence) and all(e["ok"] for e in evidence)
+        refuted_by = "" if ok else self.detect_refutation(unit, evidence)
         unit["evidence"] = evidence
         unit["completed_changes"] = [p.as_posix() for p in self.delta_paths(unit)]
-        unit["blocker"] = "" if ok else "Targeted unit verification failed"
+        unit["refuted_by"] = refuted_by
+        unit["blocker"] = (
+            f"Unit hypothesis refuted by observed output ({refuted_by})"
+            if refuted_by else ("" if ok else "Targeted unit verification failed")
+        )
         self.steps = self.unchecked_edits = 0
+        if refuted_by:
+            if self.candidate_policy:
+                ev_ids = [e["candidate_evidence_id"] for e in evidence if not e["ok"] and e.get("candidate_evidence_id")]
+                if ev_ids:
+                    self.candidate_policy.counterevidence(
+                        f"Unit '{unit['unit_id']}' matched refutation signal '{refuted_by}'.", ev_ids
+                    )
+            self.publish("repair_unit_verification", complete=False, verified=False, refuted_by=refuted_by)
+            return False, json.dumps({"unit_id": unit["unit_id"], "checks": evidence, "complete": False,
+                                      "verified": False, "refuted_by": refuted_by}, ensure_ascii=False)
         if complete:
             paths = {p for uid in self._closure(self.active) for p in self._unit(uid)["paths"]}
             paths.update(unit["completed_changes"])

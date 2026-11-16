@@ -41,111 +41,46 @@ def test_repair_keeps_path_when_xpc_git_is_missing(agent_module, monkeypatch, tm
     assert os.environ["PATH"] == "existing-path"
 
 
-def test_run_agent_returns_tool_submission(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(patch="", close=Mock())
-    tools = [object()]
-    monkeypatch.setattr(agent_module, "make_tools", lambda repo: (tools, state))
-    llm = object()
-    llm_factory = Mock(return_value=llm)
-    monkeypatch.setattr(agent_module, "ChatOpenAI", llm_factory)
-    submitted_patch = "diff --git a/a.rs b/a.rs\n"
-
-    def invoke(inputs, config):
-        assert inputs == {"messages": [{"role": "user", "content": "fix issue"}]}
-        assert config == {"recursion_limit": sys.maxsize}
-        state.patch = submitted_patch
-
-    create = Mock(return_value=SimpleNamespace(invoke=invoke))
-    monkeypatch.setattr(agent_module, "create_agent", create)
-    assert agent_module.run_agent(tmp_path, "fix issue", "model", "key", "https://example.com", max_api_calls=3, multi_agent=False) == submitted_patch
-    state.close.assert_called_once()
-    create.assert_called_once_with(model=llm, tools=tools, system_prompt=agent_module.SYSTEM_PROMPT)
-    assert llm_factory.call_args.kwargs["base_url"] == "https://example.com"
-
-
-def test_run_agent_reports_verified_toolchain(agent_module, monkeypatch, tmp_path):
+def test_run_agent_defaults_to_graph_mode_and_reports_toolchain(agent_module, monkeypatch, tmp_path):
     state = SimpleNamespace(patch="", close=Mock(), rust_info={"source": "benchmark", "rustc": "rustc 1.72.0", "cargo": "cargo 1.72.0"})
     make_tools = Mock(return_value=([], state))
     monkeypatch.setattr(agent_module, "make_tools", make_tools)
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
+    monkeypatch.delenv("RUSTBENCH_REPAIR_MODE", raising=False)
     trace = Mock()
-    def invoke(inputs, config):
-        assert "rustc 1.72.0" in inputs["messages"][0]["content"]
-        state.patch = "patch"
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    assert agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, rust_version="1.72.0", multi_agent=False) == "patch"
+    graph_mock = Mock(return_value="diff --git a/lib.rs b/lib.rs\n")
+    staged_mock = Mock(return_value="staged-patch")
+    continuous_mock = Mock(return_value="continuous-patch")
+    monkeypatch.setattr(agent_module._multi_agent, "run_graph_agent", graph_mock)
+    monkeypatch.setattr(agent_module._multi_agent, "run_multi_agent", staged_mock)
+    monkeypatch.setattr(agent_module._multi_agent, "run_continuous_repair", continuous_mock)
+
+    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", "https://example.com", trace=trace, max_api_calls=12, rust_version="1.72.0")
+    assert patch == "diff --git a/lib.rs b/lib.rs\n"
     make_tools.assert_called_once_with(tmp_path, "1.72.0")
     trace.record.assert_called_once_with("rust_environment", **state.rust_info)
-
-
-def test_run_agent_rejects_missing_submission(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(patch="", close=Mock())
-    monkeypatch.setattr(agent_module, "make_tools", lambda repo: ([], state))
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=Mock())))
-    with pytest.raises(RuntimeError, match="non-empty patch"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
+    graph_mock.assert_called_once()
+    staged_mock.assert_not_called()
+    continuous_mock.assert_not_called()
+    assert "rustc 1.72.0" in graph_mock.call_args.args[1]
+    assert graph_mock.call_args.args[4] == "https://example.com"
     state.close.assert_called_once()
 
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
+    assert agent_module.run_agent(tmp_path, "issue", "model", "key") == "staged-patch"
+    staged_mock.assert_called_once()
 
-def test_run_agent_uses_selected_patch_and_requires_resubmission(agent_module, monkeypatch, tmp_path):
-    (tmp_path / "lib.rs").write_text("before\n", encoding="utf-8")
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    make_tools = agent_module.make_tools
-    states = []
-
-    def capture_state(repo):
-        tools, state = make_tools(repo)
-        states.append(state)
-        return tools, state
-
-    monkeypatch.setattr(agent_module, "make_tools", capture_state)
-
-    def invoke(inputs, config):
-        tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
-        tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="test_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
-        preview = tools["generate_patch"].invoke({})
-        assert "test_regression_fix.rs" in preview
-        tools["generate_patch"].invoke({"paths": ["lib.rs"]})
-
-    create = Mock(return_value=SimpleNamespace(invoke=invoke))
-    monkeypatch.setattr(agent_module, "create_agent", create)
-    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
-    assert "after" in patch and "test_regression_fix.rs" not in patch
-
-    def invoke_without_submission(inputs, config):
-        tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
-        tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="test_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
-        tools["generate_patch"].invoke({"paths": ["lib.rs"]})
-        tools["write_file"].invoke({"path": "scratch.rs", "content": "temporary\n"})
-
-    create.return_value = SimpleNamespace(invoke=invoke_without_submission)
-    with pytest.raises(RuntimeError, match="non-empty patch"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
+    assert agent_module.run_agent(tmp_path, "issue", "model", "key") == "continuous-patch"
+    continuous_mock.assert_called_once()
 
 
-def test_agent_continues_when_model_stops_without_submission(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(patch="", close=Mock())
+def test_run_agent_rejects_missing_patch(agent_module, monkeypatch, tmp_path):
+    state = SimpleNamespace(patch="", close=Mock(), changed_paths=Mock(return_value=[]))
     monkeypatch.setattr(agent_module, "make_tools", lambda repo: ([], state))
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    calls = []
-
-    def invoke(inputs, config):
-        calls.append(inputs["messages"])
-        if len(calls) == 1:
-            return {"messages": inputs["messages"] + [{"role": "assistant", "content": "Tests failed."}]}
-        state.patch = "diff --git a/a b/a\n"
-        return {"messages": inputs["messages"]}
-
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    assert agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False) == state.patch
-    assert len(calls) == 2 and "continue" in calls[1][-1]["content"].lower()
+    monkeypatch.setattr(agent_module._multi_agent, "run_graph_agent", Mock(return_value=""))
+    with pytest.raises(RuntimeError, match="non-empty patch"):
+        agent_module.run_agent(tmp_path, "issue", "model", "key")
+    state.close.assert_called_once()
 
 
 def test_cli_appends_prediction(agent_module, monkeypatch, tmp_path):
@@ -227,44 +162,6 @@ def test_invalid_api_limit(agent_module, monkeypatch, tmp_path, value):
     monkeypatch.setattr(sys, "argv", ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", "issue", "--output", "out", "--rust-toolchain", "1.72.0"])
     with pytest.raises(SystemExit):
         agent_module.main()
-
-
-def test_run_agent_auto_submits_verified_changes_when_api_limit_reached(agent_module, monkeypatch, tmp_path):
-    (tmp_path / "lib.rs").write_text("before\n", encoding="utf-8")
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    make_tools = agent_module.make_tools
-    states = []
-
-    def capture_state(repo):
-        tools, state = make_tools(repo)
-        states.append(state)
-        return tools, state
-
-    monkeypatch.setattr(agent_module, "make_tools", capture_state)
-
-    def invoke_verified_then_limit(inputs, config):
-        tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
-        tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="test_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
-        raise RuntimeError("Model API call limit reached (5)")
-
-    create = Mock(return_value=SimpleNamespace(invoke=invoke_verified_then_limit))
-    monkeypatch.setattr(agent_module, "create_agent", create)
-    trace = Mock()
-    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, max_api_calls=5, multi_agent=False)
-    assert "+after" in patch and "test_regression_fix.rs" not in patch
-    trace.record.assert_called_once_with("auto_submit_on_limit", patch=patch)
-
-    def invoke_unverified_then_limit(inputs, config):
-        tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
-        tools["write_file"].invoke({"path": "lib.rs", "content": "unverified\n"})
-        raise RuntimeError("Model API call limit reached (5)")
-
-    create.return_value = SimpleNamespace(invoke=invoke_unverified_then_limit)
-    with pytest.raises(RuntimeError, match="Model API call limit reached"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key", max_api_calls=5, multi_agent=False)
 
 
 def test_compress_history_messages_trims_old_tool_outputs(agent_module):
@@ -355,30 +252,6 @@ def test_compress_history_messages_handles_cargo_check_and_assistant_tool_args(a
     assert "targets" not in ws_obj["workspace_members"][0]
 
 
-def test_run_agent_auto_submits_when_verified_without_extra_continuation(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(
-        patch="",
-        close=Mock(),
-        verified=Mock(return_value=True),
-        auto_submit_verified_patch=Mock(return_value="diff --git verified\n"),
-    )
-    monkeypatch.setattr(agent_module, "make_tools", lambda repo: ([], state))
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    calls = []
-
-    def invoke(inputs, config):
-        calls.append(inputs["messages"])
-        return {"messages": inputs["messages"] + [{"role": "assistant", "content": "Tests pass, finished."}]}
-
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    trace = Mock()
-    result_patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, multi_agent=False)
-    assert result_patch == "diff --git verified\n"
-    # Auto-submission must finish on the FIRST invoke without requiring continuation!
-    assert len(calls) == 1
-    trace.record.assert_called_once_with("auto_submit_verified", patch="diff --git verified\n")
-
-
 def test_cli_defaults_require_reproduction_and_accepts_no_require_reproduction(agent_module, monkeypatch, tmp_path):
     issue = tmp_path / "issue.txt"
     issue.write_text("issue text", encoding="utf-8")
@@ -430,22 +303,6 @@ def test_compress_history_messages_block_size_stability_and_idempotency(agent_mo
         assert m1.content == m2.content
 
 
-def test_run_agent_stops_after_repeated_idle_responses(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(patch="", close=Mock())
-    monkeypatch.setattr(agent_module, "make_tools", lambda repo: ([], state))
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    calls = []
-
-    def invoke(inputs, config):
-        calls.append(inputs["messages"])
-        return {"messages": inputs["messages"] + [{"role": "assistant", "content": "I am done."}]}
-
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    with pytest.raises(RuntimeError, match="stopped calling tools"):
-        agent_module.run_agent(tmp_path, "issue", "model", "key", multi_agent=False)
-    assert len(calls) == 4
-
-
 def test_compress_history_messages_compacts_older_assistant_thoughts(agent_module):
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -486,7 +343,7 @@ def test_compress_history_messages_compacts_stale_file_reads(agent_module):
     assert "1: fn bar()" in compressed[6].content
 
 
-def test_cli_single_agent_flag_passes_multi_agent_false(agent_module, monkeypatch, tmp_path):
+def test_cli_rejects_removed_single_agent_flag(agent_module, monkeypatch, tmp_path):
     issue = tmp_path / "issue.txt"
     issue.write_text("issue text", encoding="utf-8")
     output = tmp_path / "out.jsonl"
@@ -495,12 +352,10 @@ def test_cli_single_agent_flag_passes_multi_agent_false(agent_module, monkeypatc
     monkeypatch.setenv("API_KEY", "key")
     monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
     monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
-    run = Mock(return_value="diff --git patch\n")
-    monkeypatch.setattr(agent_module, "run_agent", run)
     monkeypatch.setattr(sys, "argv", [
         "agent.py", "--repo", str(tmp_path), "--instance-id", "id",
         "--issue-file", str(issue), "--output", str(output),
         "--rust-toolchain", "1.72.0", "--single-agent",
     ])
-    agent_module.main()
-    assert run.call_args.kwargs["multi_agent"] is False
+    with pytest.raises(SystemExit):
+        agent_module.main()

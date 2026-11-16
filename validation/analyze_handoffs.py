@@ -92,6 +92,7 @@ def parse_trace_file(trace_path: Path | None) -> dict[str, Any]:
         "qa_gates": [],
         "run_error": None,
         "metrics": {},
+        "coordination_metrics": {},
         "issue_contract": {},
         "legacy_localization": None,
         "legacy_repair_plan": None,
@@ -158,6 +159,20 @@ def parse_trace_file(trace_path: Path | None) -> dict[str, Any]:
                     "input_tokens": ev.get("input_tokens"),
                     "output_tokens": ev.get("output_tokens"),
                     "total_tokens": ev.get("total_tokens"),
+                }
+            elif etype == "coordination_metrics":
+                info["coordination_metrics"] = {
+                    "milestones": ev.get("milestones") or {},
+                    "milestones_achieved": ev.get("milestones_achieved"),
+                    "milestones_total": ev.get("milestones_total"),
+                    "role_kpi": ev.get("role_kpi") or {},
+                    "overall_kpi": ev.get("overall_kpi"),
+                    "duplicate_work_rate": ev.get("duplicate_work_rate"),
+                    "total_transitions": ev.get("total_transitions"),
+                    "zero_delta_handoffs": ev.get("zero_delta_handoffs"),
+                    "pruned_replans": ev.get("pruned_replans"),
+                    "coordination_efficiency_per_call": ev.get("coordination_efficiency_per_call"),
+                    "coordination_efficiency_per_100k_tokens": ev.get("coordination_efficiency_per_100k_tokens"),
                 }
             elif etype == "api_limit":
                 info["legacy_api_limit"] = True
@@ -454,6 +469,7 @@ def analyze_runs(
                 "run_error": trace_info["run_error"],
                 "report": report_info,
                 "features": features,
+                "coordination_metrics": trace_info.get("coordination_metrics") or {},
             })
 
     verdict_counts = Counter(r["verdict"] for r in rows)
@@ -515,6 +531,21 @@ def analyze_runs(
 
     total = len(rows)
     resolved_n = verdict_counts.get("resolved", 0)
+    coord_rows = [r["coordination_metrics"] for r in rows if r.get("coordination_metrics")]
+    coord_summary: dict[str, Any] = {}
+    if coord_rows:
+        def _avg_coord(field: str) -> float | None:
+            vals = [c[field] for c in coord_rows if isinstance(c.get(field), (int, float))]
+            return round(statistics.mean(vals), 4) if vals else None
+        coord_summary = {
+            "coverage": len(coord_rows),
+            "avg_overall_kpi": _avg_coord("overall_kpi"),
+            "avg_milestones_achieved": _avg_coord("milestones_achieved"),
+            "avg_duplicate_work_rate": _avg_coord("duplicate_work_rate"),
+            "avg_zero_delta_handoffs": _avg_coord("zero_delta_handoffs"),
+            "total_pruned_replans": sum(int(c.get("pruned_replans") or 0) for c in coord_rows),
+            "avg_efficiency_per_100k_tokens": _avg_coord("coordination_efficiency_per_100k_tokens"),
+        }
     return {
         "agent": agent,
         "run_dirs": [str(p) for p in run_dirs],
@@ -525,6 +556,7 @@ def analyze_runs(
         "failure_attribution_counts": dict(attr_counts),
         "feature_correlations": correlations,
         "prompt_char_averages": prompt_stats,
+        "coordination_summary": coord_summary,
         "instances": rows,
     }
 
@@ -571,6 +603,10 @@ def format_markdown_report(report: dict[str, Any]) -> str:
         lines.append("## Prompt Char Breakdown Averages")
         for pkey, avgs in report["prompt_char_averages"].items():
             lines.append(f"- **{pkey}**: `{json.dumps(avgs, ensure_ascii=False)}`")
+    if report.get("coordination_summary"):
+        lines.append("")
+        lines.append("## Multi-Agent Coordination Metrics")
+        lines.append(f"- Summary: `{json.dumps(report['coordination_summary'], ensure_ascii=False)}`")
     return "\n".join(lines) + "\n"
 
 

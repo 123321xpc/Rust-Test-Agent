@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import tool
 
@@ -47,6 +48,55 @@ def _is_virtual_workspace_manifest(manifest_file: Path) -> bool:
     has_package = bool(re.search(r"(?m)^\[package\]", content))
     has_explicit_target = bool(re.search(r"(?m)^(?:\[lib\]|\[\[bin\]\]|\[\[test\]\])", content))
     return has_workspace and not has_package and not has_explicit_target
+
+
+def _manifest_package_name(manifest_file: Path) -> str:
+    """Return the [package] name declared by a manifest, or ""."""
+    try:
+        content = manifest_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    section = re.search(r"(?ms)^\[package\](.*?)(?:^\[|\Z)", content)
+    if not section:
+        return ""
+    name = re.search(r"(?m)^name\s*=\s*[\"']([^\"']+)[\"']", section.group(1))
+    return name.group(1) if name else ""
+
+
+def _workspace_member_manifests(state: Any, workspace_manifest: Path) -> list[Path]:
+    """Return member crate manifests of a virtual workspace, preferring crates that own tests.
+
+    `cargo test --test=<name>` cannot run against a virtual workspace root, so a probe
+    must target a member crate. Members that ship an integration test directory are
+    preferred because they can host a temporary assertion module.
+    """
+    root = state.root.resolve()
+    workspace_dir = workspace_manifest.parent
+    members: list[Path] = []
+    try:
+        content = workspace_manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        content = ""
+    patterns = re.findall(r"(?m)^\s*members\s*=\s*\[(.*?)\]", content, re.DOTALL)
+    globs: list[str] = []
+    for block in patterns:
+        globs.extend(re.findall(r"[\"']([^\"']+)[\"']", block))
+    for pattern in globs:
+        for candidate in sorted(workspace_dir.glob(pattern)):
+            manifest = candidate / "Cargo.toml" if candidate.is_dir() else candidate
+            if manifest.is_file():
+                members.append(manifest.resolve())
+    if not members:
+        for manifest in sorted(root.glob("**/Cargo.toml")):
+            if any(part in (".git", "target") for part in manifest.parts):
+                continue
+            if manifest.resolve() == workspace_manifest.resolve():
+                continue
+            if _is_virtual_workspace_manifest(manifest):
+                continue
+            members.append(manifest.resolve())
+    with_tests = [m for m in members if (m.parent / "tests").is_dir()]
+    return with_tests or members
 
 
 def _touch_crate_entry_mtime(root: Path, rel_path: Path) -> None:
@@ -109,13 +159,146 @@ def _rust_has_substantive_code(content: str) -> bool:
     return False
 
 
+def _strip_snapshot_diff_noise(text: str) -> str:
+    """Remove insta snapshot diff payload lines so template strings inside snapshots are not misclassified."""
+    out = []
+    in_snapshot_block = False
+    for line in text.splitlines():
+        low = line.strip().lower()
+        if "snapshot summary" in low:
+            in_snapshot_block = True
+            continue
+        if in_snapshot_block:
+            if (
+                low.startswith("to update snapshots")
+                or low.startswith("thread '")
+                or low.startswith("failures:")
+                or low.startswith("test result:")
+                or low.startswith("---- ")
+            ):
+                in_snapshot_block = False
+            else:
+                continue
+        if low.startswith("stored new snapshot "):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _extract_smoke_failure_details(stdout: str, stderr: str, limit: int = 2400) -> str:
+    """Preserve panic assertions and snapshot diffs instead of trailing .snap.new paths."""
+    cleaned_stdout_lines = []
+    snap_new_count = 0
+    for line in (stdout or "").splitlines():
+        if line.lstrip().startswith("stored new snapshot "):
+            snap_new_count += 1
+            continue
+        cleaned_stdout_lines.append(line)
+    cleaned_stdout = "\n".join(cleaned_stdout_lines).strip()
+    cleaned_stderr = "\n".join(
+        line for line in (stderr or "").splitlines()
+        if not re.match(r"^\s*(?:Compiling|Checking|Downloading|Downloaded|Updating|Fresh|Locking)\s+", line)
+    ).strip()
+
+    excerpts = []
+    blocks = list(re.finditer(r"(?ms)^---- .+? stdout ----\s*.*?(?=^---- .+? stdout ----|^failures:|^test result:|\Z)", cleaned_stdout))
+    if blocks:
+        for match in blocks[:2]:
+            blk = match.group(0).strip()
+            if blk:
+                excerpts.append(blk[:1000])
+    failures_m = re.search(r"(?ms)^failures:\s*\n.*?(?=^test result:|\Z)", cleaned_stdout)
+    if failures_m:
+        excerpts.append(failures_m.group(0).strip()[:500])
+    result_lines = [
+        line for line in cleaned_stdout.splitlines()
+        if line.startswith("test result:") or "panicked at" in line or "FAILED" in line
+    ]
+    if not excerpts and result_lines:
+        excerpts.append("\n".join(result_lines[:15]))
+    if snap_new_count:
+        excerpts.append(f"[{snap_new_count} .snap.new snapshot mismatch file(s) generated]")
+    if cleaned_stderr:
+        excerpts.append(cleaned_stderr[-800:])
+    combined = "\n\n".join(part for part in excerpts if part).strip()
+    if not combined:
+        combined = f"{cleaned_stdout}\n{cleaned_stderr}".strip()
+    return combined[:limit] if len(combined) > limit else combined
+
+
+def _ckg_cross_file_impact_notice(root: Path, state: Any, rel_path: str, changed_lines: list[int] | None = None) -> str:
+    """Return a cross-file producer->consumer notice for an edited Rust source file."""
+    ckg = getattr(state, "ckg", None)
+    if ckg is None or not rel_path.endswith(".rs"):
+        return ""
+    try:
+        impact_spec = importlib.util.spec_from_file_location(
+            "test_rust_impact_tools", Path(__file__).with_name("rust_impact.py")
+        )
+        impact_mod = importlib.util.module_from_spec(impact_spec)
+        impact_spec.loader.exec_module(impact_mod)
+        surface = impact_mod.build_impact_surface(
+            ckg, [rel_path], changed_lines={rel_path: changed_lines} if changed_lines else None,
+        )
+        text = impact_mod.format_impact_surface(surface, max_chars=2200)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    return (
+        "\n[CKG cross-file impact: this file's symbols are consumed elsewhere. "
+ "Verify each listed consumer handles the new producer output before submitting.]\n"
+        f"{text}"
+    )
+
+
+def _extract_snapshot_diff_hunks(stdout: str, limit: int = 4000) -> list[str]:
+    """Extract insta snapshot diff hunks from cargo test output."""
+    text = stdout or ""
+    blocks: list[str] = []
+    pattern = re.compile(r"(?ms)^-{3,} Snapshot Summary.*?(?=^test result:|\Z)")
+    for match in pattern.finditer(text):
+        block = match.group(0).strip()
+        if block:
+            blocks.append(block)
+    if not blocks:
+        pattern = re.compile(r"(?ms)^Snapshot Summary:.*?(?=^test result:|\Z)")
+        for match in pattern.finditer(text):
+            block = match.group(0).strip()
+            if block:
+                blocks.append(block)
+    if not blocks:
+        for line in text.splitlines():
+            if re.match(r"^\s*[-+]\s", line) or "snapshot assertion" in line.lower():
+                blocks.append(line.strip())
+    joined = "\n\n".join(blocks)
+    return [joined[:limit]] if joined else []
+
+
+def _snapshot_hunks_differ(patched_details: str, baseline_stdout: str) -> bool:
+    """Return True when the patched run and the unpatched baseline produce different snapshots.
+
+    A snapshot test keeps its test name across revisions, so name comparison alone
+    cannot tell a pre-existing failure from a regression the patch introduced.
+    """
+    patched_hunks = _extract_snapshot_diff_hunks(patched_details or "")
+    baseline_hunks = _extract_snapshot_diff_hunks(baseline_stdout or "")
+    if not patched_hunks and not baseline_hunks:
+        return False
+    patched_norm = re.sub(r"\s+", " ", "\n".join(patched_hunks)).strip()
+    baseline_norm = re.sub(r"\s+", " ", "\n".join(baseline_hunks)).strip()
+    return patched_norm != baseline_norm
+
+
 def _smoke_environment_failure(stdout: str, stderr: str) -> bool:
     """Identify failures that clearly originate outside the code under test."""
-    text = f"{stdout}\n{stderr}".lower()
+    filtered_stdout = _strip_snapshot_diff_noise(stdout or "")
+    text = f"{filtered_stdout}\n{stderr or ''}".lower()
     environment_markers = (
         "failed to download", "failed to fetch", "requires rustc", "network is unreachable",
-        "could not resolve host", "connection reset", "connection refused", "gnutls recv error",
-        "failed to select a version", "failed to update", "failed to load source",
+        "could not resolve host", "connection reset", "connection refused", "connection timed out",
+        "failed to connect to", "gnutls recv error", "failed to select a version",
+        "failed to update", "failed to load source",
     )
     return any(marker in text for marker in environment_markers)
 
@@ -266,6 +449,21 @@ def _format_edit_snippet(content: str, line_ranges: list[tuple[int, int]], conte
     for w_start, w_end in windows:
         blocks.append("\n".join(f"{lineno}: {lines[lineno - 1]}" for lineno in range(w_start, w_end + 1)))
     return "\n--\n".join(blocks)
+
+
+def _changed_line_numbers(old_text: str, new_text: str) -> list[int]:
+    """Return 1-based line numbers in new_text that differ from old_text."""
+    import difflib
+
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    changed: list[int] = []
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed.extend(range(j1 + 1, j2 + 1))
+    return changed
 
 
 def _apply_one_replacement(
@@ -550,6 +748,10 @@ class PatchState:
         self._executed_test_targets = []
         self._last_compiling_prod_snapshot = None
         self._existing_test_smoke_cache = None
+        self._locked_regressions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._red_lock_violations: list[dict[str, Any]] = []
+        self._slow_smoke_targets: set[str] = set()
+        self._unlocked_regressions: dict[tuple[str, str], dict[str, Any]] = {}
 
     _API_COMPILE_ERROR_CODES = {
         "E0599", "E0308", "E0061", "E0425", "E0432", "E0433",
@@ -656,6 +858,201 @@ class PatchState:
             except OSError:
                 return ""
         return ""
+
+    def lock_regressions(self, keys: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+        """Freeze the current Red-phase regression tests so the Fixer cannot weaken them."""
+        with self._lock:
+            targets = self.get_regression_targets()
+            selected = keys if keys is not None else list(targets.keys())
+            locked: list[str] = []
+            for key in selected:
+                t_info = targets.get(key)
+                if not t_info:
+                    continue
+                sha = self._target_sha256(key)
+                if not sha:
+                    continue
+                reg_path = t_info.get("path", "")
+                lock_key = (str(key[0]), str(key[1]))
+                # The Architect already released this oracle; do not re-lock it.
+                if lock_key in self._unlocked_regressions:
+                    continue
+                self._locked_regressions[lock_key] = {
+                    "sha256": sha,
+                    "path": reg_path.as_posix() if isinstance(reg_path, Path) else str(reg_path),
+                    "name": t_info["name"],
+                    "is_in_module": bool(t_info.get("is_in_module")),
+                    "manifest": str(key[0]),
+                    "locked_at_revision": self._revision,
+                }
+                locked.append(f"{lock_key[0]}::{lock_key[1]}")
+            return {
+                "locked": locked,
+                "count": len(locked),
+                "violations": list(self._red_lock_violations),
+            }
+
+    def _match_regression_lock_key(self, mapping: dict[tuple[str, str], dict[str, Any]], query: str) -> tuple[str, str] | None:
+        raw = str(query or "").strip()
+        if not raw:
+            return None
+        norm = raw.replace("\\", "/")
+        for key, meta in mapping.items():
+            mname = str(meta.get("name") or "")
+            mpath = str(meta.get("path") or "").replace("\\", "/")
+            if raw == mname or raw == key[1] or norm == mpath or (mpath and norm == Path(mpath).name) or (mpath and norm == Path(mpath).stem):
+                return key
+        fn_pat = re.compile(rf"\bfn\s+{re.escape(raw)}\s*(?:<|\()")
+        for key, meta in mapping.items():
+            mpath = str(meta.get("path") or "")
+            content = ""
+            if meta.get("is_in_module"):
+                info = self.in_module_regressions.get(Path(mpath))
+                if info:
+                    content = str(info.get("content") or "")
+            if not content and mpath:
+                fpath = self.root.resolve() / mpath
+                if fpath.is_file():
+                    try:
+                        content = fpath.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        content = ""
+            if content and fn_pat.search(content):
+                return key
+        return None
+
+    def unlock_regression(
+        self,
+        name: str,
+        reason: str,
+        *,
+        approved_by: str = "",
+    ) -> dict[str, Any]:
+        """Release the Red-phase lock on one regression test after an explicit approval.
+
+        The lock exists so a Fixer cannot weaken a confirmed Red oracle.  When the
+        Architect confirms the locked test is factually wrong (wrong crate path,
+        impossible assertion, wrong expected value), the lock must be released or
+        the repair is stuck.  Each regression can only be unlocked once.
+        """
+        with self._lock:
+            reason_text = str(reason or "").strip()
+            if len(reason_text) < 20:
+                return {
+                    "ok": False,
+                    "error": "Provide a concrete reason (>= 20 chars) explaining why the locked test is factually wrong.",
+                }
+            target_key = self._match_regression_lock_key(self._locked_regressions, name)
+            if target_key is None:
+                if self._match_regression_lock_key(self._unlocked_regressions, name) is not None:
+                    return {
+                        "ok": False,
+                        "error": f"Regression '{name}' was already unlocked once; it cannot be unlocked again.",
+                    }
+                return {"ok": False, "error": f"No locked regression test named '{name}'."}
+            meta = dict(self._locked_regressions.pop(target_key))
+            self._unlocked_regressions[target_key] = {
+                "name": meta.get("name", name),
+                "path": meta.get("path", ""),
+                "reason": reason_text[:600],
+                "approved_by": str(approved_by or "").strip()[:120],
+                "unlocked_at_revision": self._revision,
+            }
+            for reg_key in [
+                k for k in list(self._reproduced_regressions)
+                if str(k[1]) == meta.get("name", "")
+            ]:
+                self._reproduced_regressions.pop(reg_key, None)
+                self._passed_regressions.discard(reg_key)
+                self._passed_regression_configs.pop(reg_key, None)
+                self._reproduction_notes.pop(reg_key, None)
+                self._regression_test_names.pop(reg_key, None)
+            self._verified_revision = None
+            return {
+                "ok": True,
+                "unlocked": meta.get("name", name),
+                "path": meta.get("path", ""),
+                "reason": reason_text[:600],
+                "approved_by": str(approved_by or "").strip()[:120],
+            }
+
+    def locked_regression_report(self) -> dict[str, Any]:
+        """Report whether locked Red-phase tests are still byte-identical to their locked form."""
+        with self._lock:
+            if not self._locked_regressions:
+                return {"locked": [], "violations": list(self._red_lock_violations), "tampered": False}
+            locked: list[dict[str, Any]] = []
+            tampered: list[dict[str, Any]] = []
+            for key, meta in self._locked_regressions.items():
+                current = self._locked_target_sha256(meta)
+                entry = {
+                    "manifest": key[0],
+                    "name": key[1],
+                    "path": meta["path"],
+                    "locked_sha256": meta["sha256"],
+                    "current_sha256": current,
+                }
+                if not current:
+                    entry["status"] = "removed"
+                    tampered.append(entry)
+                elif current != meta["sha256"]:
+                    entry["status"] = "modified"
+                    tampered.append(entry)
+                else:
+                    entry["status"] = "intact"
+                    locked.append(entry)
+            return {
+                "locked": locked,
+                "violations": list(self._red_lock_violations),
+                "tampered": bool(tampered),
+                "tampered_entries": tampered,
+            }
+
+    def _locked_target_sha256(self, meta: dict[str, Any]) -> str:
+        """Compute the current hash of a locked regression test from its recorded path."""
+        rel = meta.get("path") or ""
+        if not rel:
+            return ""
+        if meta.get("is_in_module"):
+            in_mod = self.in_module_regressions.get(rel) or {}
+            content = in_mod.get("content")
+            if content is not None:
+                return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+            fpath = self.root.resolve() / rel
+            if not fpath.is_file():
+                return ""
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+            block = ""
+            name = meta.get("name", "")
+            start = f"// __TEST_REGRESSION_START: {name}__"
+            end = f"// __TEST_REGRESSION_END: {name}__"
+            if start in text and end in text:
+                block = text.split(start, 1)[1].split(end, 1)[0]
+            return hashlib.sha256(block.encode("utf-8", errors="replace")).hexdigest()
+        fpath = self.root.resolve() / rel
+        if not fpath.is_file():
+            return ""
+        try:
+            return hashlib.sha256(fpath.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    def _record_red_lock_violation(self, action: str, path: str, detail: str = "") -> None:
+        with self._lock:
+            for entry in self._red_lock_violations:
+                if entry.get("action") == action and entry.get("path") == path:
+                    entry["count"] = int(entry.get("count", 1)) + 1
+                    return
+            self._red_lock_violations.append({
+                "action": action,
+                "path": path,
+                "detail": detail,
+                "count": 1,
+                "revision": self._revision,
+            })
 
     def _format_regression_cmd(self, manifest: Path, name: str, t_info: dict) -> str:
         if t_info.get("is_in_module"):
@@ -1508,6 +1905,21 @@ class PatchState:
                     for target_name in selected_targets:
                         commands.append((common + ["--test", target_name], f"test:{target_name}"))
                 for command, target in commands:
+                    if target in self._slow_smoke_targets:
+                        results.append({
+                            "manifest": str(manifest.relative_to(root)),
+                            "target": target,
+                            "status": "timeout",
+                            "classification": "unknown",
+                            "baseline_status": "unknown",
+                            "tests_executed": 0,
+                            "details": (
+                                f"skipped: this target already exceeded {timeout}s in an earlier "
+                                "smoke run during this session"
+                            ),
+                            "observed_revision": self._revision,
+                        })
+                        continue
                     try:
                         res = subprocess.run(
                             command, cwd=root, capture_output=True, text=True,
@@ -1530,13 +1942,14 @@ class PatchState:
                             "failed_tests": sorted(set(re.findall(
                                 r"^test (.+?) \.\.\. FAILED\s*$", res.stdout, re.MULTILINE
                             ))),
-                            "details": ((res.stdout + "\n" + res.stderr).strip())[-1200:] if res.returncode else "",
+                            "details": _extract_smoke_failure_details(res.stdout, res.stderr) if res.returncode else "",
                             "observed_revision": self._revision,
                         }
                         results.append(result)
                         if result["status"] == "failed":
                             baseline_candidates.append((result, command, manifest))
                     except subprocess.TimeoutExpired:
+                        self._slow_smoke_targets.add(target)
                         results.append({
                             "manifest": str(manifest.relative_to(root)),
                             "target": target,
@@ -1608,11 +2021,31 @@ class PatchState:
                         result["baseline_failed_tests"] = baseline_failures
                         if result["failed_tests"] and baseline_failures:
                             result["new_failed_tests"] = sorted(set(result["failed_tests"]) - set(baseline_failures))
-                            result["classification"] = "code" if result["new_failed_tests"] else "unknown"
+                            # Identical failing test names do not prove the failure is
+                            # pre-existing: a snapshot test can keep its name while its
+                            # rendered output changes. Compare the snapshot hunks too.
+                            if result["new_failed_tests"]:
+                                result["classification"] = "code"
+                            elif _snapshot_hunks_differ(result.get("details", ""), baseline_res.stdout):
+                                result["classification"] = "code"
+                                result["new_failed_tests"] = list(result["failed_tests"])
+                                result["details"] += (
+                                    "\nThe same tests fail on the unpatched baseline, but their "
+                                    "snapshot output differs, so the patch changed the rendered result."
+                                )
+                            else:
+                                result["classification"] = "unknown"
+                                result["details"] += (
+                                    "\nThe unpatched baseline fails the same tests with the same output, so this "
+                                    "failure is NOT confirmed pre-existing: it is unconfirmed, and the patch "
+                                    "cannot be cleared by it alone."
+                                )
                             result["details"] += "\nCompared failed test names with the unpatched baseline."
                         else:
                             result["classification"] = "unknown"
                             result["details"] += "\nBaseline also failed; individual failures could not be compared."
+                        if result["classification"] == "unknown":
+                            result["baseline_label"] = "BASELINE_UNCONFIRMED_NOT_PREEXISTING"
                     else:
                         result["baseline_status"] = "unknown"
                         result["classification"] = "unknown"
@@ -1787,6 +2220,19 @@ class PatchState:
                         "test_sha256": test_sha,
                     }
                     self._reproduction_notes.pop((rel_manifest, name), None)
+                    if test_sha and (rel_manifest, name) not in self._locked_regressions:
+                        # The Architect already released this oracle; do not re-lock it.
+                        if (str(rel_manifest), name) not in self._unlocked_regressions:
+                            t_info = self.get_regression_targets().get((rel_manifest, name), {})
+                            reg_path = t_info.get("path", "")
+                            self._locked_regressions[(str(rel_manifest), name)] = {
+                                "sha256": test_sha,
+                                "path": reg_path.as_posix() if isinstance(reg_path, Path) else str(reg_path),
+                                "name": name,
+                                "is_in_module": bool(t_info.get("is_in_module")),
+                                "manifest": str(rel_manifest),
+                                "locked_at_revision": self._revision,
+                            }
             all_targets = set(self.get_regression_targets().keys())
             if all_targets and all_targets <= self._passed_regressions and all(self._is_target_reproduced(t) for t in all_targets):
                 self._verified_revision = self._revision
@@ -2194,6 +2640,21 @@ class PatchState:
                                 "test_sha256": self._target_sha256(key),
                             }
                             self._reproduction_notes.pop(key, None)
+                            if clean_red and key not in self._locked_regressions:
+                                sha = self._target_sha256(key)
+                                # The Architect already released this oracle; do not re-lock it.
+                                if sha and key not in self._unlocked_regressions:
+                                    reg_info = self.get_regression_targets().get(key, {})
+                                    reg_path = reg_info.get("path", "")
+                                    lock_key = (str(key[0]), key[1])
+                                    self._locked_regressions[lock_key] = {
+                                        "sha256": sha,
+                                        "path": reg_path.as_posix() if isinstance(reg_path, Path) else str(reg_path),
+                                        "name": key[1],
+                                        "is_in_module": bool(reg_info.get("is_in_module")),
+                                        "manifest": str(key[0]),
+                                        "locked_at_revision": self._revision,
+                                    }
                         else:
                             if not clean_red and prior_clean:
                                 # Do not let a post-edit Cargo resolution / compile error erase an already confirmed Red proof.
@@ -2420,6 +2881,12 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             if relative not in state.originals:
                 st = target.stat() if target.is_file() else None
                 state.originals[relative] = ((target.read_bytes(), st.st_mode, st.st_mtime_ns) if st else None)
+            previous_text = ""
+            if content is not None and target.is_file():
+                try:
+                    previous_text = target.read_text(encoding="utf-8", errors="replace")
+                except (OSError, UnicodeError):
+                    previous_text = ""
             state.invalidate_write()
             if content is None:
                 target.unlink()
@@ -2430,6 +2897,11 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             result = f"Updated {relative.as_posix()} in the working copy."
             if check_cargo_lock:
                 result += cargo_lock_update_warning(target)
+            if relative.suffix == ".rs" and relative not in state.regression_tests:
+                changed_lines = _changed_line_numbers(previous_text, content or "")
+                result += _ckg_cross_file_impact_notice(
+                    root, state, relative.as_posix(), changed_lines=changed_lines or None
+                )
             return result
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
             return f"Error writing {path}: {exc}"
@@ -2489,6 +2961,45 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 orig_text = target.read_text(encoding="utf-8")
                 clean_base_text = _strip_in_module_tests(orig_text)
                 _check_rust_syntax(relative.as_posix(), content)
+
+                locked_meta = None
+                for prev_key, prev_lock in list(state._locked_regressions.items()):
+                    if prev_lock.get("is_in_module") and prev_lock.get("path") == relative.as_posix():
+                        locked_meta = prev_lock
+                        break
+                if locked_meta and locked_meta.get("name") != clean_name:
+                    state._record_red_lock_violation(
+                        "rewrite_locked_regression", relative.as_posix(),
+                        f"Locked regression '{locked_meta.get('name')}' may not be replaced by '{clean_name}'.",
+                    )
+                    return (
+                        f"Error: the Red-phase regression test '{locked_meta.get('name')}' in {relative.as_posix()} is locked "
+                        "as the issue's contract oracle and cannot be replaced or renamed. "
+                        "Fix the production code so the locked test passes instead of rewriting the test. "
+                        "If the locked test is factually wrong, call escalate_for_replan with the concrete reason."
+                    )
+                if locked_meta and locked_meta.get("name") == clean_name:
+                    proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    if proposed_sha != locked_meta.get("sha256"):
+                        state._record_red_lock_violation(
+                            "rewrite_locked_regression", relative.as_posix(),
+                            f"Locked regression '{clean_name}' content was modified.",
+                        )
+                        for reg_key_now in [
+                            k for k in list(state._reproduced_regressions)
+                            if str(k[1]) == clean_name
+                        ]:
+                            state._reproduced_regressions.pop(reg_key_now, None)
+                            state._passed_regressions.discard(reg_key_now)
+                            state._passed_regression_configs.pop(reg_key_now, None)
+                            state._reproduction_notes.pop(reg_key_now, None)
+                            state._regression_test_names.pop(reg_key_now, None)
+                        state._verified_revision = None
+                        return (
+                            f"Error: the Red-phase regression test '{clean_name}' in {relative.as_posix()} is locked "
+                            "and its assertions cannot be changed. Fix the production code so the locked test passes "
+                            "instead of editing the test, or call escalate_for_replan with the concrete reason."
+                        )
 
                 for prev_rel, prev_info in list(state.in_module_regressions.items()):
                     if prev_rel != relative and prev_info.get("name") == clean_name:
@@ -2569,6 +3080,33 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 )
             if relative not in state.regression_tests and target.exists():
                 raise ValueError("Regression test must be a new file")
+            locked_meta = None
+            for prev_key, prev_lock in list(state._locked_regressions.items()):
+                if not prev_lock.get("is_in_module") and prev_lock.get("path") == relative.as_posix():
+                    locked_meta = prev_lock
+                    break
+            if locked_meta:
+                proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if proposed_sha != locked_meta.get("sha256"):
+                    state._record_red_lock_violation(
+                        "rewrite_locked_regression", relative.as_posix(),
+                        f"Locked regression '{locked_meta.get('name')}' was rewritten.",
+                    )
+                    for reg_key_now in [
+                        k for k in list(state._reproduced_regressions)
+                        if str(k[1]) == locked_meta.get("name", "")
+                    ]:
+                        state._reproduced_regressions.pop(reg_key_now, None)
+                        state._passed_regressions.discard(reg_key_now)
+                        state._passed_regression_configs.pop(reg_key_now, None)
+                        state._reproduction_notes.pop(reg_key_now, None)
+                        state._regression_test_names.pop(reg_key_now, None)
+                    state._verified_revision = None
+                    return (
+                        f"Error: '{relative.as_posix()}' is the locked Red-phase regression test for this issue "
+                        "and cannot be rewritten. Fix the production code so the locked test passes instead of "
+                        "changing the test, or call escalate_for_replan with the concrete reason the locked test is wrong."
+                    )
             was_registered = relative in state.regression_tests
             state.invalidate_write()
             state.originals.setdefault(relative, None)
@@ -2720,9 +3258,147 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                             )
                 if impact_lines:
                     out_text += "\n[Impact notice: " + " | ".join(impact_lines) + "]"
+                changed_lines = []
+                for start, end in line_ranges:
+                    changed_lines.extend(range(start, max(start, end) + 1))
+                out_text += _ckg_cross_file_impact_notice(
+                    root, state, relative.as_posix(), changed_lines=changed_lines or None
+                )
             return out_text
         except (OSError, UnicodeError, ValueError) as exc:
             return f"Error editing {path}: {exc}"
+
+    @tool
+    @synchronized
+    def verifier_probe(
+        probe_type: str,
+        manifest_path: str = "Cargo.toml",
+        test_filter: str = "",
+        assertion_code: str = "",
+        package: str = "",
+        test_target: str = "",
+        timeout: int = 120,
+    ) -> str:
+        """Run a read-only, sandboxed falsification probe to test the current patch.
+
+        probe_type:
+          - "existing_test": run an existing crate test target to observe its real behavior.
+          - "assertion": mount a TEMPORARY assertion module compiled against the crate, run it, then
+            remove it. Returns "no_tests" if no assertion test was executed.
+          - "snapshot": re-run the relevant test target and extract insta snapshot diff hunks.
+
+        manifest_path may point at a workspace root or a member crate. When it is a
+        virtual workspace root, pass `package` to select the member crate. Use
+        `test_target` to run one integration test target instead of the whole crate.
+
+        The probe never modifies production source, never edits existing tests, and leaves no
+        file behind. Use it to obtain concrete execution evidence before rejecting a patch.
+        """
+        try:
+            probe = str(probe_type or "").strip().lower()
+            if probe not in ("existing_test", "assertion", "snapshot"):
+                return "Error: probe_type must be 'existing_test', 'assertion', or 'snapshot'."
+            if not shutil.which("cargo"):
+                return "Error: cargo is not available in this environment."
+            root = state.root.resolve()
+            manifest_abs = (root / manifest_path).resolve()
+            if not manifest_abs.is_file():
+                return f"Error: manifest not found: {manifest_path}"
+            manifest_dir = manifest_abs.parent
+            pkg = str(package or "").strip()
+            target_name = str(test_target or "").strip()
+
+            # A virtual workspace root has no test targets of its own, so `cargo test
+            # --test=<name>` fails with "no test target named". Point the probe at the
+            # member crate that owns the tests instead.
+            if probe == "assertion" and not pkg and _is_virtual_workspace_manifest(manifest_abs):
+                members = _workspace_member_manifests(state, manifest_abs)
+                if members:
+                    manifest_abs = members[0]
+                    manifest_dir = manifest_abs.parent
+                    pkg = _manifest_package_name(manifest_abs) or manifest_dir.name
+            probe_dir = None
+            probe_file = None
+            probe_created = False
+            try:
+                if probe == "assertion":
+                    if not assertion_code.strip():
+                        return "Error: assertion_code is required for probe_type='assertion'."
+                    body = assertion_code.strip()
+                    if not re.search(r"#\s*\[\s*test\s*\]", body) and "fn main" not in body:
+                        body = (
+                            "#[test]\nfn __verifier_probe__() {\n" + body + "\n}\n"
+                        )
+                    probe_dir = manifest_dir / "tests"
+                    probe_dir.mkdir(parents=True, exist_ok=True)
+                    probe_file = probe_dir / "test_verifier_probe_tmp.rs"
+                    if probe_file.exists():
+                        return "Error: a verifier probe is already active; run it again after cleanup."
+                    probe_file.write_text(body, encoding="utf-8")
+                    probe_created = True
+
+                cmd = ["cargo", "test", "--manifest-path", str(manifest_abs)]
+                if (root / "Cargo.lock").is_file():
+                    cmd.append("--locked")
+                if pkg:
+                    cmd.append(f"--package={pkg}")
+                if probe == "existing_test" or probe == "snapshot":
+                    if target_name:
+                        cmd.append(f"--test={target_name}")
+                    elif test_filter:
+                        cmd.append(test_filter)
+                else:
+                    cmd.append(f"--test={probe_file.stem}")
+
+                try:
+                    res = subprocess.run(
+                        cmd, cwd=root, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=max(20, min(int(timeout), 300)),
+                        env=state.rust_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    return json.dumps({
+                        "probe_type": probe,
+                        "status": "timeout",
+                        "exit_code": None,
+                        "stdout_tail": "",
+                        "stderr_tail": f"cargo test exceeded {timeout}s",
+                    }, ensure_ascii=False)
+
+                stdout = res.stdout or ""
+                stderr = res.stderr or ""
+                failed_tests = sorted(set(re.findall(
+                    r"^test (.+?) \.\.\. FAILED\s*$", stdout, re.MULTILINE
+                )))
+                counts = re.findall(
+                    r"^test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", stdout, re.MULTILINE
+                )
+                tests_passed = sum(int(p) for p, _f in counts)
+                tests_failed = sum(int(f) for _p, f in counts)
+                probe_status = "failed" if res.returncode else "passed"
+                if probe == "assertion" and probe_status == "passed" and not (tests_passed or tests_failed):
+                    probe_status = "no_tests"
+                payload = {
+                    "probe_type": probe,
+                    "status": probe_status,
+                    "exit_code": res.returncode,
+                    "tests_passed": tests_passed,
+                    "tests_failed": tests_failed,
+                    "failed_tests": failed_tests,
+                    "stdout_tail": stdout[-3000:],
+                    "stderr_tail": stderr[-2000:],
+                }
+                if probe == "snapshot":
+                    payload["snapshot_hunks"] = _extract_snapshot_diff_hunks(stdout)
+                return json.dumps(payload, ensure_ascii=False)
+            finally:
+                if probe_created and probe_file is not None and probe_file.exists():
+                    try:
+                        probe_file.unlink()
+                    except OSError:
+                        pass
+        except (OSError, UnicodeError, ValueError) as exc:
+            return f"Error running verifier probe: {exc}"
 
     @tool
     @synchronized
@@ -2737,6 +3413,35 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             relative = target.relative_to(root)
             if not relative.parts:
                 raise ValueError("Provide a file path")
+            locked_here = [
+                (key, meta) for key, meta in state._locked_regressions.items()
+                if meta.get("path") == relative.as_posix() and not meta.get("is_in_module")
+            ]
+            if locked_here:
+                names = ", ".join(sorted(meta.get("name", "") for _key, meta in locked_here))
+                state._record_red_lock_violation(
+                    "revert_locked_regression", relative.as_posix(),
+                    f"Attempted to revert locked regression '{names}'.",
+                )
+                for lock_key, lock_meta in locked_here:
+                    target_name = lock_meta.get("name", "")
+                    for reg_key in [
+                        k for k in list(state._reproduced_regressions)
+                        if str(k[1]) == target_name
+                    ]:
+                        state._reproduced_regressions.pop(reg_key, None)
+                        state._passed_regressions.discard(reg_key)
+                        state._passed_regression_configs.pop(reg_key, None)
+                        state._reproduction_notes.pop(reg_key, None)
+                        state._regression_test_names.pop(reg_key, None)
+                    state._verified_revision = None
+                return (
+                    f"Error: '{relative.as_posix()}' holds the locked Red-phase regression test(s) '{names}'. "
+                    "It cannot be reverted or deleted because it is the contract oracle for this issue. "
+                    "Fix the production code so the locked test passes, or call escalate_for_replan explaining why the "
+                    "locked test is factually wrong. Its Red-phase verification evidence was cleared, so the patch now "
+                    "requires a fresh confirmed reproduction before submission."
+                )
             recovery_name = None
             if not force and state._revert_would_drop_last_substantive_change(relative):
                 recovery_name = f"__recovery_before_revert_{relative.stem}_{state._revision}"
@@ -2955,7 +3660,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
     trace_tool = load_local("rust_trace").make_rust_trace_tool(root, resolve_path, rust_env)
     symbols = symbols_mod.make_rust_symbols_tool(root, resolve_path)
     all_tools = [read_file, write_file, write_regression_test, edit_file, revert_file, checkpoint, generate_patch,
-                 *rust_tools, cargo_check, cargo_test, trace_tool, symbols, ckg_tool, explain]
+                 *rust_tools, cargo_check, cargo_test, trace_tool, symbols, ckg_tool, explain, verifier_probe]
 
     def attach_budget_notice(tool_obj):
         if tool_obj.name == "read_file":

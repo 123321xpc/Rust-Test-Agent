@@ -259,3 +259,79 @@ ightarrow$ 跑测试”两步合并为一步。
    - 包含 Doctest Shift 检测与 In-Module 适配用例；
    - 全量测试结果：**145 passed in 25.50s (100% 通过)**。
 2. **所有新增修改已通过本地静态检查与测试断言验证。**
+
+---
+
+## 7. 第四轮架构重构：基于 LangGraph 的受约束有向图拓扑（Agent Graph）改造与三方验证对比
+
+### (1) 优化背景与对照基线
+针对此前分阶段状态机（`staged`）仅能沿固定线性/环回流程流转、重定位与架构重规划需经由外层循环中转导致的冗长重试与 Token 膨胀问题，本轮参考 MultiAgentBench 的受约束有向图拓扑（`Agent Graph`，动态路由图 `G_t = (A, E_t)`）将 `baselines/test` 编排重构为显式图结构，并建立独立对照基线：
+1. **对照基线剥离与验证入口适配**：
+   - 将重构前的 `baselines/test` 完整复制为 [`baselines/stage/`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/stage/)，同步至 Jifang `~/xpc/baselines/stage`（原远端 `~/xpc/baselines/test` 备份为 `~/xpc/baselines/test.bak_20261116_pre_graph`）；
+   - 更新 [`validation/run.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/validation/run.py)，在 `AGENTS`、`preflight`、`run_baseline` 及 `sources` 中注册 `stage`（并保留 `test-notest`）。
+
+---
+
+### (2) 核心改动清单
+
+1. **引入 LangGraph 受约束有向图编排（[`baselines/test/multi_agent.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/multi_agent.py)、[`baselines/test/requirements.txt`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/requirements.txt)）**：
+   - 新增依赖 `langgraph>=1.0,<2`（Jifang 环境实装 `langgraph 1.2.20`）。
+   - 定义受约束转移边集 `AGENT_GRAPH_EDGES`、图状态 `RepairGraphState`、上下文初始化 `_init_orchestration_ctx` 与基于 `langgraph.graph.StateGraph` + `Command` 的动态路由入口 `run_graph_agent`。
+   - 抽取统一阶段执行原语并由 `run_graph_agent` 与 `run_multi_agent` 共同复用：`_exec_navigator_initial`、`_exec_navigator_relocalize`、`_exec_suggester_step`、`_exec_fixer_step`、`_exec_det_qa_step`、`_exec_verifier_step`、`_record_escalation`、`_handle_low_budget_det_qa_bypass`、`_resolve_fallback_patch`。
+   - 在图路径中保留低成本闭环边（如 `fixer -> navigator` 直接重定位、`verifier -> suggester` QA 升级架构重规划等），避免无谓重启全局搜索。
+2. **红锁解锁匹配与验证快照保护（[`baselines/test/tools.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/tools.py)、[`baselines/test/multi_agent.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/multi_agent.py)）**：
+   - `PatchState` 新增 `_match_regression_lock_key` 并更新 `unlock_regression`，支持按目标测试名、锁键、路径/文件名/词干或测试源码中的 `#[test] fn <name>` 匹配解锁。
+   - 新增 `_flush_suggester_unlocks` 与 `_build_red_lock_prompt_block(state)` 注入 Suggester 与 Advisor 提示词；`run_continuous_repair` 中的 `run_advisor` 同步合并 `unlocked_regressions`。
+   - 在 `det_qa["ok"]` 且 `state.verified()` 成立时记录 `state._best_verified_snapshot`，保护已通过全量校验的候选补丁不被后续尝试覆盖。
+3. **默认模式切换与单元测试补充（[`baselines/test/agent.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/agent.py)、[`baselines/test/README.md`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/README.md)、[`baselines/test/test_test_agent.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/test_test_agent.py)、[`baselines/test/test_multi_agent.py`](file:///c:/Users/vickey/Desktop/Rust-SWE-Bench-main/baselines/test/test_multi_agent.py)）**：
+   - 将 `RUSTBENCH_REPAIR_MODE` 默认值切换为 `"graph"`（保留 `"staged"` 与 `"continuous"` 作为显式回退模式）。
+   - 更新默认模式分发断言测试，并在 `test_multi_agent.py` 新增 3 个 `test_graph_agent_*` 单元测试验证图路由行为。
+
+---
+
+### (3) 单元测试与预检验证（Jifang, Python 3.10.18, pytest-9.2.0）
+1. **定向回归测试**：
+   - `pytest baselines/test/test_test_agent.py -q`：**21 passed in 1.66s**
+   - `pytest baselines/test/test_multi_agent.py -k graph_agent -v`：**3 passed, 33 deselected in 3.58s**
+   - `pytest baselines/test/test_multi_agent.py -k test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths -v`：**1 passed, 35 deselected in 1.93s**
+2. **全量套件对比（验证未引入回归）**：
+   - `pytest baselines/stage -q`：**265 passed, 14 failed in 70.46s**（14 项为既有用例与当前代码断言漂移，原 `test.bak_20261116_pre_graph` 中对应为 264 passed, 17 failed）。
+   - `pytest baselines/test -q`：**268 passed, 14 failed in 63.66s**（新增 3 项 graph 用例全部通过，零新增失败）。
+3. **验证环境预检**：
+   - `~/xpc/validation/validate --agent stage --dry-run` 与 `--agent test --dry-run` 均返回：`Preflight passed: 5 cached images, network: proxy`。
+
+---
+
+### (4) Jifang 五任务验证集三方实证对比（`MODEL=gpt-6-luna`, `API_LIMIT=100`, `--network proxy`）
+在 Jifang 并行以 `--network proxy` 后台运行 `stage` 与 `test(graph)`，并与此前 `continuous` 验证记录三方对比（注：三次运行 API 返回均未统计 `cached_tokens`，记为 `0`）：
+
+#### 1. 整体汇总对比
+
+| 指标 | `continuous`（前次 `test`）<br>`validation_20261116_081353_858381` | `stage`（阶段基线）<br>`validation_20261116_102625_2af8fe` | `test`（LangGraph 图版）<br>`validation_20261116_102425_715845` | 图版 vs `stage` | 图版 vs `continuous` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Resolved / Total** | `2 / 5` | `2 / 5` | `2 / 5` | 持平 | 持平 |
+| **Unresolved / Agent Error** | `2 / 1` | `2 / 1` | **`3 / 0`** | `agent_error` 清零 (`1 -> 0`) | `agent_error` 清零 (`1 -> 0`) |
+| **API Calls** | 243 | 355 | **239** | **-32.7%** (-116) | **-1.6%** (-4) |
+| **Input Tokens** | 3,455,818 | 9,844,803 | 5,344,387 | **-45.7%** | +54.6% |
+| **Output Tokens** | 32,555 | 51,122 | 38,725 | **-24.2%** | +19.0% |
+| **Total Tokens** | 3,488,373 | 9,895,925 | 5,383,112 | **-45.6%** (-4.51M) | +54.3% (+1.89M) |
+| **Wall Time / Agent Time** | 2,745.5s / 2,722.4s | 3,837.6s / 3,813.5s | 2,915.0s / 2,895.0s | **-24.0%** (-922.6s) | +6.2% (+169.5s) |
+
+#### 2. 逐任务明细对比
+
+| 实例 | `continuous` | `stage` | `test`（LangGraph 图版） |
+| :--- | :--- | :--- | :--- |
+| **`axodotdev__cargo-dist-555`** | `unresolved` (F2P 0/22, P2P_fail 0)<br>25 req, 662,498 tok (in 659,550 / out 2,948), 437.59s, 751B | `unresolved` (F2P 0/22, P2P_fail 0)<br>91 req, 2,603,193 tok (in 2,588,877 / out 14,316), 1,312.88s, 3,747B | `unresolved` (F2P 0/22, P2P_fail 0)<br>33 req, **380,503 tok** (in 377,690 / out 2,813), **347.44s**, 738B |
+| **`biomejs__biome-2621`** | `unresolved` (F2P 0/52, P2P_fail 0)<br>48 req, 761,858 tok (in 755,323 / out 6,535), 891.06s, 933B | `unresolved` (F2P 0/52, P2P_fail 0)<br>45 req, 852,246 tok (in 846,139 / out 6,107), 815.66s, 2,494B | `unresolved` (**F2P 10/52**, P2P_fail 0)<br>98 req, 3,797,505 tok (in 3,776,636 / out 20,869), 1,598.04s, 1,185B |
+| **`tokio-rs__bytes-377`** | `agent_error` (0B)<br>43 req, 490,607 tok (in 482,400 / out 8,207), 417.44s | `agent_error` (0B)<br>96 req, 3,897,172 tok (in 3,882,000 / out 15,172), 720.62s | `unresolved` (F2P 0/1, P2P_fail 0)<br>44 req, 506,563 tok (in 498,895 / out 7,668), **369.24s**, 513B |
+| **`chronotope__chrono-991`** | `resolved` (F2P 4/4, P2P_fail 0)<br>31 req, 248,234 tok (in 245,002 / out 3,232), 301.91s, 1,807B | `resolved` (F2P 4/4, P2P_fail 0)<br>30 req, 312,577 tok (in 309,542 / out 3,035), 298.75s, 1,759B | `resolved` (F2P 4/4, P2P_fail 0)<br>**29 req**, 320,886 tok (in 316,772 / out 4,114), 335.57s, 1,722B |
+| **`sharkdp__bat-562`** | `resolved` (F2P 1/1, P2P_fail 0)<br>96 req, 1,325,176 tok (in 1,313,543 / out 11,633), 697.54s, 1,225B (`auto_submit_degraded`) | `resolved` (F2P 1/1, P2P_fail 0)<br>93 req, 2,230,737 tok (in 2,218,245 / out 12,492), 689.70s, 5,544B | `resolved` (F2P 1/1, P2P_fail 0)<br>**35 req**, **377,655 tok** (in 374,394 / out 3,261), **264.66s**, 605B |
+
+#### 3. 关键收益与暴露瓶颈
+- **显著改进**：
+  1. **稳定性提升**：图编排将 `agent_error` 从 `1` 降为 `0`（`tokio-rs__bytes-377` 在 `continuous` 和 `stage` 下均产空补丁报错，图版以 44 req / 369.24s 成功完成执行并提交 513B 补丁，执行轨迹 `navigator -> fixer -> navigator(relocalize_direct) -> fixer(relocalized_fast) -> suggester(replan) -> fixer -> deterministic_qa -> verifier -> __end__`）。
+  2. **大幅降本提速（对比 `stage`）**：总请求数降 **32.7%**、总 Token 降 **45.6%**、总耗时降 **24.0%**。其中 `sharkdp__bat-562` 从 93 req / 2.23M tok / 689.70s 降至 **35 req / 377,655 tok（-83.1%）/ 264.66s（-61.6%）**（对比 `continuous` 亦降 71.5% tok，且不再触发 `auto_submit_degraded`）；`axodotdev__cargo-dist-555` 通过 `navigator -> fixer -> deterministic_qa -> verifier -> __end__` 路径从 2.60M tok 降至 **380,503 tok（-85.4%）**（对比 `continuous` 亦降 42.6%）。
+  3. **部分失败用例推进**：`biomejs__biome-2621` F2P 从两基线的 `0/52` 提升至 **`10/52`**。
+- **仍存瓶颈**：
+  1. **长链路重规划成本高（`biomejs__biome-2621`）**：触发 4 轮升级与 4 次 QA 门禁（含 `verifier -> suggester(qa_escalate_architect)`），单任务消耗 98 req / **3,797,505 tok**（占图版总 Token 的 **70.5%**），拉高整集总 Token 超过 `continuous`（+54.3%）。
+  2. **语义正确性与红锁解锁触发（`tokio-rs__bytes-377`）**：图版仅在源码添加 `assert!(cnt <= self.remaining_mut())`，未触发对 `test_vec_advance_mut` 的红锁解锁或 clamp 语义修正（F2P 0/1）。

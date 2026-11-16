@@ -18,7 +18,7 @@ PYTHON = ROOT / 'envs/rustbench/bin/python'
 SWE_PYTHON = ROOT / 'miniconda3/envs/swe-agent/bin/python'
 HARNESS = ROOT / 'Rust-bench'
 SWE = ROOT / 'sweagent-run/SWE-agent'
-AGENTS = ('swe-agent', 'RustForger', 'normal', 'ACI-impr', 'trace-impr', 'test')
+AGENTS = ('swe-agent', 'RustForger', 'normal', 'ACI-impr', 'trace-impr', 'test', 'test-notest', 'stage', 'graph')
 PROXY = 'http://127.0.0.1:11321'
 PROXY_NAMES = tuple(name for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'FTP_PROXY')
                     for name in (key, key.lower()))
@@ -77,7 +77,7 @@ def preflight(tasks, rows, agents, env):
         missing += [str(p) for p in (ROOT / 'RustForger/src/rustforger_main_tracing.py',
                     ROOT / 'RustForger/rustforger-tracer/bin/trace_cli') if not p.exists()]
     missing += [str(ROOT / 'baselines' / a / 'agent.py') for a in agents
-                if a in ('normal', 'ACI-impr', 'trace-impr', 'test') and not (ROOT / 'baselines' / a / 'agent.py').exists()]
+                if a in ('normal', 'ACI-impr', 'trace-impr', 'test', 'test-notest', 'stage', 'graph') and not (ROOT / 'baselines' / a / 'agent.py').exists()]
     if missing:
         raise RuntimeError('Required paths missing: ' + ', '.join(missing))
     if SET_NAME == 'testset':
@@ -149,7 +149,7 @@ def run_logged(args, log_path, cwd, env):
 def run_baseline(agent, task, row, folder, env):
     (folder / 'issue.txt').write_text(row['problem_statement'], encoding='utf-8')
     args = docker_base(task, env)
-    if agent == 'test':
+    if agent in ('test', 'test-notest', 'stage', 'graph'):
         from swebench.harness.test_spec import evaluation_toolchain_override
         override = evaluation_toolchain_override(row)
         if override:
@@ -290,7 +290,9 @@ def main():
     write_json(run_dir / 'manifest.json', manifest)
     sources = {'swe-agent': SWE / 'sweagent', 'RustForger': ROOT / 'RustForger/src',
                'normal': ROOT / 'baselines/normal', 'ACI-impr': ROOT / 'baselines/ACI-impr',
-               'trace-impr': ROOT / 'baselines/trace-impr', 'test': ROOT / 'baselines/test'}
+               'trace-impr': ROOT / 'baselines/trace-impr', 'test': ROOT / 'baselines/test',
+               'test-notest': ROOT / 'baselines/test-notest', 'stage': ROOT / 'baselines/stage',
+               'graph': ROOT / 'baselines/graph'}
     hashes = {}
     for agent in agents:
         digest = hashlib.sha256()

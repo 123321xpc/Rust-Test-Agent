@@ -54,11 +54,17 @@ class TraceRecorder(BaseCallbackHandler):
                     self.transient_failures += 1
                 body = data.get('body')
                 usage = body.get('usage') if isinstance(body, dict) else None
-                if isinstance(usage, dict) and isinstance(usage.get('prompt_tokens'), int) and isinstance(usage.get('completion_tokens'), int):
-                    self.input_tokens += usage['prompt_tokens']
-                    self.output_tokens += usage['completion_tokens']
+                in_tok = usage.get('prompt_tokens') if isinstance(usage, dict) else None
+                if not isinstance(in_tok, int) or isinstance(in_tok, bool):
+                    in_tok = usage.get('input_tokens') if isinstance(usage, dict) else None
+                out_tok = usage.get('completion_tokens') if isinstance(usage, dict) else None
+                if not isinstance(out_tok, int) or isinstance(out_tok, bool):
+                    out_tok = usage.get('output_tokens') if isinstance(usage, dict) else None
+                if isinstance(in_tok, int) and not isinstance(in_tok, bool) and isinstance(out_tok, int) and not isinstance(out_tok, bool):
+                    self.input_tokens += in_tok
+                    self.output_tokens += out_tok
                     total = usage.get('total_tokens')
-                    self.total_tokens += total if isinstance(total, int) else usage['prompt_tokens'] + usage['completion_tokens']
+                    self.total_tokens += total if isinstance(total, int) and not isinstance(total, bool) else in_tok + out_tok
                 elif 200 <= data.get('status', 0) < 300:
                     self.responses_without_usage += 1
             with self.path.open('a', encoding='utf-8') as handle:

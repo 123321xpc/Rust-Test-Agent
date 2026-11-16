@@ -50,56 +50,6 @@ _prompts = _load_file("agent_prompts", Path(__file__).with_name("agent_prompts.p
 _multi_agent = _load_file("multi_agent", Path(__file__).with_name("multi_agent.py"))
 
 
-SYSTEM_PROMPT = """You are a software engineer resolving an issue in a Rust repository.
-Follow this order:
-1. Analyze the issue and relevant code. Identify the cause, expected behavior,
-   and callers/trait constraints using search_code (with context_lines when helpful,
-   or summarize=True for a file overview, or empty query with file_glob to locate files),
-   rust_symbols (including callers=True / references=True, inspecting vis and enclosing trait/impl),
-   read_lines, and cargo_workspace. Keep initial exploration focused (typically within 10-15
-   read/search calls) before writing the regression test.
-2. Use write_regression_test to create a new temporary integration test in the
-   relevant package's tests/test_regression_<name>.rs. You may set run_now=True to
-   immediately execute cargo_test on the written test in one step. Reproduce the issue via
-   the public API (or for binary-only CLI crates, via `env!("CARGO_BIN_EXE_<bin>")`)
-   and cover boundary cases described in the issue. Run cargo_test with test_target
-   set to the regression test before fixing to confirm reproduction (Red phase:
-   runtime failure on buggy code, or expected API-missing compile failure for new
-   APIs). Do not add or modify inline tests or other test files; never modify files in tests/ or benches/ (modifications to existing test files are blocked to prevent benchmark conflicts).
-3. Implement a targeted fix using edit_file (single replacement or edits=[...]
-   for multiple hunks), strictly preserving unrelated code and adhering to minimal modification.
-   Do not reformat or reduce lines in unrelated public functions/traits, as shifting line counts
-   can break existing exact-line Rust doctests (e.g. 'file.rs - (line X)'). When the issue specifies
-   a concrete function/method name, implement the exact requested name (not just an internal `_opt`
-   variant). Before changing any function signature or trait bound, check callers with rust_symbols(callers=True).
-   Use checkpoint(action="save"/"restore") before risky refactors and revert_file to cleanly discard unwanted
-   changes. If a strategy_warning appears, step back and change approach instead of repeating similar local tweaks.
-4. Use layered verification after edits: first run cargo_check (or cargo_test
-   with no_run=True to check test target compilation), then run cargo_test with
-   test_target set to each regression test (no filter). Then run targeted existing
-   tests (lib=True with test_filter or relevant test_target); run the full package
-   suite (tests=True) only when fast enough, avoiding repeated timeouts on huge
-    crates. Report the actual regression results, including unrun or failing tests.
-    Existing tests may fail; report their failures, but do not
-   modify or remove them to satisfy the gate. If the issue states an existing test
-   asserts outdated behavior contrary to the issue, do not weaken your fix to pass it.
-   When modifying public APIs, types, or doc comments, you may also run cargo_test with doc=True to verify documentation examples.
- 5. Use generate_patch to preview changes, or call
-    generate_patch(submit=True) to submit the current source changes in one call.
-   Alternatively, submit explicitly with paths=[...]. Temporary
-   regression tests are excluded automatically, and a post-strip verification
-    checks affected crates and downstream workspace dependents. Verification findings are advisory,
-    and unverified or failing checks do not block submission. Watch for budget
-   notices and submit before API calls run out.
-Briefly describe the analysis, tests, and change.
-Do not run git or external shell commands to inspect history or host files.
-Focus strictly on reproducing and fixing the issue using the crate's Rust API
-(or `CARGO_BIN_EXE_<bin>` for binary crates). The Rust toolchain is configured by
-the runner; do not change repository toolchain files merely to configure the environment.
-"""
-
-
-
 def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2):
     """Compress verbose tool outputs and large edit calls from older turns to reduce prompt token bloat.
 
@@ -331,31 +281,7 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
     return compressed
 
 
-def _continuation_prompt(state, client):
-    prompt = (
-        "The repair is not submitted. Continue the repair workflow and submit the "
-        "current non-empty source diff when possible. Regression tests and existing "
-        "test failures are evidence and should guide the repair, but do not block "
-        "submission when the checks cannot complete."
-    )
-    if getattr(state, "_last_submit_error", ""):
-        prompt += f" Previous submission attempt failed verification: {state._last_submit_error}."
-    if hasattr(state, "verified") and hasattr(state, "changed_paths"):
-        regression_tests = getattr(state, "regression_tests", set())
-        source_changes = [p.as_posix() for p in state.changed_paths() if p not in regression_tests]
-        if state.verified() and source_changes:
-            prompt += f" Verification is already complete—call generate_patch with paths={source_changes} now."
-        elif hasattr(state, "missing_verification_steps"):
-            missing = state.missing_verification_steps()
-            if missing:
-                prompt += f" Pending verification: {missing}."
-    remaining = getattr(client, "remaining_calls", None)
-    if isinstance(remaining, int):
-        prompt += f" Remaining API calls: {remaining}."
-    return prompt
-
-
-def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None, multi_agent=True):
+def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_calls=70, rust_version=None, require_reproduction=False, instance_id=None):
     configure_repair_git()
     kwargs = {}
     if instance_id is not None:
@@ -380,108 +306,36 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         try:
             import functools
             compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2)
-            if multi_agent:
-                repair_runner = (
-                    _multi_agent.run_multi_agent
-                    if os.getenv("RUSTBENCH_REPAIR_MODE", "continuous").strip().lower() == "staged"
-                    else _multi_agent.run_continuous_repair
-                )
-                patch = repair_runner(
-                    Path(repo),
-                    issue,
-                    model,
-                    api_key,
-                    base_url,
-                    tools=tools,
-                    state=state,
-                    client=client,
-                    trace=trace,
-                    max_api_calls=max_api_calls,
-                    compress_fn=compress_fn,
-                    create_agent_fn=create_agent,
-                    chat_model_factory=ChatOpenAI,
-                    prompts_mod=_prompts,
-                    role_callback_cls=RoleTraceCallback,
-                )
-                if not patch:
-                    patch = _multi_agent._relaxed_source_patch(state)
-                if not patch:
-                    raise RuntimeError("Agent did not generate a non-empty patch")
-                return patch
-
-            llm = ChatOpenAI(model=model, api_key=api_key, base_url=base_url,
-                             temperature=0, timeout=180, max_retries=3, http_client=client)
-            if hasattr(llm, "bind_tools") and callable(getattr(llm, "bind_tools")):
-                from langchain_core.runnables import RunnableLambda
-                orig_bind_tools = llm.bind_tools
-                def _bind_tools_with_compression(*args, **kwargs):
-                    bound = orig_bind_tools(*args, **kwargs)
-                    return RunnableLambda(compress_fn) | bound
-                object.__setattr__(llm, "bind_tools", _bind_tools_with_compression)
-            agent = create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT)
-            config = {"recursion_limit": sys.maxsize}
-            if trace:
-                config["callbacks"] = [trace]
-            messages = [{"role": "user", "content": issue}]
-            consecutive_no_tools = 0
-            while True:
-                try:
-                    result = agent.invoke({"messages": messages}, config=config)
-                except RuntimeError as exc:
-                    if "Model API call limit reached" in str(exc):
-                        fallback = getattr(state, "patch", "") or (
-                            state.auto_submit_verified_patch() if hasattr(state, "auto_submit_verified_patch") else ""
-                        )
-                        fallback = fallback or _multi_agent._relaxed_source_patch(state)
-                        if fallback:
-                            if trace:
-                                trace.record("auto_submit_on_limit", patch=fallback)
-                            return fallback
-                    raise
-                if state.patch:
-                    break
-                if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
-                    raise RuntimeError("Agent did not generate a non-empty patch")
-                # Auto-submit if current revision is verified and model stopped without explicit generate_patch
-                if hasattr(state, "auto_submit_verified_patch"):
-                    try:
-                        fallback = state.auto_submit_verified_patch(allow_snapshot_fallback=False)
-                    except TypeError:
-                        fallback = state.auto_submit_verified_patch()
-                    if fallback:
-                        if trace:
-                            trace.record("auto_submit_verified", patch=fallback)
-                        return fallback
-
-                # Detect if model is returning plain text repeatedly without calling tools
-                last_msg = result["messages"][-1]
-                has_tool_call = bool(getattr(last_msg, "tool_calls", None) or (isinstance(last_msg, dict) and last_msg.get("tool_calls")))
-                if not has_tool_call:
-                    consecutive_no_tools += 1
-                    if consecutive_no_tools >= 4:
-                        if hasattr(state, "auto_submit_verified_patch"):
-                            fallback = state.auto_submit_verified_patch()
-                            if fallback:
-                                if trace:
-                                    trace.record("auto_submit_on_idle", patch=fallback)
-                                return fallback
-                        fallback = _multi_agent._relaxed_source_patch(state)
-                        if fallback:
-                            if trace:
-                                trace.record("auto_submit_on_idle", patch=fallback, relaxed=True)
-                            return fallback
-                        raise RuntimeError("Agent stopped calling tools without submitting a verified patch")
-                else:
-                    consecutive_no_tools = 0
-
-                messages = compress_fn(result["messages"]) + [{"role": "user", "content": _continuation_prompt(state, client)}]
+            repair_mode = os.getenv("RUSTBENCH_REPAIR_MODE", "graph").strip().lower()
+            repair_runner = {
+                "continuous": _multi_agent.run_continuous_repair,
+                "staged": _multi_agent.run_multi_agent,
+                "graph": _multi_agent.run_graph_agent,
+            }.get(repair_mode, _multi_agent.run_graph_agent)
+            patch = repair_runner(
+                Path(repo),
+                issue,
+                model,
+                api_key,
+                base_url,
+                tools=tools,
+                state=state,
+                client=client,
+                trace=trace,
+                max_api_calls=max_api_calls,
+                compress_fn=compress_fn,
+                create_agent_fn=create_agent,
+                chat_model_factory=ChatOpenAI,
+                prompts_mod=_prompts,
+                role_callback_cls=RoleTraceCallback,
+            )
+            if not patch:
+                patch = _multi_agent._relaxed_source_patch(state)
+            if not patch:
+                raise RuntimeError("Agent did not generate a non-empty patch")
+            return patch
         finally:
             client.close()
-        if not state.patch:
-            state.patch = _multi_agent._relaxed_source_patch(state)
-        if not state.patch:
-            raise RuntimeError("Agent did not generate a non-empty patch")
-        return state.patch
     finally:
         state.close()
 
@@ -502,8 +356,6 @@ def main():
     rust = parser.add_mutually_exclusive_group(required=True)
     rust.add_argument("--dataset", help="Benchmark JSONL containing the selected instance")
     rust.add_argument("--rust-toolchain", help="Explicit evaluation toolchain when dataset metadata is unavailable")
-    parser.add_argument("--single-agent", action="store_true", default=False,
-                        help="Run legacy single-agent ReAct loop instead of adaptive multi-agent pipeline")
     parser.add_argument("--harness-root", default=str(Path(__file__).resolve().parents[2] / "Rust-bench"),
                         help="Rust-bench harness used for evaluation")
     args = parser.parse_args()
@@ -546,8 +398,6 @@ def main():
             "require_reproduction": args.require_reproduction,
             "instance_id": args.instance_id,
         }
-        if args.single_agent:
-            run_kwargs["multi_agent"] = False
         patch = run_agent(repo, issue, model, api_key, os.getenv("BASE_URL") or None, **run_kwargs)
         trace.record("patch", patch=patch)
         stage = "prediction"

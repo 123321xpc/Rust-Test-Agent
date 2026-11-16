@@ -373,3 +373,45 @@ def test_full_orchestrator_closes_units_and_preserves_prerequisite_on_escalation
     records = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert not any(e for e in records if e["event"] == "repair_unit_rollback" and e["affected_units"])
     assert any(e["event"] == "repair_unit_verification" and e["complete"] for e in records)
+
+
+def test_unit_refutation_signals_block_completion_and_trigger_escalation(setup, monkeypatch):
+    ma, state, tools, _, _, board = setup
+    p = {
+        "ordered_edits": [
+            {"file": "src/a.rs", "description": "Fix trait impl in a"},
+            {"file": "src/b.rs", "description": "Use trait in b"},
+        ],
+        "repair_units": [
+            {
+                "unit_id": "a",
+                "description": "Unit a",
+                "edit_indices": [0],
+                "depends_on": [],
+                "expected_outcome": "src/a.rs compiles cleanly",
+                "refutation_signals": ["E0277"],
+            },
+            {"unit_id": "b", "description": "Unit b", "edit_indices": [1], "depends_on": ["a"]},
+        ],
+    }
+    policy = ma._repair_candidates.CandidatePolicy(board, state)
+    coord = ma._repair_units.RepairUnitCoordinator(state, tools, board, candidate_policy=policy)
+    coord.configure(p, [])
+    assert coord.select()["expected_outcome"] == "src/a.rs compiles cleanly"
+    tools["cargo_check"] = SimpleNamespace(invoke=lambda _: '{"exit_code":101,"diagnostics":[{"code":"E0277","message":"the trait bound is not satisfied"}]}')
+
+    def role(*args, **kwargs):
+        edit(tools, "a")
+        return {"action": "unit_complete", "summary": "done"}, "completed"
+
+    monkeypatch.setattr(ma, "_run_role_agent", role)
+    result, outcome = ma._run_scheduled_fixer(
+        "system", "issue", [], {}, coordinator=coord,
+        allow_escalate=True, client=SimpleNamespace(calls_made=0), stage_cap=20,
+    )
+    assert outcome == "unit_blocked"
+    assert result["action"] == "escalate" and "E0277" in result["reason"]
+    assert coord.active == "a"
+    assert coord._unit("a")["status"] == "active"
+    assert coord._unit("b")["status"] == "pending"
+    assert policy.data["pending"]["kind"] == "verification_counterevidence"

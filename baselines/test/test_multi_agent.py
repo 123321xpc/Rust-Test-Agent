@@ -121,6 +121,47 @@ def test_verifier_conflict_requires_evidence_and_supports_no_plan():
     assert holder["payload"]["explanation"] == conflict["explanation"]
 
 
+def test_verifier_consistent_is_normalized_when_no_architect_plan_exists():
+    """Without a plan, 'consistent' is meaningless; it must not burn a verifier round."""
+    ma = _load("multi_agent")
+    tools, holder = ma._make_handoff_tools("verifier", None, {}, {})
+    submit = tools[0]
+    response = submit.invoke({
+        "decision": "APPROVE", "summary": "fast path looks right",
+        "plan_consistency": "consistent",
+    })
+    assert "recorded" in response.lower()
+    assert holder["done"]
+    assert holder["payload"]["plan_consistency"] == "not_applicable"
+    assert holder["payload"]["plan_conflicts"] == []
+
+
+def test_suggester_can_release_a_locked_regression_once():
+    ma = _load("multi_agent")
+    released = {}
+
+    def unlock(name, reason, approved_by=""):
+        if released:
+            return {"ok": False, "error": "already unlocked"}
+        released["name"] = name
+        released["reason"] = reason
+        released["approved_by"] = approved_by
+        return {"ok": True, "unlocked": name, "path": "tests/test_regression_x.rs", "reason": reason}
+
+    state = SimpleNamespace(unlock_regression=unlock)
+    tools, holder = ma._make_handoff_tools("suggester", state, {}, {})
+    release = next(t for t in tools if t.name == "release_locked_regression")
+    response = release.invoke({
+        "name": "test_regression_x",
+        "reason": "The locked test asserted the wrong crate path for the public API.",
+    })
+    assert "Released" in response
+    assert holder["done"]
+    assert holder["payload"]["action"] == "unlock"
+    assert holder["payload"]["unlocked"] == "test_regression_x"
+    assert released["approved_by"] == "architect"
+
+
 def test_qa_repair_feedback_is_actionable_and_blocks_unverified_fallback():
     ma = _load("multi_agent")
     payload = {
@@ -186,6 +227,86 @@ def test_submission_gate_blocks_current_code_smoke_but_warns_baseline_and_enviro
     gate = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [baseline, env])
     assert gate["blocking"] == []
     assert len(gate["warnings"]) == 2
+
+
+def test_inline_test_overlap_ignores_context_only_hunks():
+    """Production code added next to a `#[cfg(test)]` block is not an inline-test edit."""
+    ma = _load("multi_agent")
+    original = (
+        "pub fn compute() -> i32 {\n"
+        "    1\n"
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn keeps_working() {}\n"
+        "}\n"
+    )
+    state = SimpleNamespace(
+        regression_tests=set(), in_module_regressions={},
+        originals={Path("src/lib.rs"): (original.encode("utf-8"), 0, 0)},
+    )
+    # A hunk whose context reaches into the test module but only edits production code.
+    patch = (
+        "--- a/src/lib.rs\n"
+        "+++ b/src/lib.rs\n"
+        "@@ -1,6 +1,8 @@\n"
+        " pub fn compute() -> i32 {\n"
+        "-    1\n"
+        "+    2\n"
+        "+    let extra = 3;\n"
+        " }\n"
+        " \n"
+        " #[cfg(test)]\n"
+    )
+    assert ma._detect_modified_inline_tests(patch, state=state) == []
+
+
+def test_inline_test_overlap_still_flags_real_edits_inside_the_test_module():
+    ma = _load("multi_agent")
+    original = (
+        "pub fn compute() -> i32 {\n"
+        "    1\n"
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn keeps_working() {}\n"
+        "}\n"
+    )
+    state = SimpleNamespace(
+        regression_tests=set(), in_module_regressions={},
+        originals={Path("src/lib.rs"): (original.encode("utf-8"), 0, 0)},
+    )
+    patch = (
+        "--- a/src/lib.rs\n"
+        "+++ b/src/lib.rs\n"
+        "@@ -6,5 +6,5 @@\n"
+        " mod tests {\n"
+        "     #[test]\n"
+        "-    fn keeps_working() {}\n"
+        "+    fn keeps_working() { assert!(true); }\n"
+        " }\n"
+    )
+    findings = ma._detect_modified_inline_tests(patch, state=state)
+    assert findings, "an edit inside `mod tests` must still be reported"
+
+
+def test_touched_line_hits_inline_tests_uses_gap_and_line_semantics():
+    ma = _load("multi_agent")
+    ranges = [(5, 9)]
+    # Removing a line inside the range is a hit.
+    assert ma._touched_line_hits_inline_tests((("line", 7),), ranges)
+    # Inserting after a line inside the range is a hit.
+    assert ma._touched_line_hits_inline_tests((("gap", 5),), ranges)
+    # Inserting after the last line of the range is a hit.
+    assert ma._touched_line_hits_inline_tests((("gap", 8),), ranges)
+    # Inserting after the line just past the range is not a hit.
+    assert not ma._touched_line_hits_inline_tests((("gap", 9),), ranges)
+    # A pure context line is not a hit.
+    assert not ma._touched_line_hits_inline_tests((("line", 3),), ranges)
 
 
 def test_deterministic_qa_and_verified_fallback_cannot_bypass_smoke_gate(tmp_path):
@@ -709,6 +830,7 @@ def test_forced_handoff_wrapup_captures_repair_plan_on_stage_cap(tmp_path):
     blackboard = {"issue_contract": {"requested_symbols": []}, "localization": {}}
     sug_activity = {"files_read": [], "symbols_queried": []}
     sug_handoff, sug_holder = ma._make_handoff_tools("suggester", SimpleNamespace(), blackboard, sug_activity)
+    sug_handoff_names = {t.name for t in sug_handoff}
     seen_wrap_tools = []
 
     def fake_create_agent(model, tools, system_prompt):
@@ -716,7 +838,7 @@ def test_forced_handoff_wrapup_captures_repair_plan_on_stage_cap(tmp_path):
         tmap = {t.name: t for t in tools}
 
         def invoke(inputs, config):
-            if "submit_repair_plan" in tmap and len(tmap) == 2:
+            if "submit_repair_plan" in tmap and set(tmap) == set(sug_handoff_names):
                 # Forced wrap-up invocation: ONLY handoff tools are provided!
                 seen_wrap_tools.append(sorted(tmap.keys()))
                 fake_client.calls_made += 1
@@ -744,7 +866,7 @@ def test_forced_handoff_wrapup_captures_repair_plan_on_stage_cap(tmp_path):
     assert outcome == "completed"
     assert payload is not None
     assert payload["ordered_edits"][0]["file"] == "src/lib.rs"
-    assert seen_wrap_tools == [["request_relocalization", "submit_repair_plan"]]
+    assert seen_wrap_tools == [sorted(sug_handoff_names)]
 
 
 def test_prune_unreproduced_targets_and_qa_surfaces_existing_failures_and_inline_tests(tmp_path):
@@ -977,6 +1099,7 @@ def test_wrapup_retry_recovers_after_malformed_handoff_and_synthesizes_edits(tmp
 
     blackboard = {"issue_contract": {"requested_symbols": []}, "localization": {}}
     sug_handoff, sug_holder = ma._make_handoff_tools("suggester", SimpleNamespace(), blackboard, {})
+    sug_handoff_names = {t.name for t in sug_handoff}
     wrap_attempts = {"n": 0}
 
     def fake_create_agent(model, tools, system_prompt):
@@ -984,7 +1107,7 @@ def test_wrapup_retry_recovers_after_malformed_handoff_and_synthesizes_edits(tmp
         tmap = {t.name: t for t in tools}
 
         def invoke(inputs, config):
-            if "submit_repair_plan" in tmap and len(tmap) == 2:
+            if "submit_repair_plan" in tmap and set(tmap) == sug_handoff_names:
                 wrap_attempts["n"] += 1
                 fake_client.calls_made += 1
                 if wrap_attempts["n"] == 1:
@@ -1312,6 +1435,812 @@ def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeyp
     assert [s["decision"] for s in ver_snaps] == ["REJECT", "APPROVE"]
     assert ver_snaps[0]["features"]["objections"]["items"] == ["Verify edge case"]
     assert ver_snaps[1]["ver_prompt_chars"] > 0
+
+
+def test_fixer_read_only_streak_warns_and_auto_escalates(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        # auto_escalate_on_stuck=False emits pacing warning at 10+ reads and resets on edit_file
+        activity_warn = {"files_read": [], "symbols_queried": []}
+        wrapped_warn = {
+            t.name: t
+            for t in ma._wrap_tools_for_role(
+                "fixer", tools, ["read_lines", "edit_file"], [], {}, state,
+                SimpleNamespace(calls_made=0), 0, 100, activity_warn,
+                auto_escalate_on_stuck=False, blackboard={},
+            )
+        }
+        for _ in range(9):
+            out = wrapped_warn["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 1})
+            assert "Pacing warning" not in out
+        out10 = wrapped_warn["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 1})
+        assert "Pacing warning" in out10
+        wrapped_warn["edit_file"].invoke({"path": "src/lib.rs", "old_text": "{ 0 }", "new_text": "{ 1 }"})
+        assert activity_warn["read_only_streak"] == 0
+
+        # auto_escalate_on_stuck=True triggers _AutoEscalate at 16 consecutive read-only calls
+        activity_esc = {"files_read": [], "symbols_queried": []}
+        wrapped_esc = ma._wrap_tools_for_role(
+            "fixer", tools, ["read_lines"], [], {}, state,
+            SimpleNamespace(calls_made=0), 0, 100, activity_esc,
+            auto_escalate_on_stuck=True, blackboard={},
+        )[0]
+        for _ in range(15):
+            wrapped_esc.invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 1})
+        with pytest.raises(ma._AutoEscalate, match="read-only exploration stalled"):
+            wrapped_esc.invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 1})
+    finally:
+        state.close()
+
+
+def test_unreproduced_reason_requires_evidence_and_degraded_guards_hygiene(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    trace_mod = _load("agent_trace")
+    repo = _setup_fake_repo(tmp_path)
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        contract = ma.extract_issue_contract("Fix `bug` returning 0 instead of 1")
+        bb = {"environment_blocker": False, "qa_history": [{"decision": "REJECT", "objections": ["wrong return"]}]}
+        # Fabricated excuses without corroborating evidence must be rejected
+        assert not ma._is_valid_external_unreproduced_reason(
+            "Cannot run tests because the environment is offline and network is blocked.",
+            contract, state=state, blackboard=bb, issue_text="Fix bug returning 0 instead of 1",
+        )
+        assert not ma._is_valid_external_unreproduced_reason(
+            "This bug only happens on windows terminal gui.",
+            contract, state=state, blackboard=bb, issue_text="Fix bug returning 0 instead of 1",
+        )
+        # Real environment_blocker on blackboard makes offline claim valid
+        bb["environment_blocker"] = True
+        assert ma._is_valid_external_unreproduced_reason(
+            "Cannot run tests because the offline Cargo registry lacks dependency.",
+            contract, state=state, blackboard=bb, issue_text="Fix bug returning 0 instead of 1",
+        )
+
+        # Degraded fallback rejects dbg! leftovers, then accepts clean edit with QA metadata
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { dbg!(1) }"})
+        assert ma._try_degraded_patch_fallback(state, issue_contract=contract, blackboard=bb) == ""
+
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { dbg!(1) }", "new_text": "pub fn bug() -> i32 { 1 }"})
+        rec_path = tmp_path / "degraded.jsonl"
+        rec = trace_mod.TraceRecorder(rec_path)
+        patch = ma._try_degraded_patch_fallback(state, trace=rec, issue_contract=contract, blackboard=bb)
+        assert "+pub fn bug() -> i32 { 1 }" in patch
+        events = [json.loads(ln) for ln in rec_path.read_text(encoding="utf-8").splitlines()]
+        ev = next(e for e in events if e["event"] == "auto_submit_degraded")
+        assert ev["verification"] == "unverified_after_qa_reject"
+        assert ev["last_qa_decision"] == "REJECT"
+    finally:
+        state.close()
+
+
+def test_handoff_card_unit_scoped_and_shared_memory_prioritizes_root_files():
+    ma = _load("multi_agent")
+    contract = ma.extract_issue_contract("Update `src/core.rs` to add `api_a` and `api_b`.")
+    bb = {
+        "issue_contract": contract,
+        "localization": {
+            "summary": "root in core.rs",
+            "candidate_chains": [{"chain_id": "C1", "nodes": [{"path": "src/core.rs", "role": "root_candidate"}]}],
+        },
+        "repair_plan": {
+            "selected_chain_id": "C1",
+            "ordered_edits": [{"file": f"src/f{i}.rs", "symbol": f"s{i}", "action": "modify", "description": f"step {i}"} for i in range(7)],
+            "api_checklist": ["api_a", "api_b", "api_c"],
+            "rust_invariants": [f"inv_{i}" for i in range(5)],
+            "forbidden_edits": [f"forb_{i}" for i in range(5)],
+        },
+        "repair_units": {"units": [{"unit_id": "u0", "status": "verified"}]},
+    }
+    active_unit = {
+        "unit_id": "u1",
+        "expected_outcome": "api_b compiles cleanly",
+        "work": [{"file": f"src/f{i}.rs", "symbol": f"s{i}", "action": "modify", "description": f"step {i}"} for i in range(6)],
+        "paths": ["src/f4.rs", "src/f5.rs"],
+    }
+    card = ma.build_handoff_card(contract, bb, active_unit=active_unit)
+    assert "api_c" in card
+    assert "step 5" in card
+    assert "verified_units=['u0']" in card
+    assert "inv_4" in card and "forb_4" in card
+
+    # Shared memory eviction keeps root_candidate/referenced_files over older non-priority reads
+    bb["shared_read_excerpts"] = {"src/core.rs:1-20": "core code"}
+    activity = {"read_excerpts": {f"src/other_{i}.rs:1-10": f"other {i}" for i in range(15)}}
+    ma._merge_activity_into_blackboard(bb, activity)
+    assert "src/core.rs:1-20" in bb["shared_read_excerpts"]
+    assert len(bb["shared_read_excerpts"]) == 14
+
+
+def test_graph_agent_direct_fixer_to_navigator_skips_suggester(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "other.rs").write_text("pub fn real_bug() -> i32 { 0 }\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    states = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        nav_count = sum(1 for r in roles if r == "navigator")
+        fix_count = sum(1 for r in roles if r == "fixer")
+
+        def invoke(inputs, config):
+            if role == "navigator" and nav_count == 1:
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "initial",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "in lib", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 1:
+                tmap["escalate_for_replan"].invoke({"reason": "wrong file localization; real_bug is elsewhere"})
+            elif role == "navigator" and nav_count == 2:
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "relocalized to other.rs",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "in other", "nodes": [{"path": "src/other.rs", "symbol": "real_bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 2:
+                tmap["edit_file"].invoke({"path": "src/other.rs", "old_text": "pub fn real_bug() -> i32 { 0 }", "new_text": "pub fn real_bug() -> i32 { 1 }"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "fixed real_bug"})
+            elif role == "verifier":
+                tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok"})
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    trace_path = tmp_path / "graph_trace.jsonl"
+    trace = agent_mod.TraceRecorder(trace_path)
+    patch = agent_mod.run_agent(repo, "Fix real_bug()", "m", "k", trace=trace, max_api_calls=70)
+    assert "+pub fn real_bug() -> i32 { 1 }" in patch
+    assert roles == ["navigator", "fixer", "navigator", "fixer", "verifier"]
+    events = [json.loads(ln) for ln in trace_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [(e["from_role"], e["to_role"], e["relation"]) for e in events if e["event"] == "graph_transition"]
+    assert ("fixer", "navigator", "relocalize_direct") in transitions
+    assert ("navigator", "fixer", "relocalized_fast") in transitions
+
+
+def test_graph_agent_unlocks_by_test_fn_name_and_preserves_plan(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    states = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        fix_count = sum(1 for r in roles if r == "fixer")
+
+        def invoke(inputs, config):
+            prompt = inputs["messages"][-1]["content"]
+            if role == "navigator":
+                tmap["write_regression_test"].invoke({
+                    "path": "tests/test_regression_vec_advance_mut.rs",
+                    "content": "#[test]\nfn vec_advance_mut_wrong_oracle() { assert_eq!(1, 2); }\n",
+                })
+                states[-1].fail_test(
+                    states[-1].start_test(),
+                    test_target="test_regression_vec_advance_mut",
+                    executed=1,
+                    failures=["vec_advance_mut_wrong_oracle"],
+                    returncode=101,
+                )
+                states[-1].lock_regressions()
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "bug in src/lib.rs",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "return 1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 1:
+                tmap["escalate_for_replan"].invoke({"reason": "Locked regression oracle vec_advance_mut_wrong_oracle is wrong"})
+            elif role == "suggester":
+                assert "Locked Red-phase Regression Test(s)" in prompt
+                # Unlock using the Rust #[test] fn name AND submit a repair plan in the same turn
+                res = tmap["release_locked_regression"].invoke({
+                    "name": "vec_advance_mut_wrong_oracle",
+                    "reason": "The locked test asserts 1 == 2 which is factually impossible under the API contract.",
+                })
+                assert "Released the Red-phase lock" in res
+                tmap["submit_repair_plan"].invoke({
+                    "selected_chain_id": "C1",
+                    "arbitration_rationale": "Update oracle and fix bug() to return 1.",
+                    "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "action": "modify", "description": "Return 1"}],
+                })
+            elif role == "fixer" and fix_count == 2:
+                assert "RED-PHASE LOCK RELEASED BY THE ARCHITECT" in prompt
+                tmap["write_regression_test"].invoke({
+                    "path": "tests/test_regression_vec_advance_mut.rs",
+                    "content": "#[test]\nfn vec_advance_mut_fixed_oracle() { assert_eq!(1, 1); }\n",
+                })
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_vec_advance_mut")
+                tmap["submit_for_qa"].invoke({"summary": "fixed bug with updated oracle"})
+            elif role == "verifier":
+                tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "consistent"})
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    patch = agent_mod.run_agent(repo, "Fix bug()", "m", "k", max_api_calls=70)
+    assert "+pub fn bug() -> i32 { 1 }" in patch
+    assert roles == ["navigator", "fixer", "suggester", "fixer", "verifier"]
+
+
+def test_graph_agent_verifier_escalates_directly_to_navigator(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "other.rs").write_text("pub fn target() -> i32 { 0 }\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    states = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        nav_count = sum(1 for r in roles if r == "navigator")
+        fix_count = sum(1 for r in roles if r == "fixer")
+        ver_count = sum(1 for r in roles if r == "verifier")
+
+        def invoke(inputs, config):
+            if role == "navigator" and nav_count == 1:
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "wrong file",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "lib", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 1:
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "edited lib"})
+            elif role == "verifier" and ver_count in (1, 2):
+                tmap["submit_qa_decision"].invoke({
+                    "decision": "REJECT",
+                    "summary": "wrong module",
+                    "missing_requirements": ["fix target in other.rs (mislocalized wrong file)"],
+                    "objections": ["wrong file src/lib.rs edited; mislocalized"],
+                    "plan_consistency": "not_applicable",
+                })
+            elif role == "fixer" and fix_count == 2:
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "resubmit"})
+            elif role == "navigator" and nav_count == 2:
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "found target in other.rs",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "other", "nodes": [{"path": "src/other.rs", "symbol": "target"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 3:
+                tmap["edit_file"].invoke({"path": "src/other.rs", "old_text": "pub fn target() -> i32 { 0 }", "new_text": "pub fn target() -> i32 { 1 }"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "fixed other.rs"})
+            elif role == "verifier" and ver_count == 3:
+                tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "not_applicable"})
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    trace_path = tmp_path / "ver_nav.jsonl"
+    trace = agent_mod.TraceRecorder(trace_path)
+    patch = agent_mod.run_agent(repo, "Fix `src/other.rs` target()", "m", "k", trace=trace, max_api_calls=70)
+    assert "+pub fn target() -> i32 { 1 }" in patch
+    assert roles == ["navigator", "fixer", "verifier", "fixer", "verifier", "navigator", "fixer", "verifier"]
+    events = [json.loads(ln) for ln in trace_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [(e["from_role"], e["to_role"], e["relation"]) for e in events if e["event"] == "graph_transition"]
+    assert ("verifier", "navigator", "qa_escalate_navigator") in transitions
+
+
+def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    _, state = tools_mod.make_tools(repo)
+    try:
+        base_loc = {
+            "candidate_chains": [{"chain_id": "C1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+            "reproduction_status": "runtime_failure",
+            "needs_architecture_planning": False,
+        }
+        # needs_architecture_planning=True forces planned
+        route, reasons = ma.route_after_navigation({
+            "issue_contract": ma.extract_issue_contract("Fix off-by-one in `bug`"),
+            "localization": {**base_loc, "needs_architecture_planning": True},
+        }, state)
+        assert route == "planned" and any("architecture planning" in r for r in reasons)
+
+        # CLI additive option signal forces planned even for 1 candidate file
+        route_cli, _ = ma.route_after_navigation({
+            "issue_contract": ma.extract_issue_contract("Support `--allow-dirty` CLI option in `run`"),
+            "localization": base_loc,
+        }, state)
+        assert route_cli == "planned"
+
+        # Multi-consumer CKG impact surface forces planned
+        orig_builder = ma._rust_impact.build_impact_surface
+        try:
+            state.ckg = SimpleNamespace()
+            ma._rust_impact.build_impact_surface = lambda _ckg, _paths: {
+                "consumer_paths": ["src/cli.rs", "src/config.rs"],
+                "trait_impls": [],
+            }
+            route_ckg, ckg_reasons = ma.route_after_navigation({
+                "issue_contract": ma.extract_issue_contract("Fix off-by-one in `bug`"),
+                "localization": base_loc,
+            }, state)
+            assert route_ckg == "planned" and any("CKG impact" in r for r in ckg_reasons)
+        finally:
+            ma._rust_impact.build_impact_surface = orig_builder
+    finally:
+        state.close()
+
+
+def test_scheduled_fixer_omits_duplicate_user_prompt_on_subsequent_slices(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "b.rs").write_text("pub fn b() -> i32 { 0 }\n", encoding="utf-8")
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        board = {"localization": {"candidate_chains": []}, "repair_units": {}}
+        coord = ma._repair_units.RepairUnitCoordinator(state, tools, board)
+        coord.configure({
+            "ordered_edits": [
+                {"file": "src/lib.rs", "description": "step 1"},
+                {"file": "src/b.rs", "description": "step 2"},
+            ],
+            "repair_units": [
+                {"unit_id": "u1", "edit_indices": [0]},
+                {"unit_id": "u2", "edit_indices": [1], "depends_on": ["u1"]},
+            ],
+        }, [])
+        prompts_seen = []
+
+        def fake_role(_role, _sys, user_prompt, _tools, holder, **kw):
+            prompts_seen.append(user_prompt)
+            if len(prompts_seen) == 1:
+                tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "{ 0 }", "new_text": "{ 1 }"})
+                holder["history"] = [{"role": "user", "content": user_prompt}]
+                return {"action": "unit_complete", "summary": "u1"}, "completed"
+            return {"action": "qa", "summary": "done"}, "completed"
+
+        monkeypatch.setattr(ma, "_run_role_agent", fake_role)
+        monkeypatch.setattr(coord, "verify", lambda complete=False, summary="": (True, "ok"))
+        payload, _ = ma._run_scheduled_fixer(
+            "sys", "UNIQUE_INITIAL_USER_PROMPT", [], {},
+            coordinator=coord, allow_escalate=True, client=SimpleNamespace(calls_made=0), stage_cap=20,
+        )
+        assert payload["action"] == "qa"
+        assert "UNIQUE_INITIAL_USER_PROMPT" in prompts_seen[0]
+        assert "UNIQUE_INITIAL_USER_PROMPT" not in prompts_seen[1]
+        assert "Continue" in prompts_seen[1]
+    finally:
+        state.close()
+
+
+def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    states = []
+    fixer_prompts = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        sug_count = sum(1 for r in roles if r == "suggester")
+        fix_count = sum(1 for r in roles if r == "fixer")
+        ver_count = sum(1 for r in roles if r == "verifier")
+
+        def invoke(inputs, config):
+            prompt = inputs["messages"][-1]["content"]
+            if role == "navigator":
+                tmap["write_regression_test"].invoke({
+                    "path": "tests/test_regression_x.rs",
+                    "content": "#[test]\nfn oracle_x() { assert_eq!(1, 2); }\n",
+                })
+                states[-1].fail_test(
+                    states[-1].start_test(), test_target="test_regression_x",
+                    executed=1, failures=["oracle_x"], returncode=101,
+                )
+                states[-1].lock_regressions()
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "bug in lib.rs",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "in lib", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer" and fix_count == 1:
+                fixer_prompts.append(prompt)
+                # Fixer makes a partial edit, hits Red-phase lock violation, and submits unverified
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { -1 }"})
+                tmap["write_regression_test"].invoke({
+                    "path": "tests/test_regression_x.rs",
+                    "content": "#[test]\nfn oracle_x() { assert_eq!(1, 1); }\n",
+                })
+                tmap["submit_for_qa"].invoke({"summary": "partial edit blocked by locked test"})
+            elif role == "suggester" and sug_count == 1:
+                # First call unlocks ONLY (terminates turn with action='unlock')
+                tmap["release_locked_regression"].invoke({
+                    "name": "oracle_x",
+                    "reason": "The locked test asserted 1 == 2 which violates the documented API.",
+                })
+            elif role == "suggester" and sug_count == 2:
+                # Automatic follow-up turn submits the RepairPlan
+                assert "Red-phase regression lock has been released" in prompt
+                tmap["submit_repair_plan"].invoke({
+                    "selected_chain_id": "C1",
+                    "arbitration_rationale": "Update test and fix bug()",
+                    "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "action": "modify", "description": "Return 1"}],
+                })
+            elif role == "fixer" and fix_count == 2:
+                fixer_prompts.append(prompt)
+                tmap["write_regression_test"].invoke({
+                    "path": "tests/test_regression_x.rs",
+                    "content": "#[test]\nfn oracle_x() { assert_eq!(1, 1); }\n",
+                })
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { -1 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_x")
+                tmap["submit_for_qa"].invoke({"summary": "fixed"})
+            elif role == "verifier" and ver_count >= 1:
+                # Rejections with no progress: #1 -> qa_reject_fix, #2 -> qa_escalate_architect, #3 -> qa_stall_stop
+                tmap["submit_qa_decision"].invoke({
+                    "decision": "REJECT",
+                    "summary": "missing edge check",
+                    "missing_requirements": ["check overflow"],
+                    "objections": ["edge case"],
+                    "plan_consistency": "consistent",
+                })
+            elif role == "suggester" and sug_count == 3:
+                tmap["submit_repair_plan"].invoke({
+                    "selected_chain_id": "C1",
+                    "arbitration_rationale": "Verify edge case without reverting working edit",
+                    "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "action": "modify", "description": "Keep 1"}],
+                })
+            elif role == "fixer" and fix_count >= 3:
+                fixer_prompts.append(prompt)
+                # Resubmit same state without edits -> same _repair_progress_signature
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_x")
+                tmap["submit_for_qa"].invoke({"summary": "resubmit unchanged"})
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    trace_path = tmp_path / "opt_trace.jsonl"
+    trace = agent_mod.TraceRecorder(trace_path)
+    patch = agent_mod.run_agent(repo, "Fix `bug`", "m", "k", trace=trace, max_api_calls=100)
+    assert "+pub fn bug() -> i32 { 1 }" in patch
+    assert "Current Candidate Unified Diff" in fixer_prompts[-1]
+    events = [json.loads(ln) for ln in trace_path.read_text(encoding="utf-8").splitlines()]
+    transitions = [(e["from_role"], e["to_role"], e["relation"]) for e in events if e["event"] == "graph_transition"]
+    assert ("fixer", "suggester", "replan_red_lock") in transitions
+    assert ("verifier", "__end__", "qa_stall_stop") in transitions
+
+
+def test_graph_agent_prunes_zero_progress_replan_and_emits_coordination_metrics(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    states = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        sug_count = sum(1 for r in roles if r == "suggester")
+        fix_count = sum(1 for r in roles if r == "fixer")
+
+        def invoke(inputs, config):
+            if role == "navigator":
+                tmap["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "bug in lib.rs",
+                    "candidate_chains": [
+                        {"chain_id": "C1", "hypothesis": "h1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]},
+                        {"chain_id": "C2", "hypothesis": "h2", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]},
+                    ],
+                    "needs_architecture_planning": True,
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "suggester":
+                tmap["submit_repair_plan"].invoke({
+                    "selected_chain_id": "C1",
+                    "arbitration_rationale": f"Plan attempt {sug_count}",
+                    "ordered_edits": [{"file": "src/lib.rs", "symbol": "bug", "action": "modify", "description": "Return 1"}],
+                })
+            elif role == "fixer" and fix_count == 1:
+                tmap["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                tmap["escalate_for_replan"].invoke({"reason": "trait bound mismatch on attempt 1"})
+            elif role == "fixer" and fix_count == 2:
+                # Zero milestone progress since replan -> second escalation to suggester must be pruned
+                tmap["escalate_for_replan"].invoke({"reason": "trait bound still stuck on attempt 2"})
+            elif role == "fixer" and fix_count >= 3:
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "fixed"})
+            elif role == "verifier":
+                tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "consistent"})
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    trace_path = tmp_path / "prune_trace.jsonl"
+    trace = agent_mod.TraceRecorder(trace_path)
+    patch = agent_mod.run_agent(repo, "Fix `bug`", "m", "k", trace=trace, max_api_calls=120)
+    assert "+pub fn bug() -> i32 { 1 }" in patch
+    assert roles.count("suggester") == 2  # initial plan + 1 replan; 2nd replan pruned
+    events = [json.loads(ln) for ln in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(e["event"] == "graph_edge_pruned" and e["to_role"] == "suggester" for e in events)
+    coord_ev = next(e for e in events if e["event"] == "coordination_metrics")
+    assert coord_ev["pruned_replans"] >= 1
+    assert coord_ev["duplicate_reads"] >= 1
+    assert "overall_kpi" in coord_ev
+
+
+def test_graph_agent_relocalize_fast_keeps_history_clean_and_injects_sibling_contracts(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "other.rs").write_text(
+        'pub struct Buf;\nimpl Buf {\n    pub fn advance_mut(&mut self, cnt: usize) {\n        if cnt > 0 { panic!("cannot advance past capacity"); }\n    }\n}\n',
+        encoding="utf-8",
+    )
+    (repo / "src" / "lib.rs").write_text(
+        "pub mod other;\npub fn bug() -> i32 { 0 }\npub fn advance_mut(_cnt: usize) {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    fixer_histories_seen = []
+    fixer_prompts_seen = []
+    verifier_prompts_seen = []
+    states = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        states.append(s)
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        nav_count = sum(1 for r in roles if r == "navigator")
+        fix_count = sum(1 for r in roles if r == "fixer")
+        ver_count = sum(1 for r in roles if r == "verifier")
+
+        def invoke(inputs, config):
+            msgs = inputs["messages"]
+            prompt = msgs[-1]["content"]
+            if role == "navigator" and nav_count == 1:
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "wrong file",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "h", "nodes": [{"path": "src/lib.rs", "symbol": "advance_mut"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+                return {"messages": msgs + [{"role": "assistant", "content": "NAV_MARKER_INITIAL"}]}
+            if role == "fixer" and fix_count == 1:
+                tmap["escalate_for_replan"].invoke({"reason": "wrong file localization"})
+                return {"messages": msgs}
+            if role == "navigator" and nav_count == 2:
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "relocalized",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "h2", "nodes": [{"path": "src/other.rs", "symbol": "advance_mut"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+                return {"messages": msgs + [{"role": "assistant", "content": "NAV_RELOC_SECRET_MARKER"}]}
+            if role == "fixer" and fix_count == 2:
+                fixer_histories_seen.append(json.dumps(msgs))
+                fixer_prompts_seen.append(prompt)
+                tmap["edit_file"].invoke({"path": "src/other.rs", "old_text": "if cnt > 0", "new_text": "if cnt > 1"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "updated"})
+                return {"messages": msgs + [{"role": "assistant", "content": "FIXER_ROUND1_MEMORY"}]}
+            if role == "verifier" and ver_count == 1:
+                verifier_prompts_seen.append(prompt)
+                tmap["submit_qa_decision"].invoke({
+                    "decision": "REJECT",
+                    "summary": "check edge",
+                    "missing_requirements": ["verify boundary cnt == 1"],
+                    "objections": ["boundary off-by-one"],
+                    "plan_consistency": "not_applicable",
+                })
+                return {"messages": msgs}
+            if role == "fixer" and fix_count == 3:
+                fixer_histories_seen.append(json.dumps(msgs))
+                fixer_prompts_seen.append(prompt)
+                tmap["edit_file"].invoke({"path": "src/other.rs", "old_text": "if cnt > 1", "new_text": "if cnt > 2"})
+                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
+                tmap["submit_for_qa"].invoke({"summary": "fixed boundary"})
+                return {"messages": msgs}
+            if role == "verifier" and ver_count >= 2:
+                tmap["submit_qa_decision"].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "not_applicable"})
+            return {"messages": msgs}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    patch = agent_mod.run_agent(repo, "Fix `advance_mut`", "m", "k", max_api_calls=100)
+    assert "if cnt > 2" in patch
+    # Fixer after relocalized_fast must NOT inherit Navigator's relocalize conversation
+    assert "NAV_RELOC_SECRET_MARKER" not in fixer_histories_seen[0]
+    # Fixer after qa_reject_fix MUST retain compressed previous Fixer conversation
+    assert "FIXER_ROUND1_MEMORY" in fixer_histories_seen[1]
+    # Sibling contract panic message surfaced to Fixer & Verifier
+    assert "cannot advance past capacity" in fixer_prompts_seen[0]
+    assert "cannot advance past capacity" in verifier_prompts_seen[0]
+
+
+def test_scheduled_fixer_omits_unchanged_file_excerpts_across_slices(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        board = {"localization": {"candidate_chains": []}, "repair_units": {}}
+        coord = ma._repair_units.RepairUnitCoordinator(state, tools, board)
+        coord.configure({
+            "ordered_edits": [{"file": "src/lib.rs", "description": "step 1"}],
+            "repair_units": [{"unit_id": "u1", "edit_indices": [0]}],
+        }, [])
+        prompts_seen = []
+
+        def fake_role(_role, _sys, user_prompt, _tools, holder, **kw):
+            prompts_seen.append(user_prompt)
+            if len(prompts_seen) == 1:
+                tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "{ 0 }", "new_text": "{ 1 }"})
+                holder["history"] = [{"role": "user", "content": user_prompt}]
+                return None, "unit_boundary"
+            if len(prompts_seen) == 2:
+                holder["history"] = [{"role": "user", "content": user_prompt}]
+                return None, "unit_boundary"
+            return {"action": "qa", "summary": "done"}, "completed"
+
+        monkeypatch.setattr(ma, "_run_role_agent", fake_role)
+        monkeypatch.setattr(coord, "verify", lambda complete=False, summary="": (False, "check failed"))
+        ma._run_scheduled_fixer(
+            "sys", "INIT_PROMPT", [], {},
+            coordinator=coord, allow_escalate=True, client=SimpleNamespace(calls_made=0), stage_cap=20,
+        )
+        assert "src/lib.rs:" in prompts_seen[1]
+        assert "unchanged since previous slice" in prompts_seen[2]
+        assert "src/lib.rs:" not in prompts_seen[2]
+    finally:
+        state.close()
+
+
+
 
 
 

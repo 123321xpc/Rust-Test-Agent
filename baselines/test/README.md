@@ -1,12 +1,13 @@
 # test: Rust-oriented repair agent
 
-The default `continuous` mode uses one repair conversation for investigation,
-editing and verification. After repeated failures, it can consult a read-only
-Architect and then resume with its previous conversation and edits intact.
-The Verifier reviews the candidate patch and the issue contract. Set
-`RUSTBENCH_REPAIR_MODE=staged` to use the staged controller described below as
-an experimental comparison. `--single-agent` selects the legacy single-agent
-loop instead.
+The default `graph` mode orchestrates the four roles (`Navigator`, `Architect`,
+`Fixer`, `Verifier`) plus deterministic QA as a constrained directed Agent Graph
+(`langgraph.graph.StateGraph` + `Command`), routing localized issues along the
+Fast Path, allowing direct `Fixer -> Navigator` and `Verifier -> Navigator`
+relocalization edges without Architect detours, and combining Red-phase lock
+releases with RepairPlans. Set `RUSTBENCH_REPAIR_MODE=staged` for the legacy
+linear staged controller or `RUSTBENCH_REPAIR_MODE=continuous` for the
+single-conversation continuous repair mode.
 
 Both modes retain existing edits across replanning and allow explicit checkpoint
 restores. Final QA checks affected crates and the workspace with the evaluation
@@ -19,6 +20,65 @@ because their line counts changed.
 
 `test` is backed by a deterministic Rust Code Knowledge Graph (CKG), compiler
 diagnostic symbol lookup, and zero-dependency dynamic tracing.
+
+## Red-phase test locking, Verifier probes, and CKG impact injection
+
+**Red-phase test locking.** When a temporary regression test is confirmed to
+FAIL on the unpatched original code, `PatchState` freezes it as the issue's
+contract oracle. `write_regression_test` then refuses to rewrite or rename it,
+and `revert_file` refuses to delete it; either attempt records a lock violation
+and clears that test's Red-phase evidence, so the patch must re-establish a
+genuine reproduction before submission. This removes the self-grading loophole
+where an agent weakens the very test that was supposed to falsify its patch.
+The Verifier prompt receives a `Locked Red-phase Regression Test(s)` block with
+each locked test's SHA-256 and tamper status.
+
+**Verifier sandbox probe.** `verifier_probe` gives the Verifier read-only
+execution evidence instead of pure prose reasoning:
+
+- `probe_type='existing_test'` re-runs an existing crate test target and
+  reports the exit code, pass/fail counts, failed test names, and output tails.
+- `probe_type='assertion'` mounts a temporary assertion module, compiles and
+  runs it against the crate, then removes it; the working copy is left
+  untouched.
+- `probe_type='snapshot'` re-runs a target and extracts insta snapshot diff
+  hunks so a producer/consumer cascade can be inspected directly.
+
+The Verifier prompt now requires **evidence-backed rejection**: a patch that
+already passed paired Red-Green verification may only be rejected when the
+verifier cites a probe result, a sibling implementation line, a compiler
+diagnostic, a failing test name, or a snapshot diff hunk. Speculative concerns
+must not trigger a rejection, and a probe that contradicts the objection
+requires approval.
+
+**CKG impact injection.** `rust_impact.py` derives a producer -> consumer
+impact surface from the parsed code graph. Whenever production Rust is edited,
+`edit_file` and `write_file` return the downstream consumers and trait/impl or
+match-arm sites that reference the changed symbols. The same surface is
+injected into the Verifier prompt and the Architect advisory prompt, so a
+cross-layer change (for example a new lexer token missing a parser match arm)
+is surfaced deterministically instead of being rediscovered by ad-hoc grep.
+
+## `test-notest` comparison baseline
+
+`baselines/test-notest` is a copy of `baselines/test` that intentionally omits
+the pre-fix test-generation step, so the contribution of the Red-phase
+regression test can be measured against the rest of the pipeline. It differs
+from `test` in exactly four ways:
+
+1. `write_regression_test` is removed from the Fixer and Navigator tool
+   allow-lists in both `continuous` and `staged` modes.
+2. The prompts direct the agents to analyze the code and rely on the
+   repository's existing tests instead of generating a temporary test.
+3. `--require-reproduction` defaults to disabled, because no generated
+   regression test exists to reproduce against.
+4. The Verifier prompt states that `Reproduction evidence: unverified` is
+   expected and must not by itself cause a rejection.
+
+Everything else — the CKG impact surface, the Verifier sandbox probe, the
+Architect escalation paths, the submission gate, and the fallback handling —
+is identical to `test`, so a difference in resolved tasks isolates the value
+of the Red-phase test.
 
 ## Staged comparison mode
 
