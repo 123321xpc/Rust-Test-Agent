@@ -29,6 +29,10 @@ def main():
     parser.add_argument("--source-checkpoint")
     parser.add_argument("--plan-trace")
     parser.add_argument("--repeats", type=int, default=3, help="Number of matched control/intervention pairs")
+    parser.add_argument("--api", type=str.lower, choices=validation.API_PROFILES,
+                        help=f"API interface from .env to use (default: {validation.DEFAULT_API})")
+    parser.add_argument("--model", help="Override the default MODEL value from the selected API interface")
+    parser.add_argument("--api-limit", type=int, help=f"Override API_LIMIT from .env (default: {validation.DEFAULT_API_LIMIT})")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -87,6 +91,11 @@ def main():
         print(f"Prepared hybrid checkpoint: {dest}", flush=True)
         return
     env = validation.child_env("direct")
+    try:
+        validation.resolve_api_env(env, api=args.api, model=args.model)
+        validation.resolve_api_limit(env, api_limit=args.api_limit)
+    except ValueError as exc:
+        parser.error(str(exc))
     tasks = json.loads((validation.HERE / "manifest.json").read_text(encoding="utf-8"))["tasks"]
     task = next(t for t in tasks if t["instance_id"] == INSTANCE)
     row = next(r for r in validation.read_jsonl(validation.ROOT / "data/rustbench-all.jsonl") if r["instance_id"] == INSTANCE)

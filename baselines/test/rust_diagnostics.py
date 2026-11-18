@@ -112,6 +112,8 @@ def _simplify(message):
                     "file": span.get("file_name"),
                     "line_start": span.get("line_start"),
                     "line_end": span.get("line_end"),
+                    "column_start": span.get("column_start"),
+                    "column_end": span.get("column_end"),
                     "replacement": rep,
                 }
     if suggested_fix is None or machine_applicable_fix is None:
@@ -126,6 +128,8 @@ def _simplify(message):
                             "file": span.get("file_name"),
                             "line_start": span.get("line_start"),
                             "line_end": span.get("line_end"),
+                            "column_start": span.get("column_start"),
+                            "column_end": span.get("column_end"),
                             "replacement": rep,
                         }
 
@@ -347,6 +351,31 @@ def attach_diagnostic_snippets(diagnostics, root, manifest_dir=None, context_lin
                 span["snippet"] = snippet
                 total_chars += len(snippet)
 
+        maf = diag.get("machine_applicable_fix")
+        if isinstance(maf, dict) and "old_text" not in maf:
+            mfname = maf.get("file")
+            mls = maf.get("line_start")
+            mle = maf.get("line_end") or mls
+            mcs = maf.get("column_start")
+            mce = maf.get("column_end")
+            rep = maf.get("replacement")
+            mfile = resolve_span_file(mfname) if mfname else None
+            if mfile is not None and isinstance(mls, int) and isinstance(mle, int) and 1 <= mls <= mle and rep is not None:
+                mlines = get_file_lines(mfile) or []
+                if mle <= len(mlines):
+                    old_slice = mlines[mls - 1:mle]
+                    old_text = "\n".join(old_slice)
+                    if mls == mle and isinstance(mcs, int) and isinstance(mce, int) and 1 <= mcs <= mce:
+                        line_txt = old_slice[0]
+                        if mce - 1 <= len(line_txt):
+                            new_text = line_txt[:mcs - 1] + str(rep) + line_txt[mce - 1:]
+                            if old_text != new_text:
+                                maf["old_text"] = old_text
+                                maf["new_text"] = new_text
+                    elif isinstance(rep, str) and old_text and len(old_slice) <= 6:
+                        maf["old_text"] = old_text
+                        maf["new_text"] = rep
+
 
 
 _SHARED_DIAG_MASK_CACHE: dict[Path, dict] = {}
@@ -410,12 +439,16 @@ def enrich_diagnostic_symbol_lookup(
                     root, name=fn_name, kind="fn", exact=True, max_results=3,
                     mask_cache=mask_cache, priority_dir=manifest_dir, deadline=deadline,
                 )
+                inferred_trait = None
                 if matches:
                     top = matches[0]
                     enclosing = top.get("enclosing")
                     vis = top.get("vis", "private")
                     loc = f"{top['path']}:{top['line']}"
                     if enclosing:
+                        m_tr = re.search(r"\btrait\s+([A-Za-z_]\w*)|\bimpl\b(?:<[^>]*>)?\s+([A-Za-z_]\w*)\s+for\b", enclosing)
+                        if m_tr:
+                            inferred_trait = m_tr.group(1) or m_tr.group(2)
                         lookup_info.append(
                             f"[Auto-Lookup: Method '{fn_name}' is defined in '{enclosing}' at {loc} (vis: {vis}). "
                             f"Ensure the enclosing trait/type is imported or check receiver type.]"
@@ -425,6 +458,26 @@ def enrich_diagnostic_symbol_lookup(
                             f"[Auto-Lookup: Function/method '{fn_name}' is defined at {loc} (vis: {vis}). "
                             f"Check if receiver type '{ty_name}' matches the definition.]"
                         )
+                if inferred_trait and ckg is not None and (deadline is None or _time.monotonic() < deadline):
+                    try:
+                        nb_tr = ckg.query_neighborhood(inferred_trait, kind="trait", exclude_tests=True)
+                        tr_paths = [
+                            pp
+                            for d_item in nb_tr.get("definitions", [])[:2]
+                            for pp in d_item.get("public_paths", [])
+                        ]
+                        if tr_paths:
+                            lookup_info.append(
+                                f"[Auto-Lookup CKG: Trait import path(s) for '{inferred_trait}': "
+                                + ", ".join(f"use {p};" for p in list(dict.fromkeys(tr_paths))[:3])
+                                + "]"
+                            )
+                    except Exception:
+                        pass
+                if ty_name.startswith(("Option<", "Result<", "Box<", "Arc<", "Rc<", "&mut ")):
+                    lookup_info.append(
+                        f"[Auto-Lookup: Receiver '{ty_name}' may need unwrapping (?, .as_ref(), .as_deref()) or dereferencing before calling '{fn_name}'.]"
+                    )
 
         # 2. E0425, E0412, E0405, E0432, E0433: Unresolved names, types, traits, imports, modules
         elif code in ("E0425", "E0412", "E0405", "E0432", "E0433"):

@@ -366,10 +366,101 @@ def _is_static_manifest_only_test(content: str) -> bool:
         return False
     return True
 
-def _check_rust_syntax(path_str: str, content: str) -> None:
+def _format_line_window(text: str, center_line: int, radius: int = 3) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return "(empty)"
+    start = max(1, center_line - radius)
+    end = min(len(lines), center_line + radius)
+    return "\n".join(
+        f"{'>' if ln == center_line else ' '} {ln}: {lines[ln - 1]}"
+        for ln in range(start, end + 1)
+    )
+
+
+def _find_unclosed_noncode(source: str, inner_doc_lines: set[int] | None = None) -> tuple[str, int] | None:
+    """Return (description, 1-based line) if a comment or string/raw-string literal is unclosed at EOF."""
+    n, i = len(source), 0
+    while i < n:
+        if source.startswith("//", i):
+            if inner_doc_lines is not None and source.startswith("//!", i):
+                inner_doc_lines.add(source.count("\n", 0, i) + 1)
+            end = source.find("\n", i)
+            i = n if end < 0 else end + 1
+        elif source.startswith("/*", i):
+            start_line = source.count("\n", 0, i) + 1
+            i += 2
+            depth = 1
+            while i < n and depth:
+                if source.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif source.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth > 0:
+                return ("unclosed block comment '/*'", start_line)
+        else:
+            raw = (
+                re.match(r'(?:br|cr|r)(#*)"', source[i:i + 260])
+                if source[i] in "bcr" and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] == "_"))
+                else None
+            )
+            if raw:
+                start_line = source.count("\n", 0, i) + 1
+                closing = '"' + raw.group(1)
+                end = source.find(closing, i + raw.end())
+                if end < 0:
+                    return (f"unclosed raw string literal '{raw.group(0)}'", start_line)
+                i = end + len(closing)
+            elif source[i] == '"':
+                start_line = source.count("\n", 0, i) + 1
+                i += 1
+                closed = False
+                while i < n:
+                    if source[i] == "\\":
+                        i += 2
+                    elif source[i] == '"':
+                        i += 1
+                        closed = True
+                        break
+                    else:
+                        i += 1
+                if not closed:
+                    return ("unclosed string literal '\"'", start_line)
+            elif source[i] == "'":
+                char = re.match(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'", source[i:i + 32])
+                i += char.end() if char else 1
+            else:
+                i += 1
+    return None
+
+
+def _syntax_rejection_error(path_str: str, line: int, reason: str, content: str, original_content: str | None) -> ValueError:
+    parts = [
+        f"Syntax guardrail error in {path_str}:{line}: {reason}.",
+        f"Proposed code around line {line}:\n{_format_line_window(content, line)}",
+    ]
+    if original_content is not None and original_content != content:
+        parts.append(f"Original code around line {line}:\n{_format_line_window(original_content, line)}")
+    parts.append("Your changes have NOT been applied. Fix the edit and try again.")
+    return ValueError("\n".join(parts))
+
+
+def _check_rust_syntax(path_str: str, content: str, original_content: str | None = None) -> None:
     """Validate delimiter balance, unclosed comments/strings, and E0753 before writing .rs files."""
     if not path_str.endswith(".rs") or not content.strip():
         return
+    inner_doc_lines: set[int] = set()
+    unclosed = _find_unclosed_noncode(content, inner_doc_lines=inner_doc_lines)
+    if unclosed is not None:
+        desc, err_line = unclosed
+        raise _syntax_rejection_error(
+            path_str, err_line, f"{desc} reaches end of file", content, original_content,
+        )
+
     spec = importlib.util.spec_from_file_location("symbols_mask", Path(__file__).with_name("rust_symbols.py"))
     sym_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sym_mod)
@@ -388,48 +479,60 @@ def _check_rust_syntax(path_str: str, content: str) -> None:
         elif ch in "})]":
             line = content.count("\n", 0, offset) + 1
             if not stack:
-                raise ValueError(
-                    f"Syntax guardrail error in {path_str}:{line}: unexpected closing delimiter '{ch}' "
-                    "with no matching opening delimiter. Edit rejected to prevent cascading errors."
+                raise _syntax_rejection_error(
+                    path_str, line,
+                    f"unexpected closing delimiter '{ch}' with no matching opening delimiter",
+                    content, original_content,
                 )
             top, top_line, _ = stack.pop()
             if top != pairs[ch]:
-                raise ValueError(
-                    f"Syntax guardrail error in {path_str}:{line}: mismatched delimiter '{ch}', "
-                    f"expected closing for '{top}' from line {top_line}. Edit rejected to prevent cascading errors."
+                raise _syntax_rejection_error(
+                    path_str, line,
+                    f"mismatched delimiter '{ch}', expected closing for '{top}' from line {top_line}",
+                    content, original_content,
                 )
     if stack:
         top, top_line, _ = stack[-1]
-        raise ValueError(
-            f"Syntax guardrail error in {path_str}:{top_line}: unclosed opening delimiter '{top}' "
-            "(reaches end of file without matching closing bracket). Edit rejected to prevent cascading errors."
+        raise _syntax_rejection_error(
+            path_str, top_line,
+            f"unclosed opening delimiter '{top}' (reaches end of file without matching closing bracket)",
+            content, original_content,
         )
 
-    has_item = False
-    first_item_line = None
-    for lineno, line in enumerate(lines, 1):
-        s = line.strip()
-        if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*"):
-            if (s.startswith("//!") or s.startswith("#![")) and has_item:
-                raise ValueError(
-                    f"Syntax guardrail error in {path_str}:{lineno}: inner attribute or doc comment ('{s[:25]}') "
-                    f"found after code declarations at line {first_item_line} (Rust compiler error E0753). "
-                    "Inner attributes/docs must be placed at the very top of the file/module before any item or use declarations. Edit rejected."
+    masked_lines = masked.splitlines()
+    scope_first_item: list[int | None] = [None]
+    attr_depth = 0
+    for lineno, raw_line in enumerate(lines, 1):
+        code_line = masked_lines[lineno - 1] if lineno - 1 < len(masked_lines) else ""
+        ms = code_line.strip()
+        if attr_depth > 0:
+            attr_depth = max(0, attr_depth + ms.count("[") - ms.count("]"))
+        elif ms.startswith("#!["):
+            if scope_first_item[-1] is not None:
+                raise _syntax_rejection_error(
+                    path_str, lineno,
+                    f"inner attribute ('{ms[:25]}') found after code declarations at line {scope_first_item[-1]} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
+                    content, original_content,
                 )
-            continue
-        if s.startswith("#!["):
-            if has_item:
-                raise ValueError(
-                    f"Syntax guardrail error in {path_str}:{lineno}: inner attribute ('{s[:25]}') "
-                    f"found after code declarations at line {first_item_line} (Rust compiler error E0753). "
-                    "Inner attributes/docs must be placed at the very top of the file/module before any item or use declarations. Edit rejected."
-                )
-            continue
-        if s.startswith("#["):
-            continue
-        if not has_item:
-            has_item = True
-            first_item_line = lineno
+            attr_depth = max(0, ms.count("[") - ms.count("]"))
+        elif ms.startswith("#["):
+            attr_depth = max(0, ms.count("[") - ms.count("]"))
+        elif ms:
+            for ch in code_line:
+                if ch == "{":
+                    scope_first_item.append(None)
+                elif ch == "}":
+                    if len(scope_first_item) > 1:
+                        scope_first_item.pop()
+                elif not ch.isspace() and scope_first_item[-1] is None:
+                    scope_first_item[-1] = lineno
+        if lineno in inner_doc_lines and scope_first_item[-1] is not None:
+            s = raw_line.strip()
+            raise _syntax_rejection_error(
+                path_str, lineno,
+                f"inner attribute or doc comment ('{s[:25]}') found after code declarations at line {scope_first_item[-1]} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
+                content, original_content,
+            )
 
 
 def _format_edit_snippet(content: str, line_ranges: list[tuple[int, int]], context: int = 6) -> str:
@@ -507,7 +610,16 @@ def _apply_one_replacement(
 
     if position >= 0:
         if target_region.find(actual_old, position + 1) >= 0:
-            raise ValueError("old_text matches more than once; provide more context or start_line/end_line")
+            match_lines = []
+            pos = position
+            while pos >= 0 and len(match_lines) < 5:
+                match_lines.append(line_offset + target_region.count("\n", 0, pos) + 1)
+                pos = target_region.find(actual_old, pos + 1)
+            locs = ", ".join(str(ln) for ln in match_lines)
+            raise ValueError(
+                f"old_text matches more than once (starting at line(s): {locs}); "
+                "provide more context or start_line/end_line"
+            )
         start_line_out = line_offset + target_region.count("\n", 0, position) + 1
         end_line_out = start_line_out + actual_new.count("\n")
         updated_region = target_region[:position] + actual_new + target_region[position + len(actual_old):]
@@ -524,7 +636,11 @@ def _apply_one_replacement(
             if stripped_win == stripped_old:
                 matches.append(i)
         if len(matches) > 1:
-            raise ValueError("old_text matches more than once (whitespace-fuzzy match); provide more context or start_line/end_line")
+            locs = ", ".join(str(line_offset + idx + 1) for idx in matches[:5])
+            raise ValueError(
+                f"old_text matches more than once (whitespace-fuzzy match at line(s): {locs}); "
+                "provide more context or start_line/end_line"
+            )
         if len(matches) == 1:
             idx = matches[0]
             matched_slice = target_lines[idx:idx + len(old_lines)]
@@ -589,18 +705,135 @@ def _detect_doctest_line_shift(old_text: str, new_text: str, path_str: str) -> s
             break
     if first_diff is None:
         first_diff = min(len(old_lines), len(new_lines)) + 1
-    old_first_doc_line = old_text[:old_doc_starts[0]].count("\n") + 1
-    new_first_doc_line = new_text[:new_doc_starts[0]].count("\n") + 1
     affected_docs = [old_text[:pos].count("\n") + 1 for pos in old_doc_starts if old_text[:pos].count("\n") + 1 >= first_diff]
     if affected_docs:
         sign = f"+{line_delta}" if line_delta > 0 else f"{line_delta}"
+        placement_hint = (
+            " Move newly added helper functions/types below existing doctests (near the bottom of the file) or match existing line count."
+            if line_delta > 0
+            else " Keep doc-comment/formatting edits line-neutral (delta=0) whenever possible."
+        )
         return (
             f"[Doctest Line-Shift Notice in {path_str}]: edit changed line count by {sign} (from line {first_diff}+), "
             f"shifting {len(affected_docs)} downstream Rust doc-test(s) (first shifted doc at line {affected_docs[0]} -> {affected_docs[0] + line_delta}). "
-            "Benchmark evaluation matches doctests by exact `(line N)` suffix, so shifting lines can break PASS_TO_PASS even if `cargo test --doc` passes; "
-            "keep doc-comment/formatting edits line-neutral (delta=0) whenever possible."
+            "Benchmark evaluation matches doctests by exact `(line N)` suffix, so shifting lines can break PASS_TO_PASS even if `cargo test --doc` passes;"
+            + placement_hint
         )
     return ""
+
+
+def inline_test_line_ranges(orig_code: str) -> list[tuple[int, int]]:
+    """Return 1-based (start, end) line ranges of #[cfg(test)] or mod tests blocks in orig_code."""
+    lines = orig_code.splitlines()
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        is_cfg_test = stripped.startswith("#[cfg(test)]")
+        is_mod_tests = bool(re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests?|[a-z0-9_]*_tests)\b", stripped))
+        if is_cfg_test or is_mod_tests:
+            start_ln = i + 1
+            depth = 0
+            opened = False
+            j = i
+            while j < n:
+                ln_txt = lines[j]
+                if "{" in ln_txt:
+                    depth += ln_txt.count("{")
+                    opened = True
+                if "}" in ln_txt:
+                    depth -= ln_txt.count("}")
+                if opened and depth <= 0:
+                    ranges.append((start_ln, j + 1))
+                    i = j
+                    break
+                if not opened and ";" in ln_txt and j > i:
+                    break
+                j += 1
+            else:
+                if opened:
+                    ranges.append((start_ln, n))
+        i += 1
+    return ranges
+
+
+def touched_line_hits_inline_tests(touched: tuple[tuple[str, int], ...], ranges: list[tuple[int, int]]) -> bool:
+    """Return True when a hunk's real edits touch an inline #[cfg(test)]/mod tests region."""
+    for kind, number in touched:
+        for start, end in ranges:
+            if kind == "line":
+                if start <= number <= end:
+                    return True
+            elif start <= number <= end - 1:
+                return True
+    return False
+
+
+def _edited_inline_test_warning(orig_code: str, updated_code: str, path_str: str) -> str:
+    """Warn immediately when an edit touches a pre-existing inline #[cfg(test)]/mod tests region."""
+    norm = path_str.replace("\\", "/").lower()
+    if (
+        not norm.endswith(".rs")
+        or norm.startswith(("tests/", "benches/", "examples/"))
+        or "/tests/" in norm or "/benches/" in norm or "/examples/" in norm
+        or norm.endswith(("_test.rs", "tests.rs"))
+    ):
+        return ""
+    ranges = inline_test_line_ranges(orig_code)
+    if not ranges:
+        return ""
+    import difflib
+    clean_updated = _strip_in_module_tests(updated_code)
+    touched: list[tuple[str, int]] = []
+    matcher = difflib.SequenceMatcher(None, orig_code.splitlines(), clean_updated.splitlines(), autojunk=False)
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            touched.append(("gap", i1))
+        else:
+            for ln in range(i1 + 1, i2 + 1):
+                touched.append(("line", ln))
+    if touched and touched_line_hits_inline_tests(tuple(touched), ranges):
+        span_str = ", ".join(f"{s}-{e}" for s, e in ranges[:3])
+        return (
+            f"[Inline-Test Isolation Warning in {path_str}]: edit touches pre-existing #[cfg(test)]/mod tests lines ({span_str}). "
+            "Submission gate BLOCKS patches that modify pre-existing inline tests; leave existing inline tests untouched "
+            "and preserve backwards-compatible signatures/helpers or avoid changing test-helper structs directly."
+        )
+    return ""
+
+
+def _unimported_crate_path_hint(prev_code: str, updated_code: str, path_str: str) -> str:
+    """Suggest importing externally qualified types at module top when inline tests use `use super::*;`."""
+    if not path_str.endswith(".rs") or "use super::*;" not in updated_code:
+        return ""
+    brace_uses: dict[str, str] = {}
+    for m in re.finditer(r"(?m)^use\s+([A-Za-z_]\w*)::\{([^}]+)\}\s*;", updated_code):
+        brace_uses[m.group(1)] = m.group(2)
+    if not brace_uses:
+        return ""
+    import difflib
+    matcher = difflib.SequenceMatcher(None, prev_code.splitlines(), updated_code.splitlines(), autojunk=False)
+    added_lines = [
+        ln for tag, _i1, _i2, j1, j2 in matcher.get_opcodes() if tag in ("insert", "replace")
+        for ln in updated_code.splitlines()[j1:j2]
+    ]
+    hints: list[str] = []
+    for ln in added_lines:
+        for m in re.finditer(r"\b([a-z_][a-z0-9_]*)::([A-Z][A-Za-z0-9_]*)\b", ln):
+            crate_name, ident = m.group(1), m.group(2)
+            if crate_name in brace_uses and not re.search(rf"\b{re.escape(ident)}\b", brace_uses[crate_name]):
+                if not re.search(rf"(?m)^use\s+{re.escape(crate_name)}::{re.escape(ident)}\b", updated_code):
+                    hints.append(f"`{crate_name}::{ident}` -> `use {crate_name}::{{..., {ident}}}`")
+    if not hints:
+        return ""
+    uniq = list(dict.fromkeys(hints))[:3]
+    return (
+        f"[Rust Test-Scope Hint in {path_str}]: file has `use super::*;` in inline tests; consider adding top-level imports ({'; '.join(uniq)}) "
+        "so test suites importing `super::*` can resolve the type directly."
+    )
 
 
 def _detect_modified_fn_names(replacements: list[tuple]) -> tuple[list[str], list[tuple[str, str]]]:
@@ -752,6 +985,22 @@ class PatchState:
         self._red_lock_violations: list[dict[str, Any]] = []
         self._slow_smoke_targets: set[str] = set()
         self._unlocked_regressions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._consecutive_edit_failures: dict[str, int] = {}
+
+    def record_edit_outcome(self, path_key: str, success: bool) -> str:
+        with self._lock:
+            if success:
+                self._consecutive_edit_failures.pop(path_key, None)
+                return ""
+            count = self._consecutive_edit_failures.get(path_key, 0) + 1
+            self._consecutive_edit_failures[path_key] = count
+            if count >= 2:
+                return (
+                    f"\n[Recovery notice: {count} consecutive edit failures on '{path_key}'. "
+                    f"Call read_lines('{path_key}', ...) to verify exact lines, "
+                    "or use revert_file / checkpoint(action='restore').]"
+                )
+            return ""
 
     _API_COMPILE_ERROR_CODES = {
         "E0599", "E0308", "E0061", "E0425", "E0432", "E0433",
@@ -1296,13 +1545,10 @@ class PatchState:
             else:
                 source_candidates = list(selected_paths)
             doctest_shifts = []
-            trace_leftovers = []
             for p_obj in source_candidates:
                 cur_file = root / p_obj
                 if p_obj.suffix == ".rs" and cur_file.is_file():
                     cur_c = cur_file.read_text(encoding="utf-8", errors="replace")
-                    if "__TraceGuard" in cur_c or "[RUST_TRACE_" in cur_c:
-                        trace_leftovers.append(p_obj.as_posix())
                     orig_raw = self.originals.get(p_obj)
                     if orig_raw and orig_raw[0] is not None:
                         orig_c = orig_raw[0].decode("utf-8", errors="replace")
@@ -1328,7 +1574,6 @@ class PatchState:
             return {
                 "source_files": [p.as_posix() for p in source_candidates],
                 "doctest_shifts": doctest_shifts,
-                "trace_leftovers": trace_leftovers,
                 "scratch_files": scratch_files,
                 "added_dbg_lines": added_dbg[:5],
                 "patch": patch_text,
@@ -1456,8 +1701,6 @@ class PatchState:
                 fpath = root / p_obj
                 if p_obj.suffix == ".rs" and fpath.is_file():
                     cur_c = fpath.read_text(encoding="utf-8", errors="replace")
-                    if "__TraceGuard" in cur_c or "[RUST_TRACE_" in cur_c:
-                        return
                     orig_raw = self.originals.get(p_obj)
                     if "dbg!(" in cur_c and (not orig_raw or orig_raw[0] is None or "dbg!(" not in orig_raw[0].decode("utf-8", errors="replace")):
                         return
@@ -1519,6 +1762,7 @@ class PatchState:
             all_passed = bool(restored_targets) and restored_targets <= self._passed_regressions
             all_repro = (not self.require_reproduction) or all(self._is_target_reproduced(t) for t in restored_targets)
             self._verified_revision = self._revision if (snap["verified"] or (all_passed and all_repro)) else None
+            self._consecutive_edit_failures.clear()
             self._last_submit_error = ""
             self.patch = ""
 
@@ -2640,7 +2884,9 @@ class PatchState:
                                 "test_sha256": self._target_sha256(key),
                             }
                             self._reproduction_notes.pop(key, None)
-                            if clean_red and key not in self._locked_regressions:
+                            # Lock only runtime-confirmed Red oracles; compile-only missing-API tests stay editable
+                            # so Fixer can fix import/type typos in the test without triggering replan_red_lock loops.
+                            if clean_red and runtime_failure and key not in self._locked_regressions:
                                 sha = self._target_sha256(key)
                                 # The Architect already released this oracle; do not re-lock it.
                                 if sha and key not in self._unlocked_regressions:
@@ -2805,7 +3051,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
 
     @tool
     def read_file(path: str) -> str:
-        """List a directory or read small UTF-8 files (files over 250 lines are previewed; use read_lines for source files); paths are repository-relative."""
+        """List a directory or read small UTF-8 files (files over 250 lines are previewed with line numbers; use read_lines for source files); paths are repository-relative."""
         try:
             target = resolve_path(path)
             if target.is_dir():
@@ -2813,11 +3059,14 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             content = target.read_bytes().decode("utf-8")
             lines = content.splitlines()
             if len(lines) > 250 or len(content) > 15000:
-                head = "\n".join(lines[:120])
-                tail = "\n".join(lines[-30:])
+                total_lines = len(lines)
+                head = "\n".join(f"{idx}: {ln}" for idx, ln in enumerate(lines[:120], 1))
+                tail_start = max(121, total_lines - 29)
+                tail = "\n".join(f"{idx}: {ln}" for idx, ln in enumerate(lines[tail_start - 1:], tail_start))
                 return (
+                    f"[File: {target.relative_to(root).as_posix()} ({total_lines} lines total)]\n"
                     f"{head}\n"
-                    f"... [File has {len(lines)} lines ({len(content)} chars); displaying first 120 and last 30 lines. "
+                    f"... [File has {total_lines} lines ({len(content)} chars); displaying lines 1-120 and {tail_start}-{total_lines}. "
                     f"Use read_lines('{path}', start_line, end_line) to inspect specific ranges, "
                     f"or search_code to locate definitions] ...\n"
                     f"{tail}"
@@ -2861,10 +3110,15 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         "Input contains a history-compression omission placeholder; "
                         "use read_lines to inspect the actual file instead of copying omitted markers."
                     )
+                existing_text = (
+                    target.read_text(encoding="utf-8", errors="replace")
+                    if target.is_file()
+                    else None
+                )
                 if (
                     relative.suffix == ".rs"
-                    and target.is_file()
-                    and _rust_has_substantive_code(target.read_text(encoding="utf-8", errors="replace"))
+                    and existing_text is not None
+                    and _rust_has_substantive_code(existing_text)
                     and not _rust_has_substantive_code(content)
                     and not force
                 ):
@@ -2872,7 +3126,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         "Refusing to replace an existing Rust source file with comments or blank lines only. "
                         "Use read_lines to inspect the complete source, or pass force=true for an intentional rollback."
                     )
-                _check_rust_syntax(relative.as_posix(), content)
+                _check_rust_syntax(relative.as_posix(), content, original_content=existing_text)
             check_cargo_lock = (
                 relative.name == "Cargo.toml"
                 and content is not None
@@ -2958,9 +3212,22 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     manifest_dir = root
                 manifest_rel = (manifest_dir / "Cargo.toml").relative_to(root)
 
-                orig_text = target.read_text(encoding="utf-8")
+                orig_bytes = target.read_bytes()
+                orig_text = orig_bytes.decode("utf-8", errors="replace")
+                newline = "\r\n" if "\r\n" in orig_text else "\n"
                 clean_base_text = _strip_in_module_tests(orig_text)
-                _check_rust_syntax(relative.as_posix(), content)
+                norm_content = content.replace("\r\n", "\n").replace("\n", newline)
+                test_block = (
+                    f"{newline}// __TEST_REGRESSION_START: {clean_name}__{newline}"
+                    f"#[cfg(test)]{newline}"
+                    f"mod {clean_name} {{{newline}"
+                    f"    use super::*;{newline}"
+                    f"{norm_content}{newline}"
+                    f"}}{newline}"
+                    f"// __TEST_REGRESSION_END: {clean_name}__{newline}"
+                )
+                updated_text = clean_base_text + test_block
+                _check_rust_syntax(relative.as_posix(), updated_text, original_content=orig_text)
 
                 locked_meta = None
                 for prev_key, prev_lock in list(state._locked_regressions.items()):
@@ -3019,19 +3286,8 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         state._regression_test_names.pop(prev_key, None)
                         state._reproduction_notes.pop(prev_key, None)
 
-                test_block = (
-                    f"\n// __TEST_REGRESSION_START: {clean_name}__\n"
-                    f"#[cfg(test)]\n"
-                    f"mod {clean_name} {{\n"
-                    f"    use super::*;\n"
-                    f"{content}\n"
-                    f"}}\n"
-                    f"// __TEST_REGRESSION_END: {clean_name}__\n"
-                )
-                updated_text = clean_base_text + test_block
-
                 st = target.stat()
-                state.originals.setdefault(relative, (orig_text.encode("utf-8"), st.st_mode, st.st_mtime_ns))
+                state.originals.setdefault(relative, (orig_bytes, st.st_mode, st.st_mtime_ns))
                 state.invalidate_write()
                 state.regression_tests.add(relative)
                 fn_names = set(re.findall(r"(?m)^\s*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", content))
@@ -3078,6 +3334,19 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     f"so Cargo will not compile integration tests at '{relative.as_posix()}'.{hint_str} "
                     "Place the regression test under the target member crate's tests/ directory or use target_src='<crate>/src/...'."
                 )
+            target_kind, bin_name = _resolve_in_module_test_target(manifest_abs)
+            if target_kind == "bin":
+                pkg_ident = (bin_name or _manifest_package_name(manifest_abs)).replace("-", "_").strip()
+                if pkg_ident and re.search(
+                    rf"(?m)\b(?:use|extern\s+crate)\s+{re.escape(pkg_ident)}\b|\b{re.escape(pkg_ident)}::",
+                    content,
+                ):
+                    raise ValueError(
+                        f"'{manifest_rel_path.as_posix()}' defines only a binary target (no [lib] target), "
+                        f"so standalone integration tests under tests/ cannot import `{pkg_ident}::...`. "
+                        f"Use write_regression_test(path='{relative.stem}', target_src='<crate>/src/...', content=...) "
+                        "for an in-module unit test, or test the compiled binary via std::process::Command."
+                    )
             if relative not in state.regression_tests and target.exists():
                 raise ValueError("Regression test must be a new file")
             locked_meta = None
@@ -3107,6 +3376,8 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         "and cannot be rewritten. Fix the production code so the locked test passes instead of "
                         "changing the test, or call escalate_for_replan with the concrete reason the locked test is wrong."
                     )
+            existing_text = target.read_bytes().decode("utf-8", errors="replace") if target.is_file() else None
+            _check_rust_syntax(relative.as_posix(), content, original_content=existing_text)
             was_registered = relative in state.regression_tests
             state.invalidate_write()
             state.originals.setdefault(relative, None)
@@ -3115,7 +3386,6 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             state._reproduced_regressions.pop(reg_key, None)
             state._passed_regression_configs.pop(reg_key, None)
             state._reproduction_notes.pop(reg_key, None)
-            _check_rust_syntax(relative.as_posix(), content)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode("utf-8"))
             active_targets = state.get_regression_targets()
@@ -3146,9 +3416,15 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                                 target.unlink()
                         except OSError:
                             pass
+                    member_hints = []
+                    for pkg_name, pkg_manifest in sorted(state._scan_package_manifests().items())[:8]:
+                        rel_dir = pkg_manifest.parent.relative_to(root).as_posix()
+                        prefix = "" if rel_dir == "." else rel_dir + "/"
+                        member_hints.append(f"{pkg_name}: {prefix}tests/{target.name}")
+                    hint_str = f" Available member crate test paths: {', '.join(member_hints)}." if member_hints else ""
                     return (
                         f"Error: Cargo reported no test target named '{relative.stem}' under '{manifest_rel}', "
-                        f"so '{relative.as_posix()}' was not kept. Place the test under the target member crate's tests/ "
+                        f"so '{relative.as_posix()}' was not kept.{hint_str} Place the test under the target member crate's tests/ "
                         f"directory or use target_src='<crate>/src/...'.\n\n[Auto-run output]:\n{run_res}"
                     )
                 msg += f"\n\n[Auto-run result for {relative.stem}]:\n{run_res}"
@@ -3173,9 +3449,11 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
         Optional start_line and end_line can anchor the search to a specific line range.
         If exact matching fails, leading whitespace is matched flexibly to handle indentation differences.
         """
+        rel_key = path
         try:
             target = resolve_path(path)
             relative = target.relative_to(root)
+            rel_key = relative.as_posix()
             if edits is not None:
                 if old_text or new_text:
                     raise ValueError("Provide either old_text/new_text or edits, not both")
@@ -3213,17 +3491,27 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     )
             write_result = write_file.func(path, updated)
             if not write_result.startswith("Updated "):
-                return write_result
+                return write_result + state.record_edit_outcome(rel_key, False)
+            state.record_edit_outcome(rel_key, True)
             snippet = _format_edit_snippet(updated, line_ranges, context=6)
             out_text = f"{write_result}\n{snippet}" if snippet else write_result
-            if target.suffix == ".rs" and relative not in state.regression_tests:
+            is_prod_rs = target.suffix == ".rs" and (relative not in state.regression_tests or relative in state.in_module_regressions)
+            if is_prod_rs:
+                clean_updated = _strip_in_module_tests(updated) if relative in state.in_module_regressions else updated
                 orig_raw = state.originals.get(relative)
                 if orig_raw and orig_raw[0] is not None:
                     orig_code = orig_raw[0].decode("utf-8", errors="replace")
-                    shift_warn = _detect_doctest_line_shift(orig_code, updated, relative.as_posix())
+                    shift_warn = _detect_doctest_line_shift(orig_code, clean_updated, relative.as_posix())
                     if shift_warn:
-                        out_text += f"\n{shift_warn}" 
-            if target.suffix == ".rs" and relative not in state.regression_tests:
+                        out_text += f"\n{shift_warn}"
+                    inline_warn = _edited_inline_test_warning(orig_code, clean_updated, relative.as_posix())
+                    if inline_warn:
+                        out_text += f"\n{inline_warn}"
+                clean_prev = _strip_in_module_tests(content) if relative in state.in_module_regressions else content
+                scope_hint = _unimported_crate_path_hint(clean_prev, clean_updated, relative.as_posix())
+                if scope_hint:
+                    out_text += f"\n{scope_hint}"
+            if is_prod_rs:
                 mod_fns, mod_types = _detect_modified_fn_names(replacements)
                 impact_lines = []
                 if mod_fns:
@@ -3266,7 +3554,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 )
             return out_text
         except (OSError, UnicodeError, ValueError) as exc:
-            return f"Error editing {path}: {exc}"
+            return f"Error editing {path}: {exc}" + state.record_edit_outcome(rel_key, False)
 
     @tool
     @synchronized
@@ -3466,6 +3754,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     if target.is_file():
                         c = target.read_text(encoding="utf-8")
                         target.write_text(_strip_in_module_tests(c), encoding="utf-8")
+                state._consecutive_edit_failures.pop(relative.as_posix(), None)
                 state.invalidate_write()
                 warn_reg = " [Notice: Reverted active temporary regression test; its passing verification evidence was cleared. Temporary tests are stripped automatically on patch export.]" if had_passed_evidence else ""
                 suffix = f" Preserved the prior working copy as checkpoint '{recovery_name}'." if recovery_name else ""
@@ -3483,6 +3772,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             state._reproduced_regressions.pop(reg_key, None)
             state._passed_regression_configs.pop(reg_key, None)
             state._reproduction_notes.pop(reg_key, None)
+            state._consecutive_edit_failures.pop(relative.as_posix(), None)
             state.invalidate_write()
             if original is None:
                 if target.exists() or target.is_symlink():
@@ -3657,10 +3947,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
     )
     explain = load_local("rust_error_explain").make_rust_error_explain_tool(root, rust_env)
     symbols_mod = load_local("rust_symbols")
-    trace_tool = load_local("rust_trace").make_rust_trace_tool(root, resolve_path, rust_env)
     symbols = symbols_mod.make_rust_symbols_tool(root, resolve_path)
     all_tools = [read_file, write_file, write_regression_test, edit_file, revert_file, checkpoint, generate_patch,
-                 *rust_tools, cargo_check, cargo_test, trace_tool, symbols, ckg_tool, explain, verifier_probe]
+                 *rust_tools, cargo_check, cargo_test, symbols, ckg_tool, explain, verifier_probe]
 
     def attach_budget_notice(tool_obj):
         if tool_obj.name == "read_file":

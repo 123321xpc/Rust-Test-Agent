@@ -222,6 +222,11 @@ def test_submission_gate_blocks_current_code_smoke_but_warns_baseline_and_enviro
     code = {"target": "test:unit", "status": "failed", "classification": "code", "baseline_status": "passed", "observed_revision": 4, "details": "error[E0061]: this function takes 1 argument"}
     gate = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [code])
     assert gate["blocking"] and "test:unit" in gate["blocking"][0]
+    runtime = {"target": "test:snapshot", "status": "failed", "classification": "code", "baseline_status": "passed", "observed_revision": 4, "details": "test snapshot_powershell ... FAILED"}
+    gate_rt = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [runtime])
+    assert gate_rt["blocking"] and "New existing-test regression" in gate_rt["blocking"][0]
+    new_fail = {"target": "test:snap", "status": "failed", "classification": "code", "baseline_status": "failed", "observed_revision": 4, "new_failed_tests": ["snap_b"], "details": "FAILED"}
+    assert ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [new_fail])["blocking"]
     baseline = dict(code, baseline_status="failed")
     env = {"target": "test:network", "status": "environment_error", "classification": "environment", "observed_revision": 4, "details": "download failed"}
     gate = ma._submission_gate_report(state, ma.extract_issue_contract("Fix bug"), patch, selected, [baseline, env])
@@ -670,7 +675,7 @@ def test_multi_agent_auto_escalates_on_repeated_compile_errors_and_recovers(monk
                         return real_run(cmd, *a, **kw)
                     monkeypatch.setattr(subprocess, "run", cargo_fail_run)
                     for v in ("()", "();", "() "):
-                        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": tmap["read_lines"].invoke({"path": "src/lib.rs"}).split(": ", 1)[1], "new_text": f"pub fn bug() -> i32 {{ {v} }}"})
+                        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": tmap["read_lines"].invoke({"path": "src/lib.rs"}).split("\n1: ", 1)[1], "new_text": f"pub fn bug() -> i32 {{ {v} }}"})
                         tmap["cargo_check"].invoke({})
                 else:
                     assert states[-1].stuck_status()["compile_repeats"] <= 1
@@ -1821,26 +1826,50 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
         }, state)
         assert route == "planned" and any("architecture planning" in r for r in reasons)
 
-        # CLI additive option signal forces planned even for 1 candidate file
-        route_cli, _ = ma.route_after_navigation({
+        # Single-file CLI additive option stays on Fast Path when 1 file / 1 chain / no new API
+        route_cli_single, _ = ma.route_after_navigation({
             "issue_contract": ma.extract_issue_contract("Support `--allow-dirty` CLI option in `run`"),
             "localization": base_loc,
         }, state)
-        assert route_cli == "planned"
+        assert route_cli_single == "fast"
 
-        # Multi-consumer CKG impact surface forces planned
+        # mentions_new_api still routes to Planned Path even for 1 file
+        route_api, api_reasons = ma.route_after_navigation({
+            "issue_contract": {"signals": {"mentions_new_api": True}},
+            "localization": base_loc,
+        }, state)
+        assert route_api == "planned" and any("new public API" in r for r in api_reasons)
+
+        multi_loc = {
+            "candidate_chains": [{
+                "chain_id": "C1",
+                "nodes": [
+                    {"path": "src/lib.rs", "symbol": "bug", "role": "root_candidate"},
+                    {"path": "src/cli.rs", "symbol": "run", "role": "root_candidate"},
+                ],
+            }],
+            "reproduction_status": "runtime_failure",
+            "needs_architecture_planning": False,
+        }
+
+        # Multi-file CKG impact surface forces planned, while 1-file CKG consumer fan-out stays fast
         orig_builder = ma._rust_impact.build_impact_surface
         try:
             state.ckg = SimpleNamespace()
             ma._rust_impact.build_impact_surface = lambda _ckg, _paths: {
-                "consumer_paths": ["src/cli.rs", "src/config.rs"],
+                "consumer_paths": ["src/other1.rs", "src/other2.rs"],
                 "trait_impls": [],
             }
-            route_ckg, ckg_reasons = ma.route_after_navigation({
+            route_ckg_single, _ = ma.route_after_navigation({
                 "issue_contract": ma.extract_issue_contract("Fix off-by-one in `bug`"),
                 "localization": base_loc,
             }, state)
-            assert route_ckg == "planned" and any("CKG impact" in r for r in ckg_reasons)
+            assert route_ckg_single == "fast"
+            route_ckg_multi, ckg_reasons = ma.route_after_navigation({
+                "issue_contract": ma.extract_issue_contract("Fix off-by-one in `bug`"),
+                "localization": multi_loc,
+            }, state)
+            assert route_ckg_multi == "planned" and any("CKG impact" in r for r in ckg_reasons)
         finally:
             ma._rust_impact.build_impact_surface = orig_builder
     finally:
@@ -2238,6 +2267,470 @@ def test_scheduled_fixer_omits_unchanged_file_excerpts_across_slices(tmp_path, m
         assert "src/lib.rs:" not in prompts_seen[2]
     finally:
         state.close()
+
+
+def test_extract_issue_contract_adds_is_empty_companion_hint_and_verifier_conflict_basis():
+    ma = _load("multi_agent")
+    contract = ma.extract_issue_contract("Add `len` method to `broadcast::Sender`")
+    assert any("is_empty" in h for h in contract["companion_api_hints"])
+    card = ma.build_handoff_card(contract, {"localization": {}, "repair_plan": {}})
+    assert "is_empty" in card
+
+    tools, holder = ma._make_handoff_tools("verifier", None, {
+        "repair_plan": {"ordered_edits": [{"file": "src/lib.rs"}]},
+        "issue_contract": ma.extract_issue_contract("Support `--only` flag"),
+    }, {})
+    submit = tools[0]
+    err = submit.invoke({
+        "decision": "APPROVE",
+        "summary": "ok",
+        "plan_consistency": "conflict",
+        "plan_conflicts": ["diff edited src/ui.rs directly"],
+    })
+    assert "explanation" in err.lower()
+    assert not holder["done"]
+
+    ok = submit.invoke({
+        "decision": "APPROVE",
+        "summary": "ok",
+        "plan_consistency": "conflict",
+        "plan_conflicts": ["diff edited src/ui.rs directly"],
+        "explanation": "The diff satisfies the requested `--only` flag and cargo check passed.",
+    })
+    assert "recorded" in ok.lower()
+    assert holder["done"]
+
+
+def test_extract_issue_contract_ignores_inline_shell_command_flags():
+    ma = _load("multi_agent")
+    issue = (
+        "Installer.sh sourcing ~/.cargo/bin in ~/.profile is not always sufficient.\n"
+        "One-liner: `curl --proto '=https' --tlsv1.2 -LsSf https://example.com/install.sh?a=--ignored | sh`\n"
+        "```bash\n"
+        "cargo test --all-features -- --nocapture\n"
+        "```\n"
+        "- Running `curl --proto '=https' --tlsv1.2` should work in non-interactive shells.\n"
+    )
+    contract = ma.extract_issue_contract(issue)
+    assert contract["signals"]["mentions_cli_or_additive_flag"] is False
+    assert "requirement_checklist" not in contract
+
+    real_cli = ma.extract_issue_contract("Support `--config <path>` and `--only` options.")
+    assert real_cli["signals"]["mentions_cli_or_additive_flag"] is True
+
+
+def test_localization_plan_and_fixer_zero_edit_circuit_breakers(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    tools_list, state = tools_mod.make_tools(repo)
+    tools_by_name = {t.name: t for t in tools_list}
+    try:
+        # 1. Navigator cannot silently hand off a temporary regression test that passed on original code.
+        tools_by_name["write_regression_test"].invoke({"path": "tests/test_regression_fake.rs", "content": "#[test] fn fake() {}"})
+        state.pass_test(state.start_test(), test_target="test_regression_fake")
+        nav_tools, nav_holder = ma._make_handoff_tools(
+            "navigator",
+            state,
+            {"issue_contract": {"requested_symbols": []}},
+            {"files_read": [], "symbols_queried": [], "calls_remaining_in_stage": 5},
+        )
+        nav_err = nav_tools[0].invoke({
+            "summary": "s",
+            "candidate_chains": [{"chain_id": "C1", "hypothesis": "h", "nodes": [{"path": "src/lib.rs", "role": "root_candidate"}]}],
+        })
+        assert "already PASSED" in nav_err and not nav_holder["done"]
+
+        # 2. Suggester cannot submit empty or preserve-only plans.
+        sug_tools, sug_holder = ma._make_handoff_tools(
+            "suggester",
+            state,
+            {"issue_contract": {"requested_symbols": []}, "localization": {"candidate_chains": []}},
+            {"files_read": [], "symbols_queried": []},
+        )
+        submit_plan = next(t for t in sug_tools if t.name == "submit_repair_plan")
+        plan_err = submit_plan.invoke({
+            "selected_chain_id": "C1",
+            "arbitration_rationale": "none",
+            "ordered_edits": [{"file": "src/lib.rs", "action": "preserve", "description": "keep"}],
+        })
+        assert "concrete 'modify' or 'add'" in plan_err and not sug_holder["done"]
+
+        # 3. Fixer triggers _AutoEscalate on repeated submit_for_qa with 0 source edits.
+        fix_act = {"files_read": [], "symbols_queried": [], "unit_coordinator": SimpleNamespace(before_tool=lambda *a: None, observe=lambda *a: None)}
+        fix_tools, _ = ma._make_handoff_tools("fixer", state, {"issue_contract": {}, "localization": {}}, fix_act, allow_escalate=True)
+        submit_qa = next(t for t in fix_tools if t.name == "submit_for_qa")
+        assert "no source code changes" in submit_qa.invoke({"summary": "noop"})
+        try:
+            submit_qa.invoke({"summary": "noop2"})
+            assert False, "expected _AutoEscalate on repeated zero-edit submit_for_qa"
+        except ma._AutoEscalate as exc:
+            assert exc.detail["no_edit_qa_attempts"] == 2
+
+        # 4. Fixer triggers _AutoEscalate on >=3 write_regression_test calls without source edits even when coordinated.
+        dummy_write_reg = ma._clone_tool_with_func(
+            tools_by_name["write_regression_test"],
+            lambda **kw: "ok",
+        )
+        wrapped = ma._wrap_tools_for_role(
+            "fixer",
+            {"write_regression_test": dummy_write_reg},
+            ["write_regression_test"],
+            [],
+            {},
+            state,
+            SimpleNamespace(calls_made=0, remaining_calls=20),
+            0,
+            10,
+            fix_act,
+            auto_escalate_on_stuck=True,
+        )
+        wtool = wrapped[0]
+        wtool.invoke({"path": "tests/test_regression_fake.rs", "content": "#[test] fn a() {}"})
+        wtool.invoke({"path": "tests/test_regression_fake.rs", "content": "#[test] fn b() {}"})
+        try:
+            wtool.invoke({"path": "tests/test_regression_fake.rs", "content": "#[test] fn c() {}"})
+            assert False, "expected _AutoEscalate on zero-source-edit reg_write_streak"
+        except ma._AutoEscalate as exc:
+            assert exc.detail["reg_write_streak"] == 3 and not exc.detail["has_source_edits"]
+    finally:
+        state.close()
+
+
+def test_deterministic_qa_blocks_dead_enum_variant_and_warns_bare_assert(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = tmp_path / "enum_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "enum_demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(
+        "pub enum Kind {\n    Num,\n}\n"
+        "pub trait BufLike {\n    fn adv(&mut self, n: usize);\n}\n"
+        "impl BufLike for Vec<u8> {\n"
+        "    fn adv(&mut self, n: usize) { assert!(n <= 4, \"cannot advance\"); }\n"
+        "}\n"
+        "pub fn handle(k: Kind) -> i32 {\n"
+        "    match k {\n        Kind::Num => 1,\n        _ => 0,\n    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "other.rs").write_text(
+        "pub fn adv_other(n: usize) {\n    if n > 4 {}\n}\n",
+        encoding="utf-8",
+    )
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_e.rs", "content": "#[test] fn t() {}"})
+        tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub enum Kind {\n    Num,\n}",
+            "new_text": "pub enum Kind {\n    Num,\n    Bogus,\n}",
+        })
+        state.pass_test(state.start_test(), test_target="test_regression_e")
+        res = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix parser"), run_doctest_on_shift=False)
+        assert res["ok"] is False
+        assert "One-sided enum edit" in res["reason"] and "Bogus" in res["reason"]
+
+        tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub enum Kind {\n    Num,\n    Bogus,\n}",
+            "new_text": "pub enum Kind {\n    Num,\n}",
+        })
+        tools["edit_file"].invoke({
+            "path": "src/other.rs",
+            "old_text": "pub fn adv_other(n: usize) {\n    if n > 4 {}\n}",
+            "new_text": "pub fn adv_other(n: usize) {\n    assert!(n <= 4);\n}",
+        })
+        # Check sibling bare assert warning directly
+        bare_warn = ma._detect_bare_assert_sibling_mismatch(
+            state,
+            "+++ b/src/other.rs\n@@ -1,2 +1,2 @@ pub fn adv(n: usize) {\n+    assert!(n <= 4);\n",
+        )
+        assert "Bare assert!(...)" in bare_warn and "cannot advance" in bare_warn
+    finally:
+        state.close()
+
+
+def test_conditional_dynamic_trace_triggers_only_on_real_logic_failure(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = tmp_path / "trace_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "tr"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn bug(x: i32) -> i32 { x }\n", encoding="utf-8")
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=True)
+    try:
+        (state.root / "target").mkdir()
+        tools = {t.name: t for t in tools_list}
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_tr.rs", "content": "#[test] fn t() {}"})
+        state.fail_test(state.start_test(), test_target="test_regression_tr", executed=1, failures=["t"], returncode=101)
+        called = []
+        fake_trace = SimpleNamespace(name="rust_trace", func=lambda **kw: (called.append(kw), "[Rust Dynamic Trace Report]\nCall Hierarchy:\nbug (src/lib.rs:1)")[1])
+        ctx = SimpleNamespace(
+            tools_by_name={"rust_trace": fake_trace},
+            state=state,
+            trace=None,
+            blackboard={"localization": {"candidate_chains": [{"chain_id": "C1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}]}},
+        )
+        rep = ma._maybe_run_conditional_trace(ctx, on_escalation=False)
+        assert "Rust Dynamic Trace Report" in rep
+        assert called and called[0]["instrument"] == ["src/lib.rs:bug"]
+        assert ctx.blackboard["dynamic_trace_report"] == rep
+    finally:
+        state.close()
+
+
+def test_conditional_dynamic_trace_uses_cargo_target_dir_and_active_features(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = tmp_path / "trace_env_repo"
+    ext_target = tmp_path / "shared_cargo_target"
+    ext_target.mkdir()
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "tr_env"\nversion = "0.1.0"\n[features]\nserde = []\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn bug(x: i32) -> i32 { x }\n", encoding="utf-8")
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=True)
+    try:
+        assert not (state.root / "target").exists()
+        state.rust_env = {"CARGO_TARGET_DIR": str(ext_target)}
+        state._active_cfg_features[(state.root / "Cargo.toml").resolve()] = ["serde"]
+        tools = {t.name: t for t in tools_list}
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_env.rs", "content": "#[test] fn t() {}"})
+        state.fail_test(state.start_test(), test_target="test_regression_env", executed=1, failures=["t"], returncode=101)
+        called = []
+        fake_trace = SimpleNamespace(name="rust_trace", func=lambda **kw: (called.append(kw), "[Rust Dynamic Trace Report]\nok")[1])
+        ctx = SimpleNamespace(
+            tools_by_name={"rust_trace": fake_trace},
+            state=state,
+            trace=None,
+            blackboard={"localization": {"candidate_chains": [{"chain_id": "C1", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}]}},
+        )
+        rep = ma._maybe_run_conditional_trace(ctx, on_escalation=False)
+        assert "Rust Dynamic Trace Report" in rep
+        assert called and called[0].get("features") == ["serde"]
+    finally:
+        state.close()
+
+
+def test_should_prune_suggester_replan_keeps_locked_oracle_escalation_and_tracks_qa_streak(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = tmp_path / "prune_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "pr"\nversion = "0.1.0"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=True)
+    try:
+        tools = {t.name: t for t in tools_list}
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_bad.rs", "content": "#[test] fn t() {}"})
+        state.fail_test(state.start_test(), test_target="test_regression_bad", executed=1, failures=["t"], returncode=101)
+        ctx = SimpleNamespace(
+            state=state,
+            candidate_policy=None,
+            blackboard={
+                "replan_count": 1,
+                "last_replan_score": (1, 1, 1, 1),
+                "escalations": [{"reason": "Locked regression test oracle asserts wrong expected value"}],
+            },
+        )
+        prune, _ = ma._should_prune_suggester_replan(ctx)
+        assert prune is False
+
+        ctx.blackboard["escalations"] = [{"reason": "Compile failed unrelated"}]
+        prune2, _ = ma._should_prune_suggester_replan(ctx)
+        assert prune2 is True
+
+        assert ma._record_det_qa_failure_streak(ctx, "Rust changes contain only comments/blank lines: src/lib.rs") == 1
+        assert ma._record_det_qa_failure_streak(ctx, "Rust changes contain only comments/blank lines: src/other.rs") == 2
+        assert ma._record_det_qa_failure_streak(ctx, "Different failure reason: x") == 1
+    finally:
+        state.close()
+
+
+def test_smoke_gate_clusters_failed_tests_and_allows_legacy_audit_after_first_round():
+    ma = _load("multi_agent")
+    state = SimpleNamespace(_existing_test_failures=[], _revision=2)
+    patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+    selected = [Path("src/lib.rs")]
+    many_failed = [f"err::string_{i}" for i in range(12)] + ["err::object_comma_json", "err::object_null_json"]
+    smoke = [{
+        "target": "test:spec_tests",
+        "status": "failed",
+        "classification": "code",
+        "baseline_status": "passed",
+        "observed_revision": 2,
+        "failed_tests": many_failed,
+        "details": "snapshot mismatch",
+    }]
+    first = ma._submission_gate_report(state, ma.extract_issue_contract("Fix parser"), patch, selected, smoke)
+    assert first["blocking"] and "New existing-test regression" in first["blocking"][0]
+    assert "err::object_comma_json" in first["blocking"][0]
+
+    retry = ma._submission_gate_report(
+        state, ma.extract_issue_contract("Fix parser"), patch, selected, smoke,
+        allow_legacy_regression_audit=True,
+    )
+    assert retry["blocking"] == []
+    assert any("Legacy/existing-test failure for Verifier audit" in w for w in retry["warnings"])
+
+    compile_smoke = [{
+        "target": "lib",
+        "status": "failed",
+        "classification": "code",
+        "baseline_status": "passed",
+        "observed_revision": 2,
+        "details": "error[E0308]: mismatched types",
+    }]
+    still_blocked = ma._submission_gate_report(
+        state, ma.extract_issue_contract("Fix parser"), patch, selected, compile_smoke,
+        allow_legacy_regression_audit=True,
+    )
+    assert still_blocked["blocking"] and "New compilation failure" in still_blocked["blocking"][0]
+
+
+def test_graph_agent_enforces_integration_gate_once_on_template_edit(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "templates").mkdir()
+    (repo / "templates" / "install.sh.j2").write_text("echo old\n", encoding="utf-8")
+    (repo / "tests").mkdir(exist_ok=True)
+    (repo / "tests" / "integration.rs").write_text("#[test] fn snap() {}\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        s.run_existing_test_smoke = lambda _sel: [{"target": "test:integration", "status": "timeout", "classification": "unknown"}]
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        fix_count = sum(1 for r in roles if r == "fixer")
+
+        def invoke(inputs, config):
+            if role == "navigator":
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_tpl.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "template",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "template", "nodes": [{"path": "templates/install.sh.j2", "symbol": ""}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer":
+                if fix_count == 1:
+                    tmap["write_file"].invoke({"path": "templates/install.sh.j2", "content": "echo mid\n"})
+                else:
+                    tmap["write_file"].invoke({"path": "templates/install.sh.j2", "content": "echo final\n"})
+                tmap["submit_for_qa"].invoke({"summary": "updated template", "unreproduced_reason": "template"})
+            elif role == "verifier":
+                tmap["submit_qa_decision"].invoke({
+                    "decision": "APPROVE",
+                    "summary": "ok",
+                    "plan_consistency": "not_applicable",
+                })
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    patch = agent_mod.run_agent(repo, "Update install.sh.j2 template", "m", "k", max_api_calls=30)
+    assert "+echo final" in patch
+    assert roles.count("verifier") == 2
+    assert roles.count("fixer") == 2
+
+
+def test_graph_agent_allows_paired_repro_legacy_smoke_audit_and_checks_untouched_ref_files(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "lexer").mkdir(parents=True)
+    (repo / "src" / "lexer" / "mod.rs").write_text("pub fn lex() {}\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
+
+    roles = []
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        s.reproduced_cleanly = lambda: True
+        s.verified = lambda: True
+        s.run_existing_test_smoke = lambda _sel: [{
+            "target": "test:legacy",
+            "status": "failed",
+            "classification": "code",
+            "baseline_status": "passed",
+            "observed_revision": s._revision,
+            "failed_tests": ["legacy::old_behavior"],
+            "details": "assertion failed",
+        }]
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+        if "Navigator & Reproducer" in system_prompt:
+            role = "navigator"
+        elif "Rust Architect / Suggester" in system_prompt:
+            role = "suggester"
+        elif "Rust Fixer" in system_prompt:
+            role = "fixer"
+        else:
+            role = "verifier"
+        roles.append(role)
+        ver_count = sum(1 for r in roles if r == "verifier")
+
+        def invoke(inputs, config):
+            if role == "navigator":
+                tmap["write_regression_test"].invoke({"path": "tests/test_regression_ref.rs", "content": "#[test] fn t() {}"})
+                tmap["submit_localization_bundle"].invoke({
+                    "summary": "in lib",
+                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "lib", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
+                    "reproduction_status": "runtime_failure",
+                })
+            elif role == "fixer":
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+                tmap["submit_for_qa"].invoke({"summary": "updated lib", "unreproduced_reason": ""})
+            elif role == "verifier":
+                if ver_count == 1:
+                    tmap["submit_qa_decision"].invoke({
+                        "decision": "APPROVE",
+                        "summary": "downstream change looks good",
+                        "plan_consistency": "not_applicable",
+                    })
+                else:
+                    tmap["submit_qa_decision"].invoke({
+                        "decision": "APPROVE",
+                        "summary": "verified lexer/mod.rs stays unchanged intentionally",
+                        "plan_consistency": "not_applicable",
+                    })
+            return {"messages": inputs["messages"]}
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    patch = agent_mod.run_agent(repo, "Bug in src/lexer/mod.rs causes wrong output", "m", "k", max_api_calls=30)
+    assert "pub fn bug() -> i32 { 1 }" in patch
+    assert roles.count("verifier") == 2
+    assert roles.count("fixer") == 2
 
 
 

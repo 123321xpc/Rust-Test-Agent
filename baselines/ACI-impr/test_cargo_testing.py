@@ -245,3 +245,22 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored;
     res = _extract_project_backtrace(sample)
     assert "[Panic backtrace in project code]" in res
     assert "./src/lib.rs:10:5" in res
+
+
+def test_zero_tests_executed_emits_warning_except_no_run(project, monkeypatch):
+    _, tool = project
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", ""
+        ),
+    )
+    res = json.loads(tool.invoke({"test_filter": "nonexistent_case"}))
+    assert res["status"] == "passed"
+    assert res["tests_executed"] == 0
+    assert "Zero tests executed" in res["warning"]
+
+    no_run_res = json.loads(tool.invoke({"tests": True, "no_run": True}))
+    assert no_run_res["status"] == "passed"
+    assert "warning" not in no_run_res

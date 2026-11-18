@@ -1,4 +1,4 @@
-"""Run the minimal LangChain normal baseline against one benchmark instance."""
+"""Run the generic LangChain ReAct normal baseline against one benchmark instance."""
 
 import argparse
 import importlib.util
@@ -48,62 +48,14 @@ TraceHTTPClient, TraceRecorder = _trace.TraceHTTPClient, _trace.TraceRecorder
 benchmark_toolchain = _load_file("rust_environment", Path(__file__).with_name("rust_environment.py")).benchmark_toolchain
 
 
-SYSTEM_PROMPT = """You are a software engineer resolving an issue in a Rust repository.
-Follow this order:
-1. Analyze the issue and relevant code. Identify the cause, expected behavior,
-   and callers/trait constraints using search_code (with context_lines when helpful),
-   rust_symbols (including callers=True / references=True), read_lines, and
-   cargo_workspace. Keep initial exploration focused (typically within 10-15
-   read/search calls) before writing the regression test.
-2. Use write_regression_test to create a new temporary integration test in the
-   relevant package's tests/normal_regression_<name>.rs. Reproduce the issue via
-   the public API (or for binary-only CLI crates, via `env!("CARGO_BIN_EXE_<bin>")`)
-   and cover boundary cases described in the issue. Run cargo_test with test_target
-   set to the regression test before fixing to confirm reproduction (Red phase:
-   runtime failure on buggy code, or expected API-missing compile failure for new
-   APIs). Do not add or modify inline tests or other test files; never modify files in tests/ or benches/ (modifications to existing test files are blocked to prevent benchmark conflicts).
-3. Implement a targeted fix using edit_file (single replacement or edits=[...]
-   for multiple hunks), preserving unrelated code. Before changing any function
-   signature or trait bound, check callers with rust_symbols(callers=True). Use
-   checkpoint(action="save"/"restore") before risky refactors and revert_file to
-   cleanly discard unwanted changes. If a strategy_warning appears, step back and
-   change approach instead of repeating similar local tweaks.
-4. Use layered verification after edits: first run cargo_check (or cargo_test
-   with no_run=True to check test target compilation), then run cargo_test with
-   test_target set to each regression test (no filter). Then run targeted existing
-   tests (lib=True with test_filter or relevant test_target); run the full package
-   suite (tests=True) only when fast enough, avoiding repeated timeouts on huge
-   crates. Each temporary regression test must pass with at least one test executed
-   and 0 ignored. Existing tests may fail; report their failures, but do not
-   modify or remove them to satisfy the gate. If the issue states an existing test
-   asserts outdated behavior contrary to the issue, do not weaken your fix to pass it.
-   When modifying public APIs, types, or doc comments, you may also run cargo_test with doc=True to verify documentation examples.
-5. After verification passes, use generate_patch to preview changes, then submit
-   all changed source files using an explicit list of file paths. Temporary
-   regression tests are excluded automatically, and a post-strip verification
-   checks affected crates and downstream workspace dependents. Any further write
-   invalidates regression verification: rerun the required tests. Watch for budget
-   notices and submit before API calls run out.
-Briefly describe the analysis, tests, and change.
-Do not run git or external shell commands to inspect history or host files.
-Focus strictly on reproducing and fixing the issue using the crate's Rust API
-(or `CARGO_BIN_EXE_<bin>` for binary crates). The Rust toolchain is configured by
-the runner; do not change repository toolchain files merely to configure the environment.
-"""
+SYSTEM_PROMPT = """You are a software engineer resolving an issue in a repository.
+Use the available tools to search and read files, edit code to fix the issue, run commands or tests via run_command to verify your changes, and call generate_patch to submit your final patch.
+Do not include temporary test files or unrelated changes in the final submitted patch."""
 
 
-
-def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2):
-    """Compress verbose tool outputs and large edit calls from older turns to reduce prompt token bloat.
-
-    Uses block-aligned retention to preserve LLM prompt prefix caching:
-    - Recent tool turns (last keep_recent_steps) retain code reads (read_lines, search_code) in full fidelity.
-    - Older cargo_test and cargo_check JSON payloads (> test_cutoff_steps old) are compacted to essential status/counts.
-    - Older cargo_workspace and rust_symbols outputs are compacted to outline/member summaries.
-    - Large write_file/edit_file tool arguments (> 800 chars) in older assistant messages are truncated.
-    - Code reads older than keep_recent_steps have excessive middle lines compacted.
-    """
-    if not isinstance(messages, list) or len(messages) <= test_cutoff_steps * 2:
+def _compress_history_messages(messages, keep_recent_steps=6, block_size=2):
+    """Compress verbose tool outputs and large edit calls from older turns to reduce prompt token bloat."""
+    if not isinstance(messages, list) or len(messages) <= keep_recent_steps * 2:
         return messages
 
     tool_indices = [
@@ -115,20 +67,11 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
 
     total_tools = len(tool_indices)
     raw_code_cutoff = max(0, total_tools - min(keep_recent_steps, total_tools))
-    raw_test_cutoff = max(0, total_tools - min(test_cutoff_steps, total_tools))
-
-    if block_size > 1:
-        code_pos = (raw_code_cutoff // block_size) * block_size
-        test_pos = (raw_test_cutoff // block_size) * block_size
-    else:
-        code_pos = raw_code_cutoff
-        test_pos = raw_test_cutoff
-
+    code_pos = (raw_code_cutoff // block_size) * block_size if block_size > 1 else raw_code_cutoff
     code_cutoff_idx = tool_indices[code_pos] if code_pos < total_tools else len(messages)
-    test_cutoff_idx = tool_indices[test_pos] if test_pos < total_tools else len(messages)
 
     def _trim_arg_str(val):
-        if not isinstance(val, str) or len(val) <= 400 or "[earlier write omitted]" in val:
+        if not isinstance(val, str) or len(val) <= 400 or "[earlier write omitted" in val:
             return val, False
         lines = val.splitlines()
         if len(lines) > 8:
@@ -142,7 +85,6 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
         is_tool = getattr(msg, "type", None) == "tool" or (isinstance(msg, dict) and msg.get("role") == "tool")
         is_ai = getattr(msg, "type", None) == "ai" or (isinstance(msg, dict) and msg.get("role") == "assistant")
 
-        # Compact older assistant reasoning text and write/edit tool arguments
         if is_ai and i < code_cutoff_idx:
             ai_content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
             content_changed = False
@@ -166,29 +108,12 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                         continue
                     name = tc.get("name")
                     args = tc.get("args")
-                    if name in ("write_file", "write_regression_test", "edit_file") and isinstance(args, dict):
+                    if name in ("write_file", "edit_file") and isinstance(args, dict):
                         args_copy = dict(args)
                         for k in ("content", "old_text", "new_text"):
                             new_val, changed = _trim_arg_str(args_copy.get(k))
                             if changed:
                                 args_copy[k] = new_val
-                                tc_changed = True
-                        if isinstance(args_copy.get("edits"), list):
-                            new_edits = []
-                            edits_changed = False
-                            for item in args_copy["edits"]:
-                                if isinstance(item, dict):
-                                    item_copy = dict(item)
-                                    for ek in ("old_text", "new_text"):
-                                        nv, ch = _trim_arg_str(item_copy.get(ek))
-                                        if ch:
-                                            item_copy[ek] = nv
-                                            edits_changed = True
-                                    new_edits.append(item_copy)
-                                else:
-                                    new_edits.append(item)
-                            if edits_changed:
-                                args_copy["edits"] = new_edits
                                 tc_changed = True
                         updated_tc.append({**tc, "args": args_copy})
                     else:
@@ -204,6 +129,12 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                     elif isinstance(msg, dict):
                         msg = dict(msg)
                         msg.update(updates)
+            elif content_changed:
+                if hasattr(msg, "model_copy"):
+                    msg = msg.model_copy(update={"content": ai_content})
+                elif isinstance(msg, dict):
+                    msg = dict(msg)
+                    msg["content"] = ai_content
 
         if not is_tool:
             compressed.append(msg)
@@ -214,99 +145,16 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
             compressed.append(msg)
             continue
 
-        stripped = content.strip()
         new_content = None
-
-        if i < test_cutoff_idx and stripped.startswith("{") and stripped.endswith("}"):
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict):
-                    if str(data.get("note", "")).startswith("[earlier"):
-                        new_content = content
-                    elif "status" in data:
-                        err_codes = []
-                        for d in data.get("diagnostics", []):
-                            if isinstance(d, dict) and d.get("level") == "error" and d.get("code"):
-                                if d["code"] not in err_codes:
-                                    err_codes.append(d["code"])
-                        payload = {
-                            "status": data.get("status"),
-                            "tests_executed": data.get("tests_executed", 0),
-                            "tests_ignored": data.get("tests_ignored", 0),
-                            "failed_tests": data.get("failed_tests", [])[:20],
-                            "note": "[earlier test output compacted]",
-                        }
-                        if err_codes:
-                            payload["compiler_errors"] = err_codes[:5]
-                        new_content = json.dumps(payload, ensure_ascii=False)
-                    elif "exit_code" in data and "diagnostics" in data:
-                        diags = data.get("diagnostics", [])
-                        errs = [d for d in diags if isinstance(d, dict) and d.get("level") == "error"]
-                        err_summary = []
-                        for d in errs[:5]:
-                            spans = d.get("spans") or []
-                            first_span = spans[0] if spans else {}
-                            err_summary.append({
-                                "code": d.get("code"),
-                                "category": d.get("category"),
-                                "file": first_span.get("file_name"),
-                                "line": first_span.get("line_start"),
-                                "msg": (d.get("message") or "")[:120],
-                            })
-                        new_content = json.dumps({
-                            "exit_code": data.get("exit_code"),
-                            "error_count": len(errs),
-                            "warning_count": len([d for d in diags if isinstance(d, dict) and d.get("level") == "warning"]),
-                            "top_errors": err_summary,
-                            "note": "[earlier cargo_check output compacted]",
-                        }, ensure_ascii=False)
-            except Exception:
-                pass
-
-        if new_content is None and i < code_cutoff_idx:
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    data = json.loads(content)
-                    if isinstance(data, dict):
-                        if str(data.get("note", "")).startswith("[earlier"):
-                            new_content = content
-                        elif "workspace_members" in data:
-                            members = [
-                                {"name": m.get("name"), "manifest_path": m.get("manifest_path")}
-                                for m in data.get("workspace_members", []) if isinstance(m, dict)
-                            ]
-                            new_content = json.dumps({
-                                "workspace_root": data.get("workspace_root"),
-                                "workspace_members": members,
-                                "note": "[earlier cargo_workspace targets compacted]",
-                            }, ensure_ascii=False)
-                        elif "results" in data or "outline" in data:
-                            items = data.get("results") or data.get("outline") or []
-                            slim = [
-                                {"path": x.get("path"), "line": x.get("line"), "kind": x.get("kind"), "name": x.get("name")}
-                                for x in items[:8] if isinstance(x, dict)
-                            ]
-                            new_content = json.dumps({
-                                "count": len(items),
-                                "top_matches": slim,
-                                "truncated": data.get("truncated", False),
-                                "note": "[earlier rust_symbols output compacted]",
-                            }, ensure_ascii=False)
-                except Exception:
-                    pass
-
-            if new_content is None:
-                if "[omitted " in content or "[earlier output truncated]" in content:
-                    new_content = content
-                else:
-                    lines = content.splitlines()
-                    if len(lines) > 10:
-                        head = "\n".join(lines[:5])
-                        tail = "\n".join(lines[-3:])
-                        omitted = len(lines) - 8
-                        new_content = f"{head}\n... [omitted {omitted} intermediate lines of earlier reading] ...\n{tail}"
-                    elif len(content) > 800:
-                        new_content = content[:500] + "\n... [earlier output truncated] ..."
+        if i < code_cutoff_idx and "[omitted " not in content and "[earlier output truncated]" not in content:
+            lines = content.splitlines()
+            if len(lines) > 10:
+                head = "\n".join(lines[:5])
+                tail = "\n".join(lines[-3:])
+                omitted = len(lines) - 8
+                new_content = f"{head}\n... [omitted {omitted} intermediate lines of earlier output] ...\n{tail}"
+            elif len(content) > 800:
+                new_content = content[:500] + "\n... [earlier output truncated] ..."
 
         if new_content is not None and new_content != content:
             if hasattr(msg, "model_copy"):
@@ -332,22 +180,13 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
 
 def _continuation_prompt(state, client):
     prompt = (
-        "The repair is not submitted. Continue the required workflow: "
-        "write a regression test, fix the issue, and pass each temporary regression "
-        "test before submitting the patch. Report existing test failures; they do "
-        "not block submission. Investigate if regression tests cannot run."
+        "The repair patch is not submitted yet. Continue resolving the issue "
+        "and call generate_patch(paths=[...]) with the files to include in the final patch."
     )
-    if getattr(state, "_last_submit_error", ""):
-        prompt += f" Previous submission attempt failed verification: {state._last_submit_error}."
-    if hasattr(state, "verified") and hasattr(state, "changed_paths"):
-        regression_tests = getattr(state, "regression_tests", set())
-        source_changes = [p.as_posix() for p in state.changed_paths() if p not in regression_tests]
-        if state.verified() and source_changes:
-            prompt += f" Verification is already complete—call generate_patch with paths={source_changes} now."
-        elif hasattr(state, "missing_verification_steps"):
-            missing = state.missing_verification_steps()
-            if missing:
-                prompt += f" Pending verification: {missing}."
+    if hasattr(state, "changed_paths"):
+        changed = [p.as_posix() for p in state.changed_paths()]
+        if changed:
+            prompt += f" Currently modified files: {changed}."
     remaining = getattr(client, "remaining_calls", None)
     if isinstance(remaining, int):
         prompt += f" Remaining API calls: {remaining}."
@@ -364,8 +203,6 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         if rust_version is not None
         else make_tools(Path(repo), **kwargs)
     )
-    if require_reproduction and hasattr(state, "require_reproduction"):
-        state.require_reproduction = True
     try:
         if rust_version is not None:
             info = state.rust_info
@@ -380,7 +217,7 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
             llm = ChatOpenAI(model=model, api_key=api_key, base_url=base_url,
                              temperature=0, timeout=180, max_retries=3, http_client=client)
             import functools
-            compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2)
+            compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, block_size=2)
             if hasattr(llm, "bind_tools") and callable(getattr(llm, "bind_tools")):
                 from langchain_core.runnables import RunnableLambda
                 orig_bind_tools = llm.bind_tools
@@ -400,7 +237,7 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                 except RuntimeError as exc:
                     if "Model API call limit reached" in str(exc):
                         fallback = getattr(state, "patch", "") or (
-                            state.auto_submit_verified_patch() if hasattr(state, "auto_submit_verified_patch") else ""
+                            state.auto_submit_patch() if hasattr(state, "auto_submit_patch") else ""
                         )
                         if fallback:
                             if trace:
@@ -411,30 +248,19 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
                     break
                 if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
                     raise RuntimeError("Agent did not generate a non-empty patch")
-                # Auto-submit if current revision is verified and model stopped without explicit generate_patch
-                if hasattr(state, "auto_submit_verified_patch"):
-                    try:
-                        fallback = state.auto_submit_verified_patch(allow_snapshot_fallback=False)
-                    except TypeError:
-                        fallback = state.auto_submit_verified_patch()
-                    if fallback:
-                        if trace:
-                            trace.record("auto_submit_verified", patch=fallback)
-                        return fallback
 
-                # Detect if model is returning plain text repeatedly without calling tools
                 last_msg = result["messages"][-1]
                 has_tool_call = bool(getattr(last_msg, "tool_calls", None) or (isinstance(last_msg, dict) and last_msg.get("tool_calls")))
                 if not has_tool_call:
                     consecutive_no_tools += 1
                     if consecutive_no_tools >= 4:
-                        if hasattr(state, "auto_submit_verified_patch"):
-                            fallback = state.auto_submit_verified_patch()
+                        if hasattr(state, "auto_submit_patch"):
+                            fallback = state.auto_submit_patch()
                             if fallback:
                                 if trace:
                                     trace.record("auto_submit_on_idle", patch=fallback)
                                 return fallback
-                        raise RuntimeError("Agent stopped calling tools without submitting a verified patch")
+                        raise RuntimeError("Agent stopped calling tools without submitting a patch")
                 else:
                     consecutive_no_tools = 0
 
@@ -448,19 +274,46 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         state.close()
 
 
+def _resolve_api_settings(api=None, model_override=None):
+    if model_override is not None and not model_override.strip():
+        return None, None, None, "--model must not be empty"
+    model_val = model_override.strip() if model_override is not None else None
+    if api is not None:
+        prefix = api.upper()
+        base_url = os.getenv(f"{prefix}_BASE_URL") or None
+        api_key = os.getenv(f"{prefix}_API_KEY")
+        model = model_val or os.getenv(f"{prefix}_MODEL")
+        if not base_url or not api_key or not model:
+            return None, None, None, f"set {prefix}_BASE_URL, {prefix}_API_KEY, and {prefix}_MODEL (or --model) in the project-root .env"
+        return model, api_key, base_url, None
+    api_key = os.getenv("API_KEY")
+    model = model_val or os.getenv("MODEL")
+    if api_key and model:
+        return model, api_key, os.getenv("BASE_URL") or None, None
+    base_url = os.getenv("YJ_BASE_URL") or None
+    api_key = os.getenv("YJ_API_KEY")
+    model = model_val or os.getenv("YJ_MODEL")
+    if base_url and api_key and model:
+        return model, api_key, base_url, None
+    return None, None, None, "set YJ_*/DS_* (or MODEL and API_KEY) in the project-root .env"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="Instance repository checked out at its base commit")
     parser.add_argument("--instance-id", required=True)
     parser.add_argument("--issue-file", required=True, help="UTF-8 file containing the issue description")
     parser.add_argument("--output", required=True, help="Prediction JSONL file (appends one record)")
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"), help="API interface from .env to use (default: yj)")
+    parser.add_argument("--model", help="Override the default model for the selected API interface")
+    parser.add_argument("--api-limit", type=int, default=None, help="Override API_LIMIT from .env (default: 70)")
     parser.add_argument("--max-api-calls", type=int, default=None, help="Optional lower per-task limit for model HTTP calls, including retries")
     parser.add_argument("--trace-dir", help="Directory for per-run JSONL traces (default: traces beside output)")
     repro_group = parser.add_mutually_exclusive_group()
-    repro_group.add_argument("--require-reproduction", dest="require_reproduction", action="store_true", default=True,
-                             help="Require regression test failure before fix (paired pre-fix verification) [default: enabled]")
+    repro_group.add_argument("--require-reproduction", dest="require_reproduction", action="store_true", default=False,
+                             help="Compatibility flag (no-op in generic normal baseline) [default: disabled]")
     repro_group.add_argument("--no-require-reproduction", dest="require_reproduction", action="store_false",
-                             help="Disable pre-fix reproduction check")
+                             help="Compatibility flag (no-op in generic normal baseline)")
     rust = parser.add_mutually_exclusive_group(required=True)
     rust.add_argument("--dataset", help="Benchmark JSONL containing the selected instance")
     rust.add_argument("--rust-toolchain", help="Explicit evaluation toolchain when dataset metadata is unavailable")
@@ -470,17 +323,21 @@ def main():
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     configure_network_proxy()
-    model = os.getenv("MODEL")
-    api_key = os.getenv("API_KEY")
-    if not model or not api_key:
-        parser.error("set MODEL and API_KEY in the project-root .env")
-    raw_limit = os.getenv("API_LIMIT")
-    try:
-        api_limit = 70 if raw_limit is None else int(raw_limit)
-        if api_limit < 1:
-            raise ValueError
-    except ValueError:
-        parser.error("API_LIMIT must be a positive integer")
+    model, api_key, base_url, api_err = _resolve_api_settings(args.api, args.model)
+    if api_err:
+        parser.error(api_err)
+    if args.api_limit is not None:
+        if args.api_limit < 1:
+            parser.error("--api-limit must be a positive integer")
+        api_limit = args.api_limit
+    else:
+        raw_limit = os.getenv("API_LIMIT")
+        try:
+            api_limit = 70 if raw_limit is None else int(raw_limit)
+            if api_limit < 1:
+                raise ValueError
+        except ValueError:
+            parser.error("API_LIMIT must be a positive integer")
     if args.max_api_calls is not None and args.max_api_calls < 1:
         parser.error("--max-api-calls must be positive")
     max_api_calls = min(api_limit, args.max_api_calls) if args.max_api_calls is not None else api_limit
@@ -499,7 +356,7 @@ def main():
     try:
         rust_version = (benchmark_toolchain(args.dataset, args.instance_id, args.harness_root)
                         if args.dataset else args.rust_toolchain)
-        patch = run_agent(repo, issue, model, api_key, os.getenv("BASE_URL") or None,
+        patch = run_agent(repo, issue, model, api_key, base_url,
                           trace=trace, max_api_calls=max_api_calls, rust_version=rust_version,
                           require_reproduction=args.require_reproduction, instance_id=args.instance_id)
         trace.record("patch", patch=patch)

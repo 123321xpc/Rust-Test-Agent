@@ -200,13 +200,15 @@ def test_metrics_count_retries_and_provider_usage(tmp_path):
         httpx.Response(200, json={'usage': {'prompt_tokens': 12, 'completion_tokens': 5, 'total_tokens': 17}}),
         httpx.Response(200, json={'choices': []}),
         httpx.Response(200, json={'usage': {'prompt_tokens': 2, 'completion_tokens': 3, 'total_tokens': None}}),
+        httpx.Response(200, json={'usage': {'input_tokens': 4, 'output_tokens': 6}}),
     ])
     client._transport = httpx.MockTransport(lambda request: next(responses))
     client._mounts = {}
     try:
-        for _ in range(4):
+        for _ in range(5):
             client.post('https://example.test/v1/chat/completions', json={})
     finally:
         client.close()
-    assert recorder.metrics() == {'api_calls': 4, 'input_tokens': 14, 'output_tokens': 8,
-                                  'total_tokens': 22, 'responses_without_usage': 1}
+    assert recorder.metrics() == {'api_calls': 5, 'input_tokens': 18, 'output_tokens': 14,
+                                  'total_tokens': 32, 'responses_without_usage': 1,
+                                  'transient_failures': 1}

@@ -327,6 +327,7 @@ def make_cargo_test_tool(
                     returncode=result.returncode,
                     failed_target=failed_target,
                     compile_errors=compile_errors,
+                    cargo_output=result.stderr,
                 )
             compacted_output, output_truncated = _compact_test_output(test_output, 16000)
             proj_trace = _extract_project_backtrace(test_output)
@@ -365,6 +366,21 @@ def make_cargo_test_tool(
                 "cargo_output": cargo_output,
                 "cargo_output_truncated": cargo_truncated,
             }
+            if result.returncode == 0 and not no_run and executed == 0:
+                payload["warning"] = (
+                    "Zero tests executed (exit_code=0). Check test_target, package, or test_filter "
+                    "if tests were expected to run."
+                )
+            elif (
+                result.returncode == 0
+                and not no_run
+                and executed > 0
+                and (test_target.startswith(("test_regression_", "normal_regression_")) or test_filter.startswith("__test_regression_"))
+            ):
+                payload["hint"] = (
+                    "Regression test passed. Consider running relevant existing unit tests "
+                    "(e.g. cargo_test(lib=True, test_filter='...')) to verify symmetric cases before calling generate_patch(submit=True)."
+                )
             if omitted_diagnostics:
                 payload["diagnostics_omitted"] = omitted_diagnostics
             if on_test_feedback and not no_run:

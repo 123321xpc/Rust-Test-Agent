@@ -66,11 +66,11 @@
       "size": "small"
     },
     {
-      "instance_id": "sharkdp__bat-562",
-      "repo": "sharkdp/bat",
-      "base_commit": "1ce0bc8e0d6364b3dbac07158ad6343f3d5769a3",
-      "image": "rustbench/sharkdp__bat:pr-562-rust-1.34.1-1ce0bc8e0d63-2956d89870",
-      "rust_toolchain": "1.34.1",
+      "instance_id": "dtolnay__async-trait-150",
+      "repo": "dtolnay/async-trait",
+      "base_commit": "2c4cde7ce826c77fe08a8f67d6fdc47b023adf0f",
+      "image": "rustbench/dtolnay__async-trait:pr-150-rust-1.50.0-2c4cde7ce826-b28f64b28a",
+      "rust_toolchain": "1.50.0",
       "patch_changed_lines": 3,
       "size": "small"
     }

@@ -1,8 +1,8 @@
 """Adaptive multi-agent orchestration for Rust repository-level issue resolution.
 
 Architecture:
-  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup, AST-aware rust_trace
-  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test + trace
+  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup
+  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test
   Adaptive Gate (AdaCoder-inspired): Fast Path (simple single-file) vs Planned Path (complex/multi-file/trait)
   Agent 2 (Rust Architect / Suggester): Clean-context root-cause arbitration & Rust contract RepairPlan
   Agent 3 (Rust Fixer): Minimal edit_file loop + compiler/test verification + bounded failure escalation
@@ -17,6 +17,7 @@ import re
 import time
 import difflib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.runnables import RunnableLambda
@@ -36,6 +37,11 @@ RepairCandidate = _repair_candidates.RepairCandidate
 _impact_spec = importlib.util.spec_from_file_location("test_rust_impact", Path(__file__).with_name("rust_impact.py"))
 _rust_impact = importlib.util.module_from_spec(_impact_spec)
 _impact_spec.loader.exec_module(_rust_impact)
+_tools_spec = importlib.util.spec_from_file_location("test_tools_helpers", Path(__file__).with_name("tools.py"))
+_tools_helpers = importlib.util.module_from_spec(_tools_spec)
+_tools_spec.loader.exec_module(_tools_helpers)
+_inline_test_line_ranges = _tools_helpers.inline_test_line_ranges
+_touched_line_hits_inline_tests = _tools_helpers.touched_line_hits_inline_tests
 
 
 class _StageBudgetReached(Exception):
@@ -68,6 +74,129 @@ _TRIVIAL_BACKTICKS = frozenset({
     "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
     "f32", "f64", "bool", "char", "vec", "string", "option", "result",
 })
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    return re.sub(r"```[\s\S]*?```", "", text or "")
+
+
+def _strip_inline_commands(text: str) -> str:
+    """Remove fenced blocks, URLs, and multi-token inline shell commands before scanning CLI flags."""
+    cleaned = _strip_fenced_code_blocks(text or "")
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    return re.sub(
+        r"\x60([^\x60\n]+)\x60",
+        lambda m: (
+            " "
+            if (re.search(r"[\s|;&]", m.group(1).strip()) and not m.group(1).strip().startswith("--"))
+            else m.group(0)
+        ),
+        cleaned,
+    )
+
+
+def _extract_cli_flags(text: str) -> list[str]:
+    """Extract unique CLI long flags (`--flag`) outside fenced blocks, URLs, and shell commands."""
+    cleaned = _strip_inline_commands(text)
+    return list(dict.fromkeys(
+        re.findall(r"(?<![A-Za-z0-9_-])(--[a-z][a-z0-9_-]*)(?!\.\d|[A-Za-z0-9_-])", cleaned)
+    ))
+
+
+def _extract_requirement_checklist(
+    issue: str,
+    new_api_candidates: list[str],
+    companion_api_hints: list[str],
+    expected_result_excerpt: str,
+    cli_flags: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Decompose multi-part issue expectations into up to 5 orthogonal requirement items."""
+    clean_issue = _strip_fenced_code_blocks(issue or "")
+    items: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+
+    def _add_req(kind: str, target: str, summary: str) -> None:
+        clean_sum = " ".join((summary or "").split())[:160]
+        key = (target or clean_sum[:60]).strip().lower()
+        if not key or key in seen_keys or len(items) >= 5:
+            return
+        seen_keys.add(key)
+        items.append({
+            "req_id": f"req_{len(items) + 1}",
+            "kind": kind,
+            "target": target,
+            "summary": clean_sum,
+        })
+
+    for sym in new_api_candidates:
+        _add_req("api", sym, f"Implement and verify requested API `{sym}`")
+
+    if any("is_empty" in h for h in companion_api_hints):
+        _add_req("companion_api", "is_empty", "Check/add companion `is_empty(&self) -> bool` alongside `len`")
+
+    for m in re.finditer(
+        r"(?i)\bboth\s+\x60([A-Za-z_][A-Za-z0-9_:]*)\x60\s*(?:and|&|,)\s*\x60([A-Za-z_][A-Za-z0-9_:]*)\x60"
+        r"|\b(?:add|implement|introduce|expose|provide|support)\s+(?:[A-Za-z0-9_.-]+\s+){0,4}\x60([A-Za-z_][A-Za-z0-9_:]*)\x60\s*(?:and|,)\s*\x60([A-Za-z_][A-Za-z0-9_:]*)\x60",
+        clean_issue,
+    ):
+        for g in (m.group(1), m.group(2), m.group(3), m.group(4)):
+            if g and g.lower() not in _TRIVIAL_BACKTICKS:
+                _add_req("sibling_variant", g, f"Cover paired variant/symbol `{g}`")
+
+    flags = _extract_cli_flags(issue or "") if cli_flags is None else list(cli_flags)
+    if len(flags) >= 2 or (len(flags) == 1 and items):
+        for flag in flags[:3]:
+            _add_req("cli_flag", flag, f"Verify `{flag}` CLI behavior and combinations")
+
+    bullet_src = _strip_fenced_code_blocks(expected_result_excerpt) or clean_issue
+    for raw_line in bullet_src.splitlines():
+        m = re.match(r"^\s*(?:[-*]|\d+[.)]|-\s*\[[ xX]\])\s+(.+)$", raw_line)
+        if not m:
+            continue
+        line = " ".join(m.group(1).split())
+        if not (14 <= len(line) <= 180):
+            continue
+        if not (re.search(r"\b(?:should|must|needs?\s+to|add|support|return|handle|emit|panic|error|reject|allow|preserve|both)\b", line, re.I) or "`" in line or "--" in line):
+            continue
+        target_m = re.search(
+            r"\x60([A-Za-z_][A-Za-z0-9_:]*)\x60|(?<![A-Za-z0-9_-])(--[a-z][a-z0-9_-]*)(?!\.\d|[A-Za-z0-9_-])",
+            _strip_inline_commands(line),
+        )
+        target = (target_m.group(1) or target_m.group(2)) if target_m else ""
+        if target.lower() in _TRIVIAL_BACKTICKS:
+            target = ""
+        _add_req("requirement", target, line)
+
+    return items
+
+
+def _audit_target_proxy_coverage(issue_contract: dict[str, Any], repro_contents: str) -> dict[str, Any]:
+    """Check whether temporary regression tests cover decomposed requirement checklist items."""
+    checklist = issue_contract.get("requirement_checklist") or []
+    text = repro_contents or ""
+    test_fns = re.findall(r"#\[(?:[A-Za-z0-9_]+::)*test\]\s*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+    missing_targets: list[str] = []
+    if len(checklist) >= 2 and text.strip():
+        low_text = text.lower()
+        for item in checklist:
+            tgt = str(item.get("target") or "").strip()
+            if not tgt:
+                continue
+            if tgt.startswith("--"):
+                bare = tgt.lstrip("-")
+                variants = (tgt.lower(), bare.lower(), bare.replace("-", "_").lower())
+            else:
+                leaf = tgt.split("::")[-1]
+                variants = (tgt.lower(), leaf.lower()) if leaf else (tgt.lower(),)
+            if not any(v in low_text for v in variants) and tgt not in missing_targets:
+                missing_targets.append(tgt)
+    return {
+        "checklist_count": len(checklist),
+        "test_fn_count": len(test_fns),
+        "test_fns": test_fns[:8],
+        "missing_targets": missing_targets,
+        "monolithic_warning": bool(len(checklist) >= 2 and text.strip() and len(test_fns) <= 1),
+    }
 
 
 def extract_issue_contract(issue: str) -> dict[str, Any]:
@@ -108,8 +237,10 @@ def extract_issue_contract(issue: str) -> dict[str, Any]:
         or re.search(r"\b(?:add\s+(?:method|function|support|api|a\s+new)|feature\s+request|new\s+method|missing\s+method)\b", low)
     )
     mentions_feature_flag = bool(re.search(r"\b(?:feature\s+flag|cfg\(|--features|--all-features|no_default_features|no_std)\b", low))
+    cli_flags = _extract_cli_flags(issue or "")
     mentions_cli_or_additive_flag = bool(
-        re.search(r"(?:--[a-z0-9][a-z0-9_-]*|\banother\s+(?:argument|flag|option)\b|\bnew\s+(?:flag|option|argument|field)\b)", low)
+        cli_flags
+        or re.search(r"(?:\banother\s+(?:argument|flag|option)\b|\bnew\s+(?:flag|option|argument|field)\b)", low)
     )
     mentions_test_change = bool(
         re.search(r"\b(?:test|tests|snapshot|snapshots|fixture|fixtures|assert(?:ion)?|golden)\b", low)
@@ -142,9 +273,27 @@ def extract_issue_contract(issue: str) -> dict[str, Any]:
             seen_files.add(fpath)
             referenced_files.append(fpath)
 
+    companion_api_hints: list[str] = []
+    if (
+        "len" in new_api_candidates
+        or (mentions_new_api and any(s.split("::")[-1] == "len" for s in requested_symbols))
+    ):
+        companion_api_hints.append(
+            "When adding `pub fn len(&self)`, check whether `pub fn is_empty(&self) -> bool` is also expected by Rust/Clippy conventions."
+        )
+    requirement_checklist = _extract_requirement_checklist(
+        issue or "",
+        new_api_candidates,
+        companion_api_hints,
+        expected_result_excerpt,
+        cli_flags=cli_flags,
+    )
+
     return {
         "requested_symbols": requested_symbols[:20],
         "new_api_candidates": new_api_candidates[:10],
+        "companion_api_hints": companion_api_hints,
+        "requirement_checklist": requirement_checklist,
         "referenced_files": referenced_files[:10],
         "expected_result_excerpt": expected_result_excerpt,
         "signals": {
@@ -245,12 +394,37 @@ def route_after_navigation(blackboard: dict[str, Any], state: Any) -> tuple[str,
 
     effective_files = root_files if root_files else distinct_files
 
+    if bundle.get("needs_architecture_planning"):
+        reasons.append("navigator requested architecture planning")
     if len(chains) > 1 and len(distinct_files) > 1:
         reasons.append(f"multiple candidate fault chains ({len(chains)})")
     if bundle.get("unresolved_chain_ids") and bundle.get("ambiguity_reason"):
         reasons.append("navigator could not distinguish root-cause chains")
     if len(effective_files) > 2:
         reasons.append(f"repair spans {len(effective_files)} candidate files")
+    for sig_key, sig_label in (
+        ("mentions_new_api", "issue requests a new public API"),
+        ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
+        ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
+        ("mentions_macro", "issue involves macros"),
+    ):
+        if signals.get(sig_key):
+            reasons.append(sig_label)
+
+    ckg = getattr(state, "ckg", None)
+    if ckg is not None and effective_files and not reasons:
+        try:
+            surface = _rust_impact.build_impact_surface(ckg, sorted(effective_files))
+            extra_consumers = [
+                p for p in (surface.get("consumer_paths") or [])
+                if p not in effective_files and not _is_non_prod_path(p)
+            ]
+            if len(extra_consumers) >= 2:
+                reasons.append(f"CKG impact surface spans {len(extra_consumers)} external consumer file(s)")
+            elif len(surface.get("trait_impls") or []) >= 2:
+                reasons.append("CKG impact surface spans multiple trait/impl sites")
+        except Exception:
+            pass
 
     # Record downstream workspace dependents on blackboard for Fixer awareness without forcing Planned Path.
     if effective_files and getattr(state, "_find_downstream_workspace_packages", None):
@@ -442,9 +616,17 @@ def build_handoff_card(
             api_items.append(s)
     contract = ", ".join(api_items) or "no named API"
     expected = _compact_handoff_text(issue_contract.get("expected_result_excerpt"), 260) or "follow the issue's stated behavior"
+    checklist = issue_contract.get("requirement_checklist") or []
+    req_suffix = ""
+    if len(checklist) >= 2:
+        req_parts = [f"{r.get('req_id')}:{r.get('target') or _compact_handoff_text(r.get('summary'), 48)}" for r in checklist[:5]]
+        req_suffix = f"; reqs=[{', '.join(req_parts)}]"[:220]
 
     unit_paths = set((active_unit or {}).get("paths") or [])
     raw_invariants = list(plan.get("rust_invariants") or [])
+    for hint in issue_contract.get("companion_api_hints") or []:
+        if hint not in raw_invariants:
+            raw_invariants.append(hint)
     raw_forbidden = list(plan.get("forbidden_edits") or [])
     if unit_paths:
         raw_invariants.sort(key=lambda x: (0 if any(p in str(x) for p in unit_paths) else 1))
@@ -453,6 +635,8 @@ def build_handoff_card(
     forbidden = "; ".join(_compact_handoff_text(x, 160) for x in raw_forbidden[:6]) or "none recorded"
 
     qa = _compact_handoff_text(qa_feedback, 420) or "none"
+    if plan.get("_qa_conflicts"):
+        qa += f"; plan_conflicts_superseded_by_qa={_compact_handoff_text(plan['_qa_conflicts'], 220)}"
     if det_qa:
         qa = _compact_handoff_text(
             f"deterministic_ok={det_qa.get('ok')}; missing={det_qa.get('missing_contract_apis') or []}; "
@@ -468,7 +652,7 @@ def build_handoff_card(
         unit_tag += f" verified_units={verified_units}"
 
     return "\n".join([
-        f"1. Contract: APIs={contract}; expected={expected}",
+        f"1. Contract: APIs={contract}; expected={expected}{req_suffix}",
         f"2. Root: paths={', '.join(root_paths[:6]) or 'relocalize from issue'}; summary={_compact_handoff_text(loc.get('summary'), 260)}",
         f"3. Plan: chain={plan.get('selected_chain_id') or 'direct'}{unit_tag}; edits={' | '.join(edits) or 'minimal root-cause edit'}",
         f"4. Constraints: invariants={_compact_handoff_text(invariants, 520)}; forbidden={_compact_handoff_text(forbidden, 420)}",
@@ -525,6 +709,239 @@ def _invalidate_cached_path(blackboard: dict[str, Any], activity: dict[str, Any]
             continue
         for k in [k for k in store if k == rel_path or k.startswith(rel_path + ":")]:
             store.pop(k, None)
+
+
+_MILESTONE_KEYS = (
+    "m1_reproduced",
+    "m2_compiled",
+    "m3_regression_green",
+    "m4_smoke_passed",
+    "m5_qa_approved",
+)
+
+
+def _compute_milestone_state(
+    state: Any,
+    *,
+    det_qa: dict[str, Any] | None = None,
+    ver_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute deterministic milestone flags and monotonic progress score."""
+    selected = _extract_selected_source_paths(state) if hasattr(state, "changed_paths") else []
+    stuck = state.stuck_status() if hasattr(state, "stuck_status") else {}
+    check_errs = stuck.get("last_check_errors") or []
+    failed_tests = (stuck.get("last_test_failure") or {}).get("failed_tests") or []
+    repro_clean = bool(state.reproduced_cleanly()) if hasattr(state, "reproduced_cleanly") else False
+    repro_any = bool(state.reproduced()) if hasattr(state, "reproduced") else False
+    m1 = repro_clean or (repro_any and not getattr(state, "require_reproduction", True))
+    if det_qa is not None:
+        m2 = bool(selected) and det_qa.get("post_strip_status") != "failed" and not check_errs
+    else:
+        m2 = bool(selected) and not check_errs
+    m3 = bool(state.verified()) if hasattr(state, "verified") else False
+    smoke_passed = sum(
+        1 for item in ((det_qa or {}).get("existing_test_smoke") or [])
+        if isinstance(item, dict) and item.get("status") == "passed"
+    )
+    m4 = bool(det_qa and det_qa.get("ok") and smoke_passed > 0)
+    m5 = bool(ver_payload and str(ver_payload.get("decision") or "").upper() == "APPROVE")
+    flags = {
+        "m1_reproduced": m1,
+        "m2_compiled": m2,
+        "m3_regression_green": m3,
+        "m4_smoke_passed": m4,
+        "m5_qa_approved": m5,
+    }
+    achieved = sum(1 for k in _MILESTONE_KEYS if flags[k])
+    score = (
+        int(m1),
+        int(m2),
+        int(m3),
+        int(m4),
+        int(m5),
+        smoke_passed,
+        -len(check_errs),
+        -len(failed_tests),
+    )
+    return {
+        "flags": flags,
+        "achieved": achieved,
+        "total": len(_MILESTONE_KEYS),
+        "progress_score": list(score),
+    }
+
+
+def _update_milestones_and_kpi(
+    ctx: SimpleNamespace,
+    role: str,
+    *,
+    det_qa: dict[str, Any] | None = None,
+    ver_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Update milestone states and attribute newly achieved milestones to `role`."""
+    cur = _compute_milestone_state(ctx.state, det_qa=det_qa, ver_payload=ver_payload)
+    prev = ctx.blackboard.get("milestones") or {k: False for k in _MILESTONE_KEYS}
+    credits = ctx.blackboard.setdefault("milestone_credits", {})
+    newly_achieved = [k for k in _MILESTONE_KEYS if cur["flags"][k] and not prev.get(k)]
+    if newly_achieved:
+        credits[role] = int(credits.get(role, 0)) + len(newly_achieved)
+        ctx.blackboard.setdefault("milestone_history", []).append({
+            "role": role,
+            "newly_achieved": newly_achieved,
+            "achieved_total": cur["achieved"],
+        })
+    merged = {k: bool(prev.get(k) or cur["flags"][k]) if k == "m1_reproduced" else cur["flags"][k] for k in _MILESTONE_KEYS}
+    ctx.blackboard["milestones"] = merged
+    cur["flags"] = merged
+    cur["achieved"] = sum(1 for k in _MILESTONE_KEYS if merged[k])
+    return cur
+
+
+def _should_prune_suggester_replan(ctx: SimpleNamespace) -> tuple[bool, str]:
+    """Prune redundant -> suggester loops when prior replans produced zero milestone progress."""
+    replan_count = int(ctx.blackboard.get("replan_count") or 0)
+    if replan_count < 1:
+        return False, ""
+    if ctx.candidate_policy and ctx.candidate_policy.data.get("pending"):
+        return False, ""
+    lock_rep = ctx.state.locked_regression_report() if hasattr(ctx.state, "locked_regression_report") else {}
+    if lock_rep.get("violations") and lock_rep.get("locked"):
+        return False, ""
+    last_score = ctx.blackboard.get("last_replan_score")
+    if not last_score:
+        return False, ""
+    cur_score = _compute_milestone_state(ctx.state)["progress_score"]
+    if tuple(cur_score) <= tuple(last_score):
+        zero_runs = int(ctx.blackboard.get("zero_progress_replans") or 0) + 1
+        ctx.blackboard["zero_progress_replans"] = zero_runs
+        if zero_runs >= 1:
+            return True, f"Zero milestone progress after {replan_count} replan(s); pruning redundant architect loop"
+    else:
+        ctx.blackboard["zero_progress_replans"] = 0
+    return False, ""
+
+
+def _append_cognitive_entry(
+    ctx: SimpleNamespace,
+    *,
+    source: str,
+    actual: str,
+    expected: str = "",
+    falsified: str = "",
+) -> None:
+    """Append an Expected vs Actual reflection record for Cognitive Evolving Planning."""
+    ledger = ctx.blackboard.setdefault("cognitive_ledger", [])
+    changed = [p.as_posix() for p in _extract_selected_source_paths(ctx.state)] if hasattr(ctx.state, "changed_paths") else []
+    exp_text = expected or str(ctx.blackboard.get("last_plan_expectation") or "resolve root cause and pass regression/existing tests")
+    entry = {
+        "step": len(ledger) + 1,
+        "source": source,
+        "changed_files": changed[:6],
+        "expected": _compact_handoff_text(exp_text, 160),
+        "actual": _compact_handoff_text(actual, 220),
+        "falsified": _compact_handoff_text(falsified, 160),
+    }
+    ledger.append(entry)
+    if len(ledger) > 6:
+        del ledger[:-6]
+
+
+def _format_cognitive_ledger(blackboard: dict[str, Any], max_entries: int = 5) -> str:
+    ledger = blackboard.get("cognitive_ledger") or []
+    if not ledger:
+        return ""
+    lines = ["Cognitive Evolving Ledger (Expected -> Actual -> Falsified; do NOT repeat falsified attempts):"]
+    for item in ledger[-max_entries:]:
+        files = ",".join(item.get("changed_files") or []) or "none"
+        fal = f" | falsified={item['falsified']}" if item.get("falsified") else ""
+        lines.append(
+            f"- #{item.get('step')} [{item.get('source')}] files=[{files}] "
+            f"expected={item.get('expected')} | actual={item.get('actual')}{fal}"
+        )
+    return "\n".join(lines)
+
+
+def _reconcile_plan_with_qa_rejection(blackboard: dict[str, Any], ver_payload: dict[str, Any] | None) -> None:
+    """Annotate active RepairPlan with QA rejections so handoff card does not conflict with QA feedback."""
+    plan = blackboard.get("repair_plan")
+    if not isinstance(plan, dict) or not ver_payload:
+        return
+    if str(ver_payload.get("plan_consistency") or "").lower() == "conflict":
+        plan["_qa_conflicts"] = list(ver_payload.get("plan_conflicts") or [])[:5]
+    reqs = list(ver_payload.get("missing_requirements") or []) + list(ver_payload.get("objections") or [])
+    if reqs:
+        plan["_qa_required_fixes"] = [str(r)[:180] for r in reqs[:6]]
+
+
+def _refresh_sibling_contracts(ctx: SimpleNamespace) -> str:
+    """Probe sibling trait impls and existing test expectations for requested/localized symbols."""
+    ckg = getattr(ctx.state, "ckg", None)
+    if ckg is None:
+        return ""
+    loc = ctx.blackboard.get("localization") or {}
+    chains = loc.get("candidate_chains") or loc.get("ckg_suggested_chains") or []
+    symbols: list[str] = list(ctx.issue_contract.get("requested_symbols") or []) + list(ctx.issue_contract.get("new_api_candidates") or [])
+    for ch in chains[:3]:
+        for node in (ch.get("nodes") or [])[:4]:
+            sym = node.get("symbol")
+            if sym and sym not in symbols:
+                symbols.append(sym)
+    try:
+        contracts = _rust_impact.collect_sibling_contracts(ckg, symbols[:10])
+        text = _rust_impact.format_sibling_contracts(contracts, max_chars=1200)
+    except Exception:
+        contracts, text = {"sibling_impls": [], "test_contracts": []}, ""
+    ctx.blackboard["sibling_contracts"] = contracts
+    ctx.blackboard["sibling_contracts_text"] = text
+    return text
+
+
+def _emit_coordination_metrics(ctx: SimpleNamespace) -> None:
+    """Emit coordination KPI, duplicate work, and efficiency metrics."""
+    if not ctx.trace:
+        return
+    milestones = _compute_milestone_state(
+        ctx.state,
+        ver_payload=((ctx.blackboard.get("qa_history") or [])[-1] if ctx.blackboard.get("qa_history") else None),
+    )
+    merged = ctx.blackboard.get("milestones") or milestones["flags"]
+    achieved = sum(1 for k in _MILESTONE_KEYS if merged.get(k))
+    total_m = len(_MILESTONE_KEYS)
+    credits = dict(ctx.blackboard.get("milestone_credits") or {})
+    roles = ("navigator", "suggester", "fixer", "verifier")
+    role_kpi = {r: round(int(credits.get(r, 0)) / total_m, 4) for r in roles}
+    overall_kpi = round(sum(role_kpi.values()) / len(roles), 4)
+    coord_stats = ctx.blackboard.get("coord_stats") or {}
+    downstream_reads = int(coord_stats.get("downstream_reads") or 0)
+    duplicate_reads = int(coord_stats.get("duplicate_reads") or 0)
+    dup_rate = round(duplicate_reads / downstream_reads, 4) if downstream_reads > 0 else 0.0
+    total_trans = int(coord_stats.get("total_transitions") or 0)
+    zero_delta_handoffs = int(coord_stats.get("zero_delta_handoffs") or 0)
+    t_metrics = ctx.trace.metrics() if hasattr(ctx.trace, "metrics") else {}
+    t_metrics = t_metrics if isinstance(t_metrics, dict) else {}
+    raw_api = t_metrics.get("api_calls")
+    api_calls = int(raw_api) if isinstance(raw_api, (int, float)) else _client_calls_made(ctx.client)
+    raw_tok = t_metrics.get("total_tokens")
+    total_tokens = int(raw_tok) if isinstance(raw_tok, (int, float)) else 0
+    eff_per_call = round(achieved / max(1, api_calls), 4)
+    eff_per_100k = round((achieved * 100_000) / total_tokens, 4) if total_tokens > 0 else None
+    ctx.trace.record(
+        "coordination_metrics",
+        milestones=merged,
+        milestones_achieved=achieved,
+        milestones_total=total_m,
+        role_kpi=role_kpi,
+        overall_kpi=overall_kpi,
+        downstream_reads=downstream_reads,
+        duplicate_reads=duplicate_reads,
+        duplicate_work_rate=dup_rate,
+        total_transitions=total_trans,
+        zero_delta_handoffs=zero_delta_handoffs,
+        replan_count=int(ctx.blackboard.get("replan_count") or 0),
+        pruned_replans=int(ctx.blackboard.get("pruned_replans") or 0),
+        coordination_efficiency_per_call=eff_per_call,
+        coordination_efficiency_per_100k_tokens=eff_per_100k,
+    )
 
 
 def _prune_unreproduced_regression_targets(state: Any, trace: Any = None) -> list[str]:
@@ -650,42 +1067,6 @@ def _detect_added_inline_tests(patch_text: str) -> list[str]:
                 if tag not in findings:
                     findings.append(tag)
     return findings[:6]
-
-
-def _inline_test_line_ranges(orig_code: str) -> list[tuple[int, int]]:
-    """Return 1-based (start, end) line ranges of #[cfg(test)] or mod tests blocks in orig_code."""
-    lines = orig_code.splitlines()
-    ranges: list[tuple[int, int]] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        stripped = lines[i].strip()
-        is_cfg_test = stripped.startswith("#[cfg(test)]")
-        is_mod_tests = bool(re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests?|[a-z0-9_]*_tests)\b", stripped))
-        if is_cfg_test or is_mod_tests:
-            start_ln = i + 1
-            depth = 0
-            opened = False
-            j = i
-            while j < n:
-                ln_txt = lines[j]
-                if "{" in ln_txt:
-                    depth += ln_txt.count("{")
-                    opened = True
-                if "}" in ln_txt:
-                    depth -= ln_txt.count("}")
-                if opened and depth <= 0:
-                    ranges.append((start_ln, j + 1))
-                    i = j
-                    break
-                if not opened and ";" in ln_txt and j > i:
-                    break
-                j += 1
-            else:
-                if opened:
-                    ranges.append((start_ln, n))
-        i += 1
-    return ranges
 
 
 def _detect_modified_inline_tests(patch_text: str, state: Any = None) -> list[str]:
@@ -846,23 +1227,6 @@ def _patch_hunks(patch_text: str):
         hunk = (path, start, count, has_added, has_removed, touched)
     for item in flush():
         yield item
-
-
-def _touched_line_hits_inline_tests(touched: tuple[tuple[str, int], ...], ranges: list[tuple[int, int]]) -> bool:
-    """Return True when a hunk's real edits touch an inline #[cfg(test)]/mod tests region.
-
-    A removed line inside the region counts as a modification. An insertion counts
-    only when the gap sits inside the region body, i.e. after the `#[cfg(test)]`
-    line and before the closing brace.
-    """
-    for kind, number in touched:
-        for start, end in ranges:
-            if kind == "line":
-                if start <= number <= end:
-                    return True
-            elif start <= number <= end - 1:
-                return True
-    return False
 
 
 def _is_documentation_path(path: str) -> bool:
@@ -1129,8 +1493,8 @@ def _plan_conflict_explanation_has_issue_basis(explanation: str, issue_contract:
     low = text.lower()
     contract = issue_contract or {}
     symbols = [str(item).lower() for item in (contract.get("requested_symbols") or []) if len(str(item)) >= 3]
-    context_words = ("issue", "contract", "requirement", "expected", "behavior")
-    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime")
+    context_words = ("issue", "contract", "requirement", "expected", "behavior", "requested", "spec", "bug", "fix", "panic")
+    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime", "cargo", "probe", "diff", "check", "assert", "pass", "fail", "symbol", "impl")
     has_context = any(token in low for token in context_words)
     has_evidence_or_symbol = any(token in low for token in evidence_words) or any(token in low for token in symbols)
     return has_context and has_evidence_or_symbol
@@ -1251,7 +1615,6 @@ def _clean_and_audit_fallback_patch(state: Any, issue_contract: dict[str, Any], 
             trace.record("stripped_scratch_from_fallback", scratch=sorted(scratch))
     if (
         not patch_text
-        or hygiene.get("trace_leftovers")
         or hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
     ):
@@ -1543,8 +1906,7 @@ def _try_degraded_patch_fallback(
         hygiene = state.diff_hygiene_report(selected)
 
     if (
-        hygiene.get("trace_leftovers")
-        or hygiene.get("added_dbg_lines")
+        hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
         or _detect_benchmark_test_conflicts(patch_text, state, issue_contract)
     ):
@@ -1619,8 +1981,6 @@ def run_deterministic_qa_checks(
         warnings.append(f"Verification incomplete: {state.missing_verification_steps()}")
 
     hygiene = state.diff_hygiene_report(selected)
-    if hygiene.get("trace_leftovers"):
-        warnings.append(f"Temporary trace probes left in files: {hygiene['trace_leftovers']}")
     if hygiene.get("added_dbg_lines"):
         warnings.append(f"Debug macro dbg!(...) left in patch: {hygiene['added_dbg_lines']}")
     if hygiene.get("scratch_files"):
@@ -1671,6 +2031,12 @@ def run_deterministic_qa_checks(
     ]
     static_manifest_tests = _detect_static_manifest_tests(state)
     untested_integration_targets = _find_untested_integration_targets(state, selected)
+    target_proxy_coverage = _audit_target_proxy_coverage(issue_contract, _collect_regression_test_contents(state))
+    if target_proxy_coverage["missing_targets"]:
+        warnings.append(
+            "Target proxy requirement coverage gap: temporary regression test does not reference "
+            f"{target_proxy_coverage['missing_targets']}"
+        )
 
     doctest_status = "not_run"
     if run_doctest_on_shift and hygiene.get("doctest_shifts"):
@@ -1730,6 +2096,7 @@ def run_deterministic_qa_checks(
         "untouched_referenced_files": untouched_ref_files,
         "static_manifest_tests": static_manifest_tests,
         "untested_integration_targets": untested_integration_targets,
+        "target_proxy_coverage": target_proxy_coverage,
         "executed_test_targets": list(getattr(state, "_executed_test_targets", []) or []),
         "doctest_status": doctest_status,
         "comment_doctest_shifts": comment_shifts,
@@ -1888,6 +2255,8 @@ def _make_handoff_tools(
                 "forbidden_edits": forbidden_edits or [],
                 "repair_units": [u.model_dump() for u in repair_units or []],
             }
+            if not payload["ordered_edits"]:
+                return "Error: ordered_edits must include at least one concrete EditStep (empty replans discard unit structure). Submit again."
             try:
                 _repair_units.normalize_units(payload, [])
             except ValueError as exc:
@@ -1922,12 +2291,18 @@ def _make_handoff_tools(
             result = unlock(name=name, reason=reason, approved_by="architect")
             if not result.get("ok"):
                 return "Error: " + str(result.get("error", "unlock refused"))
+            unlock_entry = {
+                "name": result.get("unlocked", name),
+                "path": result.get("path", ""),
+                "reason": result.get("reason", reason),
+            }
+            activity.setdefault("unlocked_regressions", []).append(unlock_entry)
             holder["done"] = True
             holder["payload"] = {
                 "action": "unlock",
-                "unlocked": result.get("unlocked", name),
-                "path": result.get("path", ""),
-                "reason": result.get("reason", reason),
+                "unlocked": unlock_entry["name"],
+                "path": unlock_entry["path"],
+                "reason": unlock_entry["reason"],
             }
             return (
                 "Released the Red-phase lock on '" + str(result.get("unlocked", name)) + "' ("
@@ -1968,9 +2343,34 @@ def _make_handoff_tools(
             holder["payload"] = {"action": "escalate", "reason": reason}
             return "Escalation recorded. Handing off to Architect for replanning."
 
+        @tool
+        def append_repair_unit(
+            unit_id: str,
+            file: str,
+            description: str,
+            symbol: str = "",
+            depends_on: list[str] | None = None,
+            expected_outcome: str = "",
+        ) -> str:
+            """Dynamically append a missing companion/consumer repair unit without wiping verified units."""
+            if not coordinator:
+                return "Error: unit coordinator is unavailable."
+            try:
+                res = coordinator.append_unit(
+                    unit_id=unit_id,
+                    description=description,
+                    paths=[file],
+                    symbol=symbol,
+                    depends_on=depends_on,
+                    expected_outcome=expected_outcome,
+                )
+            except ValueError as exc:
+                return f"Error appending repair unit: {exc}"
+            return json.dumps(res, ensure_ascii=False)
+
         handoffs = [submit_for_qa]
         if coordinator:
-            handoffs.append(complete_repair_unit)
+            handoffs.extend([complete_repair_unit, append_repair_unit])
         if allow_escalate:
             handoffs.append(escalate_for_replan)
             handoffs.extend(candidate_tools)
@@ -1987,7 +2387,11 @@ def _make_handoff_tools(
             plan_conflicts: list[str] | None = None,
             explanation: str = "",
         ) -> str:
-            """Finalize QA audit with decision='APPROVE' or 'REJECT'."""
+            """Finalize QA audit with decision='APPROVE' or 'REJECT'.
+
+            When plan_consistency='conflict', provide non-empty plan_conflicts AND a concrete
+            `explanation` citing the issue requirement/contract and test/compile/runtime/caller evidence.
+            """
             norm = decision.strip().upper()
             if norm not in ("APPROVE", "REJECT"):
                 return "Error: decision must be 'APPROVE' or 'REJECT'."
@@ -2012,7 +2416,7 @@ def _make_handoff_tools(
             ):
                 return (
                     "Error: explain how the conflict relates to the issue contract and concrete test, caller, "
-                    "API, compile, or runtime evidence."
+                    "API, compile, or runtime evidence in the `explanation` parameter (not only `summary`)."
                 )
             if consistency == "not_applicable" and has_plan:
                 return "Error: an Architect plan exists; audit it or select not_checked."
@@ -2053,7 +2457,7 @@ _READ_ONLY_BROWSE_TOOLS = frozenset({
 })
 _PROGRESS_ACTION_TOOLS = frozenset({
     "edit_file", "write_file", "write_regression_test", "revert_file",
-    "checkpoint", "cargo_check", "cargo_test", "rust_trace",
+    "checkpoint", "cargo_check", "cargo_test",
 })
 
 
@@ -2100,6 +2504,15 @@ def _wrap_tools_for_role(
                 p = kwargs.get("path") or (args[0] if args else "")
                 if p and p not in activity["files_read"]:
                     activity["files_read"].append(str(p))
+                if p and blackboard is not None and role in ("suggester", "fixer", "verifier"):
+                    s_l = kwargs.get("start_line")
+                    e_l = kwargs.get("end_line")
+                    r_key = f"{p}:{s_l}-{e_l}" if (s_l is not None or e_l is not None) else str(p)
+                    cached_reads = blackboard.get("shared_read_excerpts") or {}
+                    stats = blackboard.setdefault("coord_stats", {})
+                    stats["downstream_reads"] = int(stats.get("downstream_reads", 0)) + 1
+                    if r_key in cached_reads or str(p) in cached_reads:
+                        stats["duplicate_reads"] = int(stats.get("duplicate_reads", 0)) + 1
             elif __tname == "inspect_rust_neighborhood":
                 tgt = kwargs.get("target") or (args[0] if args else "")
                 if tgt and tgt not in activity["symbols_queried"]:
@@ -2422,6 +2835,8 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
     history = kwargs.pop("history", None)
     slices = idle_slices = 0
     feedback = ""
+    injected_digests: dict[str, str] = {}
+    last_diff_digest = ""
     while True:
         used = max(_client_calls_made(client) - start, slices)
         if total_cap is not None and used >= total_cap:
@@ -2435,17 +2850,35 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
         current_ctx = ""
         if slices:
             paths = (unit["paths"] if unit else [p.as_posix() for p in coordinator.state.changed_paths()])
+            file_blocks: list[str] = []
             for path in paths[:6]:
                 p = coordinator.state.root / path
                 if p.is_file():
-                    current_ctx += f"\n{path}:\n{p.read_text(encoding='utf-8', errors='replace')[:1800]}\n"
+                    raw_txt = p.read_text(encoding="utf-8", errors="replace")
+                    dig = hashlib.sha256(raw_txt.encode("utf-8", errors="replace")).hexdigest()[:16]
+                    if injected_digests.get(path) != dig:
+                        injected_digests[path] = dig
+                        file_blocks.append(f"\n{path}:\n{raw_txt[:1800]}\n")
             diff_scope = set(paths) | (unit.get("touched", set()) if unit else set())
             diff_paths = [p for p in coordinator.state.changed_paths() if p.as_posix() in diff_scope]
             diff = coordinator.state.build_patch(diff_paths) if diff_paths else "(No changes in this unit yet)"
-            current_ctx = ("\nCURRENT source excerpts (supersede earlier pre-loaded excerpts):\n" + current_ctx[:5000]
-                           + "\nCurrent unit diff:\n" + diff[:3500])
+            diff_dig = hashlib.sha256(diff.encode("utf-8", errors="replace")).hexdigest()[:16]
+            diff_block = ""
+            if diff_dig != last_diff_digest:
+                last_diff_digest = diff_dig
+                diff_block = "\nCurrent unit diff:\n" + diff[:3500]
+            if file_blocks or diff_block:
+                current_ctx = (
+                    ("\nCURRENT modified source excerpts (unchanged files omitted):\n" + "".join(file_blocks)[:5000] if file_blocks else "")
+                    + diff_block
+                )
+            else:
+                current_ctx = "\n(Unit files and diff unchanged since previous slice.)"
         policy = getattr(coordinator, "candidate_policy", None)
-        prompt = user_prompt + coordinator.prompt() + (policy.prompt() if policy else "") + current_ctx + "\nCoordinator feedback:\n" + feedback
+        base_prompt = (
+            f"Continue repair on unit '{unit['unit_id']}'.\n" if unit else "Continue final repair and verification.\n"
+        ) if (slices >= 1 and history) else user_prompt
+        prompt = base_prompt + coordinator.prompt() + (policy.prompt() if policy else "") + current_ctx + "\nCoordinator feedback:\n" + feedback
         revision_before = coordinator.state._revision
         done_before = sum(u["status"] in {"verified", "completed_unverified"} for u in coordinator.units)
         payload, outcome = _run_role_agent(
@@ -2491,6 +2924,14 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
         progressed = (coordinator.state._revision != revision_before
                       or sum(u["status"] in {"verified", "completed_unverified"} for u in coordinator.units) > done_before)
         idle_slices = 0 if progressed else idle_slices + 1
+        lock_rep = (
+            coordinator.state.locked_regression_report()
+            if (not progressed and allow_escalate and hasattr(coordinator.state, "locked_regression_report"))
+            else {}
+        )
+        if lock_rep.get("violations") and lock_rep.get("locked") and not coordinator.state.verified():
+            reason = "Fixer hit Red-phase lock violation(s) without progress; inspect locked oracle and release/replan if wrong. " + feedback[-1200:]
+            return {"action": "escalate", "reason": reason}, "unit_blocked"
         if idle_slices >= 2:
             reason = "Two bounded Fixer slices without implementation/verification progress. " + feedback[-1800:]
             if allow_escalate:
@@ -2769,7 +3210,6 @@ def _build_fixer_handoff_features(
             "untouched_referenced_files": list(det_qa.get("untouched_referenced_files") or [])[:8],
             "static_manifest_tests": list(det_qa.get("static_manifest_tests") or [])[:6],
             "untested_integration_targets_count": len(det_qa.get("untested_integration_targets") or []),
-            "trace_leftovers_count": len(hygiene.get("trace_leftovers") or []),
             "added_dbg_lines_count": len(hygiene.get("added_dbg_lines") or []),
             "scratch_files_count": len(hygiene.get("scratch_files") or []),
         }
@@ -3118,6 +3558,15 @@ def _build_verifier_prompt(
     )
     impact_block = _build_impact_prompt_block(state, selected)
     red_lock_block = _build_red_lock_prompt_block(state)
+    sibling_block = (blackboard.get("sibling_contracts_text") or "").strip()
+    sibling_section = f"{sibling_block}\n\n" if sibling_block else ""
+    proxy_cov = det_qa.get("target_proxy_coverage") or {}
+    proxy_cov_line = (
+        f"- Target Proxy Requirement Coverage: checklist={proxy_cov.get('checklist_count', 0)}, "
+        f"test_fns={proxy_cov.get('test_fns') or []}, missing_targets={proxy_cov.get('missing_targets') or []}\n"
+        if (proxy_cov.get("checklist_count", 0) >= 2 or proxy_cov.get("missing_targets"))
+        else ""
+    )
     return (
         f"Issue:\n{issue}\n\n"
         f"Issue Contract:\n{json.dumps(issue_contract, ensure_ascii=False, indent=2)}\n\n"
@@ -3140,10 +3589,12 @@ def _build_verifier_prompt(
         f"- Inline #[cfg(test)]/#[test] Blocks Added to Source Diff: {added_inline_tests or 'None'}\n"
         f"- Pre-existing Inline mod tests Modified in Source Diff: {det_qa.get('modified_inline_tests') or 'None'}\n"
         f"- Missing Requested APIs Heuristic: {missing_apis or 'None detected'}\n"
+        f"{proxy_cov_line}"
         f"- Doctest Line-Shift Warnings (WARNING: cargo test --doc passing does NOT prevent exact line-number PASS_TO_PASS benchmark failures): {hygiene.get('doctest_shifts') or 'None'}\n"
         f"- Doc-test Check Status: {det_qa.get('doctest_status')}\n\n"
         f"Temporary Regression Test(s):\n{repro_contents}\n\n"
         f"{red_lock_block}"
+        f"{sibling_section}"
         f"{impact_block}"
         f"{qa_hist_block}"
         f"Architect RepairPlan (actual plan used by Fixer):\n{json.dumps(verifier_plan, ensure_ascii=False, indent=2) if verifier_plan else 'No Architect plan: fast path.'}\n\n"
@@ -3181,6 +3632,9 @@ def _build_advisor_prompt(
         parts.append(f"Recent Verifier QA Rejections:\n{json.dumps(qa_history[-2:], ensure_ascii=False, indent=2)}")
     if repro_txt:
         parts.append(f"Current Temporary Regression Test(s):\n{repro_txt}")
+    red_lock_txt = _build_red_lock_prompt_block(state)
+    if red_lock_txt:
+        parts.append(red_lock_txt.strip())
     if impact_txt:
         parts.append(f"CKG Impact Surface (producer -> consumer):\n{impact_txt}")
     if shared_ctx:
@@ -3294,14 +3748,39 @@ def run_continuous_repair(
             attempt=consultations, max_continuations=1, handoff_only_tools=adviser_handoffs,
         )
         _merge_activity_into_blackboard(board, adviser_activity)
-        board["repair_plan"] = advice if advice and advice.get("action") == "plan" else None
+        for item in adviser_activity.get("unlocked_regressions") or []:
+            if item not in board["unlocked_regressions"]:
+                board["unlocked_regressions"].append(item)
+                if trace:
+                    trace.record("red_lock_release", **item)
+        if advice and advice.get("action") == "plan":
+            board["repair_plan"] = advice
+        elif advice and advice.get("action") == "unlock":
+            unlock_item = {
+                "name": advice.get("unlocked", ""),
+                "path": advice.get("path", ""),
+                "reason": advice.get("reason", ""),
+            }
+            if unlock_item not in board["unlocked_regressions"]:
+                board["unlocked_regressions"].append(unlock_item)
+                if trace:
+                    trace.record("red_lock_release", **unlock_item)
+        else:
+            board["repair_plan"] = None
         board["escalations"].append({"attempt": consultations, "reason": reason_text})
         state.reset_stuck_counters()
         if trace:
             trace.record("continuous_advice", attempt=consultations, advice=advice)
+        unlocked_note = ""
+        if adviser_activity.get("unlocked_regressions") or (advice and advice.get("action") == "unlock"):
+            unlocked_note = (
+                "\nRED-PHASE LOCK RELEASED BY THE ARCHITECT: you may now update the released "
+                "temporary regression test with write_regression_test and re-verify."
+            )
         return (
             "The advisor reviewed the blocker/disagreement. Your current code and previous conversation are preserved. "
             f"Consider this advice as a proposal and continue the repair:\n{json.dumps(advice or {}, ensure_ascii=False)}"
+            f"{unlocked_note}"
         )
 
     try:
@@ -3314,7 +3793,7 @@ def run_continuous_repair(
             allowed = [
                 "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
                 "inspect_rust_neighborhood", "edit_file", "write_file", "write_regression_test",
-                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
+                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_error_explain",
             ]
             role_tools = _wrap_tools_for_role(
                 "fixer", tools_by_name, allowed, handoffs, holder, state, client,
@@ -3481,6 +3960,963 @@ def run_continuous_repair(
             return result
         raise
 
+
+_NAV_ALLOWED = [
+    "read_file", "read_lines", "search_code", "cargo_workspace",
+    "rust_symbols", "inspect_rust_neighborhood", "write_regression_test",
+    "revert_file", "cargo_test", "cargo_check", "rust_error_explain",
+]
+_SUG_ALLOWED = [
+    "read_file", "read_lines", "search_code",
+    "cargo_workspace", "rust_symbols", "inspect_rust_neighborhood",
+]
+_FIX_ALLOWED = [
+    "read_file", "read_lines", "search_code", "cargo_workspace",
+    "rust_symbols", "inspect_rust_neighborhood", "edit_file", "write_file",
+    "write_regression_test", "revert_file", "checkpoint",
+    "cargo_check", "cargo_test", "rust_error_explain",
+]
+
+
+def _init_orchestration_ctx(
+    repo: Path,
+    issue: str,
+    model: str,
+    api_key: str,
+    base_url: str | None,
+    *,
+    tools: list[Any],
+    state: Any,
+    client: Any,
+    trace: Any,
+    max_api_calls: int | None,
+    compress_fn: Any,
+    create_agent_fn: Any,
+    chat_model_factory: Any,
+    prompts_mod: Any,
+    role_callback_cls: Any,
+    topology: str = "staged",
+) -> SimpleNamespace:
+    tools_by_name = {t.name: t for t in tools}
+    budgets = allocate_stage_budgets(max_api_calls)
+    issue_contract = extract_issue_contract(issue)
+    blackboard: dict[str, Any] = {
+        "issue_contract": issue_contract,
+        "localization": None,
+        "repair_plan": None,
+        "escalations": [],
+        "cognitive_ledger": [],
+        "unlocked_regressions": [],
+        "qa_history": [],
+        "shared_read_excerpts": {},
+        "shared_ckg_notes": {},
+        "sibling_contracts": {"sibling_impls": [], "test_contracts": []},
+        "sibling_contracts_text": "",
+        "milestones": {k: False for k in _MILESTONE_KEYS},
+        "milestone_credits": {},
+        "milestone_history": [],
+        "coord_stats": {"downstream_reads": 0, "duplicate_reads": 0, "total_transitions": 0, "zero_delta_handoffs": 0},
+        "replan_count": 0,
+        "zero_progress_replans": 0,
+        "pruned_replans": 0,
+        "last_replan_score": None,
+        "last_plan_expectation": "",
+        "environment_blocker": False,
+    }
+    qa_repair_loop_enabled = os.getenv("RUSTBENCH_QA_REPAIR_LOOP", "1").strip().lower() not in (
+        "0", "false", "off", "no"
+    )
+    if trace:
+        trace.record(
+            "multi_agent_start",
+            topology=topology,
+            budgets=budgets,
+            issue_contract=issue_contract,
+            qa_repair_loop_enabled=qa_repair_loop_enabled,
+        )
+        _record_handoff_snapshot(
+            trace,
+            stage="issue_contract",
+            from_role="issue",
+            to_role="navigator",
+            attempt=1,
+            features=_build_issue_contract_features(issue, issue_contract),
+            extra={"budgets": budgets, "topology": topology},
+        )
+    return SimpleNamespace(
+        repo=repo,
+        issue=issue,
+        issue_contract=issue_contract,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        tools_by_name=tools_by_name,
+        state=state,
+        client=client,
+        trace=trace,
+        max_api_calls=max_api_calls,
+        budgets=budgets,
+        compress_fn=compress_fn,
+        create_agent_fn=create_agent_fn,
+        chat_model_factory=chat_model_factory,
+        prompts_mod=prompts_mod,
+        role_callback_cls=role_callback_cls,
+        blackboard=blackboard,
+        qa_repair_loop_enabled=qa_repair_loop_enabled,
+        max_escalations=max(2, (max_api_calls or 70) // 25),
+        max_qa_rounds=max(2, (max_api_calls or 70) // 15),
+        escalations_used=0,
+        qa_rounds=0,
+        qa_escalation_sigs=set(),
+        last_qa_feedback="",
+        rescue_attempted=False,
+        route="planned",
+        fix_session_history=None,
+        nav_activity={"files_read": [], "symbols_queried": [], "calls_remaining_in_stage": budgets["navigator_cap"]},
+        candidate_policy=None,
+        unit_coordinator=None,
+        _last_progress_sig=None,
+    )
+
+
+def _record_stage_transition(ctx: SimpleNamespace, from_role: str, to_role: str) -> None:
+    cstats = ctx.blackboard.setdefault("coord_stats", {})
+    cstats["total_transitions"] = int(cstats.get("total_transitions", 0)) + 1
+    if from_role in ("fixer", "verifier") and to_role not in ("submission", "fallback"):
+        try:
+            sig_now = _repair_progress_signature(ctx.state)
+            if ctx._last_progress_sig is not None and sig_now == ctx._last_progress_sig:
+                cstats["zero_delta_handoffs"] = int(cstats.get("zero_delta_handoffs", 0)) + 1
+            ctx._last_progress_sig = sig_now
+        except Exception:
+            pass
+
+
+def _flush_suggester_unlocks(ctx: SimpleNamespace, sug_activity: dict[str, Any], sug_payload: dict[str, Any] | None) -> list[dict[str, str]]:
+    items = list(sug_activity.get("unlocked_regressions") or [])
+    if sug_payload and sug_payload.get("action") == "unlock":
+        items.append({
+            "name": sug_payload.get("unlocked", ""),
+            "path": sug_payload.get("path", ""),
+            "reason": sug_payload.get("reason", ""),
+        })
+    added: list[dict[str, str]] = []
+    existing = ctx.blackboard.setdefault("unlocked_regressions", [])
+    for item in items:
+        if item and item not in existing:
+            existing.append(item)
+            added.append(item)
+            if ctx.trace:
+                ctx.trace.record(
+                    "red_lock_release",
+                    name=item.get("name", ""),
+                    path=item.get("path", ""),
+                    reason=item.get("reason", ""),
+                )
+    return added
+
+
+def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, bool]:
+    nav_handoff, nav_holder = _make_handoff_tools("navigator", ctx.state, ctx.blackboard, ctx.nav_activity)
+    nav_calls_before = _client_calls_made(ctx.client)
+    nav_tools = _wrap_tools_for_role(
+        "navigator", ctx.tools_by_name, _NAV_ALLOWED, nav_handoff, nav_holder,
+        ctx.state, ctx.client, nav_calls_before, ctx.budgets["navigator_cap"], ctx.nav_activity,
+        blackboard=ctx.blackboard,
+    )
+    checklist = ctx.issue_contract.get("requirement_checklist") or []
+    checklist_note = (
+        "\nNotice: requirement_checklist contains multiple distinct sub-requirements. "
+        "Inside your ONE temporary regression test file, write a separate #[test] fn test_req_1_..., #[test] fn test_req_2_... "
+        "covering EVERY checklist requirement rather than only a single happy-path assertion.\n"
+        if len(checklist) >= 2
+        else ""
+    )
+    nav_prompt = (
+        f"Issue:\n{ctx.issue}\n\n"
+        f"Pre-extracted Issue Contract (verify exact names/crates):\n"
+        f"{json.dumps(ctx.issue_contract, ensure_ascii=False, indent=2)}\n\n"
+        f"{checklist_note}"
+        "Locate root cause / candidate fault chains, reproduce the issue with write_regression_test(run_now=True), "
+        "then call submit_localization_bundle."
+    )
+    ctx.state._submit_hint_override = "Call submit_localization_bundle(...) now to hand off findings."
+    nav_payload, nav_outcome = _run_role_agent(
+        "navigator", ctx.prompts_mod.NAVIGATOR_PROMPT, nav_prompt, nav_tools, nav_holder,
+        model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+        compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+        chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+        stage_cap=ctx.budgets["navigator_cap"], reserve_floor=ctx.budgets["verifier_reserve"],
+        max_continuations=1,
+        continuation_fn=lambda r, s: "Wrap up exploration and call submit_localization_bundle(...) immediately.",
+        handoff_only_tools=nav_handoff,
+        wrapup_prompt="Exploration budget reached. Call submit_localization_bundle(...) IMMEDIATELY using the files and test outputs already observed.",
+    )
+    ctx.state._submit_hint_override = None
+    _merge_activity_into_blackboard(ctx.blackboard, ctx.nav_activity)
+    _prune_unreproduced_regression_targets(ctx.state, trace=ctx.trace)
+
+    # Roll half of unused Navigator stage calls into Fixer budget
+    nav_used = max(0, _client_calls_made(ctx.client) - nav_calls_before)
+    nav_cap = ctx.budgets.get("navigator_cap")
+    if nav_cap is not None and ctx.budgets.get("fixer_attempt_cap") is not None:
+        unused_nav = max(0, int(nav_cap) - nav_used)
+        rollover = unused_nav // 2
+        if rollover > 0:
+            ctx.budgets["fixer_attempt_cap"] = int(ctx.budgets["fixer_attempt_cap"]) + rollover
+            if ctx.trace:
+                ctx.trace.record(
+                    "budget_rollover",
+                    from_role="navigator",
+                    to_role="fixer",
+                    nav_used=nav_used,
+                    nav_cap=int(nav_cap),
+                    rollover=rollover,
+                    fixer_attempt_cap=ctx.budgets["fixer_attempt_cap"],
+                )
+
+    repro_status, repro_meta = _format_repro_status_for_blackboard(ctx.state)
+    nav_auto_synthesized = nav_payload is None
+    if nav_payload is None:
+        fallback_chains = []
+        if getattr(ctx.state, "ckg", None) is not None:
+            try:
+                fallback_chains = ctx.state.ckg.build_fault_chains(
+                    ctx.issue_contract.get("requested_symbols", []),
+                    seed_files=ctx.nav_activity["files_read"][:4],
+                    max_chains=3,
+                )
+            except Exception:
+                fallback_chains = []
+        nav_payload = {
+            "summary": f"Navigator budget finished. Files inspected: {ctx.nav_activity['files_read'][:6]}.",
+            "candidate_chains": fallback_chains,
+            "reproduction_status": repro_status,
+            "requested_apis": ctx.issue_contract.get("requested_symbols", []),
+            "needs_architecture_planning": True,
+            "notes": "Auto-synthesized bundle after stage cap.",
+        }
+    else:
+        if repro_status != "not_reproduced":
+            nav_payload["reproduction_status"] = repro_status
+        if len(nav_payload.get("candidate_chains", [])) <= 1 and getattr(ctx.state, "ckg", None) is not None and nav_payload.get("needs_architecture_planning"):
+            try:
+                seeds = list(ctx.issue_contract.get("requested_symbols", [])) + ctx.nav_activity["symbols_queried"][:3]
+                extra = ctx.state.ckg.build_fault_chains(seeds, seed_files=ctx.nav_activity["files_read"][:3], max_chains=3)
+                if len(extra) > len(nav_payload.get("candidate_chains", [])):
+                    nav_payload.setdefault("ckg_suggested_chains", extra)
+            except Exception:
+                pass
+    nav_payload["repro_meta"] = repro_meta
+    ctx.blackboard["localization"] = nav_payload
+    _refresh_sibling_contracts(ctx)
+    _update_milestones_and_kpi(ctx, "navigator")
+
+    ctx.state.save_checkpoint("pre_fix")
+    route, route_reasons = route_after_navigation(ctx.blackboard, ctx.state)
+    ctx.route = route
+    ctx.fix_session_history = nav_holder.get("history") if route == "fast" else None
+
+    ctx.candidate_policy = _repair_candidates.CandidatePolicy(ctx.blackboard, ctx.state, ctx.trace)
+    if nav_payload.get("unresolved_chain_ids"):
+        ctx.candidate_policy.ambiguity(nav_payload["unresolved_chain_ids"], nav_payload.get("ambiguity_reason", ""))
+    ctx.unit_coordinator = _repair_units.RepairUnitCoordinator(
+        ctx.state, ctx.tools_by_name, ctx.blackboard, ctx.trace, candidate_policy=ctx.candidate_policy,
+    )
+
+    if ctx.trace:
+        ctx.trace.record("adaptive_route", route=route, reasons=route_reasons)
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="navigator_handoff",
+            from_role="navigator",
+            to_role=("suggester" if route == "planned" else "fixer"),
+            attempt=1,
+            features=_build_localization_features(
+                ctx.blackboard,
+                ctx.state,
+                repro_contents=_collect_regression_test_contents(ctx.state, max_chars=2000),
+            ),
+            extra={
+                "outcome": nav_outcome,
+                "auto_synthesized": nav_auto_synthesized,
+                "route": route,
+                "route_reasons": route_reasons,
+                "files_read_count": len(ctx.nav_activity.get("files_read", [])),
+                "symbols_queried_count": len(ctx.nav_activity.get("symbols_queried", [])),
+            },
+        )
+    return route, route_reasons, nav_outcome, nav_auto_synthesized
+
+
+def _exec_navigator_relocalize(
+    ctx: SimpleNamespace,
+    reason: str,
+    *,
+    attempt: int,
+    allow_fast_return: bool = False,
+) -> tuple[str, list[str], str, Any]:
+    nav_handoff2, nav_holder2 = _make_handoff_tools("navigator", ctx.state, ctx.blackboard, ctx.nav_activity)
+    nav_tools2 = _wrap_tools_for_role(
+        "navigator", ctx.tools_by_name, _NAV_ALLOWED, nav_handoff2, nav_holder2,
+        ctx.state, ctx.client, _client_calls_made(ctx.client), max(4, ctx.budgets["navigator_cap"] // 2), ctx.nav_activity,
+        blackboard=ctx.blackboard,
+    )
+    reloc_prompt = (
+        f"Issue:\n{ctx.issue}\n\nPrevious localization was insufficient: {reason}.\n"
+        "Search more broadly for the true implementation/trait/module and call submit_localization_bundle."
+    )
+    new_nav, reloc_nav_outcome = _run_role_agent(
+        "navigator", ctx.prompts_mod.NAVIGATOR_PROMPT, reloc_prompt, nav_tools2, nav_holder2,
+        model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+        compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+        chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+        stage_cap=max(4, ctx.budgets["navigator_cap"] // 2), reserve_floor=ctx.budgets["verifier_reserve"],
+        attempt=attempt, max_continuations=1,
+        handoff_only_tools=nav_handoff2,
+        wrapup_prompt="Relocalization budget reached. Call submit_localization_bundle(...) IMMEDIATELY.",
+    )
+    _merge_activity_into_blackboard(ctx.blackboard, ctx.nav_activity)
+    if new_nav:
+        reloc_status, reloc_meta = _format_repro_status_for_blackboard(ctx.state)
+        if reloc_status != "not_reproduced":
+            new_nav["reproduction_status"] = reloc_status
+        new_nav["repro_meta"] = reloc_meta
+        ctx.blackboard["localization"] = new_nav
+    reloc_route, reloc_reasons = route_after_navigation(ctx.blackboard, ctx.state)
+    to_role = "fixer" if (allow_fast_return and reloc_route == "fast" and ctx.blackboard.get("repair_plan") is None) else "suggester"
+    _refresh_sibling_contracts(ctx)
+    _update_milestones_and_kpi(ctx, "navigator")
+    if ctx.trace:
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="navigator_handoff",
+            from_role="navigator",
+            to_role=to_role,
+            attempt=attempt,
+            features=_build_localization_features(
+                ctx.blackboard,
+                ctx.state,
+                repro_contents=_collect_regression_test_contents(ctx.state, max_chars=2000),
+            ),
+            extra={
+                "outcome": reloc_nav_outcome,
+                "auto_synthesized": new_nav is None,
+                "relocalized": True,
+                "route": reloc_route,
+                "route_reasons": reloc_reasons,
+                "files_read_count": len(ctx.nav_activity.get("files_read", [])),
+                "symbols_queried_count": len(ctx.nav_activity.get("symbols_queried", [])),
+            },
+        )
+    ctx.candidate_policy.relocalized()
+    return to_role, reloc_reasons, reloc_nav_outcome, new_nav
+
+
+def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, dict[str, Any] | None, str, dict[str, int]]:
+    sug_activity: dict[str, Any] = {"files_read": [], "symbols_queried": [], "candidate_policy": ctx.candidate_policy}
+    sug_handoff, sug_holder = _make_handoff_tools("suggester", ctx.state, ctx.blackboard, sug_activity)
+    sug_tools = _wrap_tools_for_role(
+        "suggester", ctx.tools_by_name, _SUG_ALLOWED, sug_handoff, sug_holder,
+        ctx.state, ctx.client, _client_calls_made(ctx.client), ctx.budgets["suggester_cap"], sug_activity,
+        blackboard=ctx.blackboard,
+    )
+    chains_for_ctx = ctx.blackboard["localization"].get("candidate_chains") or ctx.blackboard["localization"].get("ckg_suggested_chains") or []
+    shared_ctx = _build_shared_context(ctx.state.root, ctx.blackboard, chains_for_ctx, max_chars=10000)
+    repro_tests_txt = _collect_regression_test_contents(ctx.state, max_chars=2000)
+    red_lock_txt = _build_red_lock_prompt_block(ctx.state)
+    sibling_txt = (ctx.blackboard.get("sibling_contracts_text") or "").strip()
+    sibling_block = f"{sibling_txt}\n\n" if sibling_txt else ""
+    ledger_txt = _format_cognitive_ledger(ctx.blackboard)
+    escalation_ctx = ""
+    if ctx.blackboard["escalations"] or ledger_txt:
+        latest_esc_obj = ctx.blackboard["escalations"][-1] if ctx.blackboard["escalations"] else {}
+        latest_esc = (
+            "\nLatest Escalation Detail:\n"
+            + json.dumps(latest_esc_obj, ensure_ascii=False, indent=2)
+            if ctx.blackboard["escalations"] else ""
+        )
+        grad_block = ""
+        coord = getattr(ctx, "unit_coordinator", None)
+        if coord and getattr(coord, "units", None):
+            last_qa = (ctx.blackboard.get("qa_history") or [{}])[-1]
+            grad = coord.textual_gradient_summary(
+                last_error=str(latest_esc_obj.get("reason") or ctx.last_qa_feedback or ""),
+                missing_requirements=list(last_qa.get("missing_requirements") or []),
+                candidate_paths=list(ctx.issue_contract.get("referenced_files") or []),
+            )
+            grad_block = (
+                "\nTextual Gradient Summary (freeze/keep verified units, revise only faulty units, add unplanned files as new units):\n"
+                + json.dumps(grad, ensure_ascii=False, indent=2)
+            )
+        escalation_ctx = (
+            "\n\nPREVIOUS ATTEMPT FAILED & ESCALATED:\n"
+            + (f"{ledger_txt}\n" if ledger_txt else "")
+            + latest_esc
+            + grad_block
+            + "\nDistinguish wrong implementation/test oracle/environment from evidence refuting the mechanism. "
+            "Keep frozen_verified_units intact with stable IDs unless directly refuted; focus revisions on faulty_units and add any missing_subtask_candidates as new repair_units. "
+            "If a candidate comparison is pending, compare brief mechanisms first; keep the current mechanism unless contract/execution evidence warrants another. "
+            "Otherwise, if failure_route is navigator, call request_relocalization and re-map the fault before planning; if failure_route is architect, revise the trait/type/API plan."
+        )
+    sug_issue_contract_json = json.dumps(ctx.issue_contract, ensure_ascii=False, indent=2)
+    sug_loc_json = json.dumps(ctx.blackboard["localization"], ensure_ascii=False, indent=2)
+    sug_prompt = (
+        f"Issue:\n{ctx.issue}\n\n"
+        f"Issue Contract:\n{sug_issue_contract_json}\n\n"
+        f"LocalizationBundle:\n{sug_loc_json}\n\n"
+        f"Current Temporary Regression Test(s):\n{repro_tests_txt}\n\n"
+        f"{red_lock_txt}"
+        f"{sibling_block}"
+        f"Pre-loaded Source Excerpts & CKG Context:\n{shared_ctx}"
+        f"{escalation_ctx}\n\n"
+        "Use the pre-loaded excerpts first (at most 1-3 extra read/search calls if needed), verify Rust contracts & Expected Result, and call submit_repair_plan."
+        " Provide repair_units with edit_indices, prerequisites, and targeted verification. "
+        "Retain stable IDs and definitions of already verified units unless evidence requires changing them.\n"
+        + json.dumps(ctx.blackboard.get("repair_units", {}), ensure_ascii=False)
+        + ctx.candidate_policy.prompt()
+    )
+    sug_prompt_breakdown = {
+        "issue_chars": len(ctx.issue or ""),
+        "issue_contract_chars": len(sug_issue_contract_json),
+        "localization_chars": len(sug_loc_json),
+        "repro_tests_chars": len(repro_tests_txt),
+        "shared_ctx_chars": len(shared_ctx),
+        "escalation_chars": len(escalation_ctx),
+        "total_chars": len(sug_prompt),
+    }
+    ctx.state._submit_hint_override = "Call submit_repair_plan(...) now."
+    sug_payload, sug_outcome = _run_role_agent(
+        "suggester", ctx.prompts_mod.SUGGESTER_PROMPT, sug_prompt, sug_tools, sug_holder,
+        model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+        compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+        chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+        stage_cap=ctx.budgets["suggester_cap"], reserve_floor=ctx.budgets["verifier_reserve"],
+        attempt=attempt, max_continuations=1,
+        continuation_fn=lambda r, s: "Call submit_repair_plan(...) immediately with your best plan.",
+        handoff_only_tools=sug_handoff,
+        wrapup_prompt="Planning exploration complete. Call submit_repair_plan(...) (or request_relocalization if chains are wrong) IMMEDIATELY with concrete file/symbol/line edits.",
+    )
+    ctx.state._submit_hint_override = None
+    _merge_activity_into_blackboard(ctx.blackboard, sug_activity)
+    _flush_suggester_unlocks(ctx, sug_activity, sug_payload)
+
+    if sug_payload and sug_payload.get("action") == "unlock":
+        rem_after_unlock = _client_remaining_calls(ctx.client)
+        if rem_after_unlock is None or rem_after_unlock > ctx.budgets["verifier_reserve"] + 1:
+            sug_holder.update(done=False, payload=None)
+            plan_followup = (
+                "The Red-phase regression lock has been released. Now call submit_repair_plan(...) "
+                "IMMEDIATELY with concrete ordered_edits and the corrected test oracle expectation for Fixer."
+            )
+            sug_payload2, sug_outcome2 = _run_role_agent(
+                "suggester", ctx.prompts_mod.SUGGESTER_PROMPT, plan_followup, sug_tools, sug_holder,
+                model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+                compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+                chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+                stage_cap=max(2, ctx.budgets["suggester_cap"] // 2), reserve_floor=ctx.budgets["verifier_reserve"],
+                history=sug_holder.get("history"), attempt=attempt, max_continuations=0,
+                handoff_only_tools=sug_handoff,
+                wrapup_prompt="Call submit_repair_plan(...) IMMEDIATELY after unlocking the regression test.",
+            )
+            _merge_activity_into_blackboard(ctx.blackboard, sug_activity)
+            _flush_suggester_unlocks(ctx, sug_activity, sug_payload2)
+            if sug_payload2:
+                sug_payload = sug_payload2
+                sug_outcome = sug_outcome2
+
+    if sug_payload and sug_payload.get("action") == "relocalize" and ctx.escalations_used < ctx.max_escalations:
+        ctx.escalations_used += 1
+        if ctx.trace:
+            ctx.trace.record("escalation", from_role="suggester", to_role="navigator", reason=sug_payload.get("reason", ""))
+            _record_handoff_snapshot(
+                ctx.trace,
+                stage="suggester_handoff",
+                from_role="suggester",
+                to_role="navigator",
+                attempt=ctx.escalations_used,
+                features=_build_repair_plan_features(ctx.blackboard.get("repair_plan"), ctx.blackboard["escalations"]),
+                extra={
+                    "action": "relocalize",
+                    "outcome": sug_outcome,
+                    "relocalize_reason": str(sug_payload.get("reason", ""))[:240],
+                    "sug_prompt_breakdown": sug_prompt_breakdown,
+                },
+            )
+        return "relocalize", sug_payload, sug_outcome, sug_prompt_breakdown
+
+    if sug_payload and sug_payload.get("action") == "plan":
+        ctx.blackboard["repair_plan"] = sug_payload
+        ctx.fix_session_history = None
+    elif sug_payload and sug_payload.get("action") == "unlock":
+        pass
+    else:
+        prior_plan = ctx.candidate_policy.fallback_plan(ctx.blackboard.get("repair_plan"))
+        synth_edits = _synthesize_ordered_edits_from_chains(chains_for_ctx)
+        ctx.blackboard["repair_plan"] = prior_plan or {
+            "action": "plan",
+            "selected_chain_id": (chains_for_ctx[0].get("chain_id", "C1") if chains_for_ctx else "C1"),
+            "arbitration_rationale": (
+                "Architect budget ended before submitting a plan; start directly from these candidate chain files/symbols "
+                "and apply minimal edits within 3-5 steps instead of re-reading the repository."
+            ),
+            "ordered_edits": synth_edits,
+            "rust_invariants": ["Keep edits minimal and preserve unrelated doctest line counts."],
+            "api_checklist": ctx.issue_contract.get("new_api_candidates", []),
+            "_synthesized": True,
+        }
+        ctx.fix_session_history = None
+    plan_now = ctx.blackboard.get("repair_plan") or {}
+    if attempt > 1 or ctx.blackboard.get("escalations"):
+        ctx.blackboard["replan_count"] = int(ctx.blackboard.get("replan_count") or 0) + 1
+        ctx.blackboard["last_replan_score"] = _compute_milestone_state(ctx.state)["progress_score"]
+    ctx.blackboard["last_plan_expectation"] = _compact_handoff_text(
+        plan_now.get("arbitration_rationale") or ", ".join(str(e.get("description") or "") for e in (plan_now.get("ordered_edits") or [])[:3]),
+        180,
+    )
+    _update_milestones_and_kpi(ctx, "suggester")
+    if ctx.trace:
+        plan_now = ctx.blackboard.get("repair_plan") or {}
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="suggester_handoff",
+            from_role="suggester",
+            to_role="fixer",
+            attempt=attempt,
+            features=_build_repair_plan_features(ctx.blackboard.get("repair_plan"), ctx.blackboard["escalations"]),
+            extra={
+                "action": "synthesized_fallback" if plan_now.get("_synthesized") else (sug_payload or {}).get("action", "plan"),
+                "outcome": sug_outcome,
+                "synthesized": bool(plan_now.get("_synthesized")),
+                "sug_prompt_breakdown": sug_prompt_breakdown,
+            },
+        )
+    return "plan_ready", sug_payload, sug_outcome, sug_prompt_breakdown
+
+
+def _exec_fixer_step(ctx: SimpleNamespace, *, attempt: int) -> dict[str, Any]:
+    rem_for_fixer = _client_remaining_calls(ctx.client)
+    in_rescue_pass = bool(
+        rem_for_fixer is not None
+        and rem_for_fixer <= ctx.budgets["verifier_reserve"]
+        and not ctx.rescue_attempted
+        and rem_for_fixer >= 2
+        and _extract_selected_source_paths(ctx.state)
+    )
+    if in_rescue_pass:
+        ctx.rescue_attempted = True
+        fixer_cap_now = max(1, rem_for_fixer - 1)
+        fixer_reserve_now = 0
+        fixer_continuations = 0
+        allow_escalate_now = False
+    else:
+        fixer_cap_now = ctx.budgets["fixer_attempt_cap"]
+        fixer_reserve_now = ctx.budgets["verifier_reserve"]
+        fixer_continuations = 2
+        allow_escalate_now = (ctx.escalations_used < ctx.max_escalations) and not ctx.blackboard.get("environment_blocker")
+
+    unit_paths = [e["file"] for e in _synthesize_ordered_edits_from_chains(
+        ctx.blackboard["localization"].get("candidate_chains") or ctx.blackboard["localization"].get("ckg_suggested_chains") or []
+    ) if e.get("file")]
+    if ctx.escalations_used:
+        ctx.state.reset_stuck_counters()
+    ctx.unit_coordinator.configure(ctx.blackboard.get("repair_plan"), unit_paths)
+    ctx.unit_coordinator.select()
+    fix_activity: dict[str, Any] = {
+        "files_read": [],
+        "symbols_queried": [],
+        "unit_coordinator": ctx.unit_coordinator,
+        "candidate_policy": ctx.candidate_policy,
+    }
+    fix_handoff, fix_holder = _make_handoff_tools(
+        "fixer", ctx.state, ctx.blackboard, fix_activity, allow_escalate=allow_escalate_now,
+    )
+    if "generate_patch" in ctx.tools_by_name:
+        gp_orig = ctx.tools_by_name["generate_patch"].func
+
+        @tool
+        def preview_patch() -> str:
+            """Preview current diff without submitting. Call submit_for_qa when verification passes."""
+            return gp_orig(paths=None, submit=False)
+
+        extra_fixer_tools = fix_handoff + [preview_patch]
+    else:
+        extra_fixer_tools = fix_handoff
+
+    fix_tools = _wrap_tools_for_role(
+        "fixer", ctx.tools_by_name, _FIX_ALLOWED, extra_fixer_tools, fix_holder,
+        ctx.state, ctx.client, _client_calls_made(ctx.client), fixer_cap_now, fix_activity,
+        auto_escalate_on_stuck=allow_escalate_now,
+        blackboard=ctx.blackboard,
+    )
+    chains_for_fix = ctx.blackboard["localization"].get("candidate_chains") or ctx.blackboard["localization"].get("ckg_suggested_chains") or []
+    shared_fix_ctx = _build_shared_context(ctx.state.root, ctx.blackboard, chains_for_fix, max_chars=1800)
+    repro_fix_txt = _collect_regression_test_contents(ctx.state, max_chars=1800)
+    impact_paths = _extract_selected_source_paths(ctx.state)
+    if not impact_paths:
+        impact_paths = list(dict.fromkeys(
+            Path(n["path"])
+            for ch in chains_for_fix
+            for n in (ch.get("nodes") or [])
+            if n.get("path") and not _is_non_prod_path(n["path"])
+        ))[:4]
+    impact_fix_txt = _build_impact_prompt_block(ctx.state, impact_paths)[:1800]
+    if impact_fix_txt and not impact_fix_txt.endswith("\n\n"):
+        impact_fix_txt = impact_fix_txt.rstrip() + "\n\n"
+    selected_for_diff = _extract_selected_source_paths(ctx.state)
+    cur_diff_txt = ""
+    if selected_for_diff and (ctx.last_qa_feedback or ctx.blackboard.get("escalations")):
+        raw_cur_diff = ctx.state.build_patch(selected_for_diff)
+        if raw_cur_diff:
+            cur_diff_txt = f"Current Candidate Unified Diff (latest edits):\n{raw_cur_diff[:4500]}\n\n"
+    failure_route = str(ctx.blackboard.get("last_failure_route") or "")
+    handoff_card = build_handoff_card(
+        ctx.issue_contract,
+        ctx.blackboard,
+        qa_feedback=ctx.last_qa_feedback,
+        failure_route=failure_route,
+        active_unit=ctx.unit_coordinator._unit(ctx.unit_coordinator.active) if ctx.unit_coordinator.active else None,
+    )
+    downstream_note = (
+        f"Workspace Dependents (verify post-strip compilation): {ctx.blackboard['downstream_dependents']}\n\n"
+        if ctx.blackboard.get("downstream_dependents")
+        else ""
+    )
+    qa_block = f"PREVIOUS QA OBJECTIONS (MUST FIX):\n{ctx.last_qa_feedback}\n\n" if ctx.last_qa_feedback else ""
+    sibling_fix = (ctx.blackboard.get("sibling_contracts_text") or "").strip()[:1000]
+    sibling_fix_block = f"{sibling_fix}\n\n" if sibling_fix else ""
+    ledger_fix = _format_cognitive_ledger(ctx.blackboard, max_entries=3) if (ctx.blackboard.get("escalations") or ctx.last_qa_feedback) else ""
+    ledger_fix_block = f"{ledger_fix[:700]}\n\n" if ledger_fix else ""
+    unlocked = ctx.blackboard.get("unlocked_regressions") or []
+    unlock_block = ""
+    if unlocked:
+        lines = [
+            "RED-PHASE LOCK RELEASED BY THE ARCHITECT (you may correct these tests):",
+        ]
+        for item in unlocked[-3:]:
+            lines.append(
+                f"  * {item.get('name')} ({item.get('path')}): {item.get('reason')}"
+            )
+        lines.append(
+            "Correct the released test with write_regression_test and re-verify the Red->Green pair."
+        )
+        unlock_block = "\n".join(lines) + "\n\n"
+    last_test_failure = ctx.state.stuck_status().get("last_test_failure") or {}
+    observed_failures = list(getattr(ctx.state, "_existing_test_failures", []) or [])
+    failure_evidence = (
+        "Observed Cargo test failure evidence (check observed_revision; a later edit may have changed it):\n"
+        + json.dumps({"current_revision": getattr(ctx.state, "_revision", None),
+                      "last_failure": last_test_failure,
+                      "existing_test_failures": observed_failures}, ensure_ascii=False, indent=2)
+        + "\n\n"
+    ) if last_test_failure or observed_failures else ""
+    esc_note = (
+        "If stuck, call escalate_for_replan WITHOUT restoring pre_fix; Coordinator preserves verified unrelated units; follow the handoff card's failure_route."
+        if allow_escalate_now
+        else "Final repair phase (escalation limit reached): resolve remaining test/edit issues directly and call submit_for_qa."
+    )
+    fix_prompt = (
+        f"Issue:\n{ctx.issue}\n\n"
+        f"Repair Handoff Card (compact; use targeted reads for missing details):\n{handoff_card}\n\n"
+        f"Temporary Regression Test(s):\n{repro_fix_txt}\n\n"
+        f"Targeted Source Excerpts:\n{shared_fix_ctx}\n\n"
+        f"{impact_fix_txt}"
+        f"{sibling_fix_block}"
+        f"{cur_diff_txt}"
+        f"{downstream_note}"
+        f"{unlock_block}"
+        f"{ledger_fix_block}"
+        f"{qa_block}"
+        f"{failure_evidence}"
+        "Implement the fix with minimal edits, pass all temporary regression tests + relevant existing tests, "
+        f"and call submit_for_qa(summary=...). {esc_note}"
+    )
+    fix_prompt_breakdown = {
+        "issue_chars": len(ctx.issue or ""),
+        "handoff_card_chars": len(handoff_card),
+        "repro_tests_chars": len(repro_fix_txt),
+        "shared_ctx_chars": len(shared_fix_ctx),
+        "impact_chars": len(impact_fix_txt),
+        "cur_diff_chars": len(cur_diff_txt),
+        "downstream_chars": len(downstream_note),
+        "qa_feedback_chars": len(qa_block),
+        "test_failure_evidence_chars": len(failure_evidence),
+        "total_chars": len(fix_prompt),
+    }
+    ctx.state._submit_hint_override = _fixer_budget_hint
+    fix_payload, fix_outcome = _run_scheduled_fixer(
+        ctx.prompts_mod.FIXER_PROMPT, fix_prompt, fix_tools, fix_holder,
+        coordinator=ctx.unit_coordinator, allow_escalate=allow_escalate_now,
+        model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+        compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+        chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+        stage_cap=fixer_cap_now, reserve_floor=fixer_reserve_now,
+        history=ctx.fix_session_history,
+        attempt=attempt, max_continuations=fixer_continuations,
+        continuation_fn=lambda r, s: (
+            "Verification passed - call submit_for_qa(summary=...) now!"
+            if ctx.state.verified() and _extract_selected_source_paths(ctx.state)
+            else f"Continue repair and verification ({ctx.state.missing_verification_steps()}), then call submit_for_qa."
+        ),
+    )
+    ctx.fix_session_history = fix_holder.get("history") or ctx.fix_session_history
+    ctx.state._submit_hint_override = None
+    _merge_activity_into_blackboard(ctx.blackboard, fix_activity)
+    return {
+        "fix_payload": fix_payload,
+        "fix_outcome": fix_outcome,
+        "in_rescue_pass": in_rescue_pass,
+        "fix_prompt_breakdown": fix_prompt_breakdown,
+    }
+
+
+def _record_escalation(
+    ctx: SimpleNamespace,
+    *,
+    from_role: str,
+    to_role: str,
+    failure_route: str,
+    reason: str,
+    handoff_stage: str | None = None,
+    handoff_to_role: str | None = None,
+    handoff_extra: dict[str, Any] | None = None,
+) -> None:
+    ctx.escalations_used += 1
+    ctx.blackboard["last_failure_route"] = failure_route
+    ctx.blackboard["escalations"].append({
+        "attempt": ctx.escalations_used,
+        "reason": reason,
+        "repair_units": ctx.unit_coordinator.status(),
+        "failure_route": failure_route,
+        "failed_plan": ctx.blackboard.get("repair_plan"),
+        "stuck_status": ctx.state.stuck_status(),
+        "existing_test_failures": list(getattr(ctx.state, "_existing_test_failures", [])),
+    })
+    _append_cognitive_entry(
+        ctx,
+        source=from_role,
+        actual=reason,
+        falsified=str((ctx.blackboard.get("repair_plan") or {}).get("selected_chain_id") or ""),
+    )
+    if ctx.trace:
+        ctx.trace.record(
+            "escalation",
+            from_role=from_role,
+            to_role=to_role,
+            reason=reason,
+            attempt=ctx.escalations_used,
+            failure_route=failure_route,
+        )
+        if handoff_stage:
+            _record_handoff_snapshot(
+                ctx.trace,
+                stage=handoff_stage,
+                from_role=from_role,
+                to_role=handoff_to_role or to_role,
+                attempt=ctx.escalations_used + ctx.qa_rounds,
+                features=_build_fixer_handoff_features(ctx.state, ctx.blackboard, det_qa=None),
+                extra=handoff_extra or {},
+            )
+    ctx.state.reset_stuck_counters()
+    ctx.fix_session_history = None
+
+
+def _exec_det_qa_step(
+    ctx: SimpleNamespace,
+    *,
+    fix_payload: dict[str, Any] | None,
+    fix_outcome: str,
+    in_rescue_pass: bool,
+    fix_prompt_breakdown: dict[str, Any],
+    attempt: int,
+) -> dict[str, Any]:
+    _prune_unreproduced_regression_targets(ctx.state, trace=ctx.trace)
+    unreproduced_reason = (fix_payload or {}).get("unreproduced_reason", "")
+    det_qa = run_deterministic_qa_checks(
+        ctx.state, ctx.issue_contract, run_doctest_on_shift=True,
+        unreproduced_reason=unreproduced_reason,
+    )
+    if not det_qa["ok"] and "Pending regression verification" in det_qa.get("reason", ""):
+        rem_prune = _client_remaining_calls(ctx.client)
+        if in_rescue_pass or fix_outcome in ("reserve_reached", "stage_cap_reached") or (rem_prune is not None and rem_prune <= ctx.budgets["verifier_reserve"] + 2):
+            if _prune_secondary_unverified_regression_targets(ctx.state, trace=ctx.trace):
+                det_qa = run_deterministic_qa_checks(
+                    ctx.state, ctx.issue_contract, run_doctest_on_shift=True,
+                    unreproduced_reason=unreproduced_reason,
+                )
+
+    if (
+        det_qa.get("ok")
+        and not det_qa.get("passed_on_original")
+        and hasattr(ctx.state, "verified")
+        and ctx.state.verified()
+        and hasattr(ctx.state, "_capture_snapshot")
+    ):
+        ctx.state._best_verified_snapshot = ctx.state._capture_snapshot()
+    _update_milestones_and_kpi(ctx, "fixer", det_qa=det_qa)
+
+    if ctx.trace:
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="fixer_handoff",
+            from_role="fixer",
+            to_role="qa",
+            attempt=attempt,
+            features=_build_fixer_handoff_features(ctx.state, ctx.blackboard, det_qa=det_qa),
+            extra={
+                "action": (fix_payload or {}).get("action", "incomplete"),
+                "outcome": fix_outcome,
+                "in_rescue_pass": in_rescue_pass,
+                "fix_prompt_breakdown": fix_prompt_breakdown,
+            },
+        )
+    return det_qa
+
+
+def _handle_low_budget_det_qa_bypass(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> str:
+    selected = det_qa["selected"]
+    hygiene = det_qa["hygiene"]
+    missing_apis = det_qa["missing_contract_apis"]
+    ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
+    if ctx.trace:
+        consistency_pending = bool(ctx.blackboard.get("_qa_repair_pending"))
+        consistency_unchecked = bool(ctx.blackboard.get("repair_plan")) and not consistency_pending
+        if consistency_pending or consistency_unchecked:
+            _record_consistency_blocked(
+                ctx.trace, ctx.blackboard, ctx.state.patch, ctx.blackboard.get("_last_qa_payload"),
+                reason=(
+                    "Verifier rejection was followed by budget exhaustion before a repair could be re-verified."
+                    if consistency_pending else
+                    "Verifier consistency audit was bypassed because the remaining API budget was exhausted."
+                ),
+                attempt=ctx.qa_rounds + 1,
+                decision="REJECT" if consistency_pending else "BYPASS_LOW_BUDGET",
+            )
+            ctx.trace.record("qa_gate", deterministic_ok=True, llm_decision="CONSISTENCY_BLOCKED", missing_apis=missing_apis)
+        else:
+            ctx.trace.record("qa_gate", deterministic_ok=True, llm_decision="BYPASS_LOW_BUDGET", missing_apis=missing_apis)
+        _record_plan_consistency_audit(
+            ctx.trace, ctx.blackboard, ctx.state.patch, None,
+            attempt=ctx.qa_rounds + 1, outcome="bypassed_low_budget",
+        )
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="verifier_handoff",
+            from_role="verifier",
+            to_role="submission",
+            attempt=ctx.qa_rounds + 1,
+            features=_build_verifier_handoff_features(ctx.blackboard.get("_last_qa_payload") if consistency_pending else None),
+            extra={
+                "decision": "CONSISTENCY_BLOCKED" if (consistency_pending or consistency_unchecked) else "BYPASS_LOW_BUDGET",
+                "outcome": "blocked" if (consistency_pending or consistency_unchecked) else "bypassed",
+                "ver_prompt_chars": 0,
+            },
+        )
+    return ctx.state.patch
+
+
+def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+    selected = det_qa["selected"]
+    hygiene = det_qa["hygiene"]
+    ver_activity: dict[str, Any] = {"files_read": [], "symbols_queried": []}
+    ver_handoff, ver_holder = _make_handoff_tools("verifier", ctx.state, ctx.blackboard, ver_activity)
+    ver_tools = _wrap_tools_for_role(
+        "verifier", ctx.tools_by_name, list(_VERIFIER_TOOLS),
+        ver_handoff, ver_holder, ctx.state, ctx.client, _client_calls_made(ctx.client),
+        ctx.budgets["verifier_cap"], ver_activity,
+        blackboard=ctx.blackboard,
+    )
+    verifier_patch = hygiene.get("patch") or ctx.state.build_patch(selected)
+    ver_prompt = _build_verifier_prompt(ctx.issue, ctx.issue_contract, det_qa, ctx.state, ctx.blackboard)
+    ver_payload, ver_outcome = _run_role_agent(
+        "verifier", ctx.prompts_mod.VERIFIER_PROMPT, ver_prompt, ver_tools, ver_holder,
+        model=ctx.model, api_key=ctx.api_key, base_url=ctx.base_url, client=ctx.client, trace=ctx.trace,
+        compress_fn=ctx.compress_fn, create_agent_fn=ctx.create_agent_fn,
+        chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
+        stage_cap=ctx.budgets["verifier_cap"], reserve_floor=0,
+        attempt=ctx.qa_rounds + 1, max_continuations=1,
+        continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); include an issue/evidence explanation when reporting plan_consistency='conflict'.",
+        handoff_only_tools=ver_handoff,
+        wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; include an issue/evidence explanation for any plan conflict.",
+    )
+    if not ver_payload:
+        inconclusive_clean = bool(
+            det_qa.get("ok")
+            and not ctx.blackboard.get("_qa_repair_pending")
+            and not det_qa.get("passed_on_original")
+            and not det_qa.get("missing_contract_apis")
+            and not det_qa.get("added_inline_tests")
+            and not det_qa.get("comment_doctest_shifts")
+            and not det_qa.get("static_manifest_tests")
+        )
+        if inconclusive_clean:
+            ver_payload = {
+                "decision": "INCONCLUSIVE_FALLBACK",
+                "summary": "Verifier did not return a structured QA decision before its stage budget ended; deterministic QA passed cleanly.",
+                "missing_requirements": [],
+                "objections": [],
+                "plan_consistency": "not_checked",
+                "plan_conflicts": [],
+                "_inconclusive": True,
+            }
+        else:
+            ver_payload = {
+                "decision": "REJECT",
+                "summary": "Verifier did not return a structured QA decision before its stage budget ended.",
+                "missing_requirements": [],
+                "objections": ["No structured Verifier decision was returned; the patch requires another audit before submission."],
+                "plan_consistency": "not_checked",
+                "plan_conflicts": [],
+            }
+    decision = str(ver_payload.get("decision", "REJECT")).strip().upper()
+    if decision not in ("APPROVE", "REJECT", "INCONCLUSIVE_FALLBACK"):
+        decision = "REJECT"
+        ver_payload["decision"] = decision
+    if ver_payload:
+        ctx.blackboard["qa_history"].append(dict(ver_payload))
+    if ctx.trace:
+        ctx.trace.record(
+            "qa_gate", deterministic_ok=True, llm_decision=decision, payload=ver_payload,
+            qa_round=ctx.qa_rounds + 1, reproduction=det_qa.get("reproduction"),
+            unreproduced_reason=det_qa.get("unreproduced_reason"),
+        )
+        _record_plan_consistency_audit(
+            ctx.trace, ctx.blackboard, verifier_patch, ver_payload,
+            attempt=ctx.qa_rounds + 1,
+            outcome=("inconclusive_fallback" if decision == "INCONCLUSIVE_FALLBACK" else ver_outcome),
+        )
+        _record_handoff_snapshot(
+            ctx.trace,
+            stage="verifier_handoff",
+            from_role="verifier",
+            to_role=("submission" if decision in ("APPROVE", "INCONCLUSIVE_FALLBACK") else "fixer"),
+            attempt=ctx.qa_rounds + 1,
+            features=_build_verifier_handoff_features(ver_payload),
+            extra={
+                "decision": decision,
+                "outcome": ver_outcome,
+                "ver_prompt_chars": len(ver_prompt),
+            },
+        )
+    return decision, ver_payload, ver_outcome
+
+
+def _resolve_fallback_patch(ctx: SimpleNamespace, *, error_message: str = "Model API call limit reached") -> str:
+    fallback = _clean_and_audit_fallback_patch(
+        ctx.state, ctx.issue_contract, ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True), trace=ctx.trace,
+    )
+    if fallback:
+        if ctx.trace:
+            ctx.trace.record("auto_submit_verified", patch=fallback, stage="deterministic_qa_last_resort")
+        return fallback
+    degraded = _try_degraded_patch_fallback(
+        ctx.state, trace=ctx.trace, allow_unverified_compiling=True,
+        issue_contract=ctx.issue_contract, blackboard=ctx.blackboard,
+    )
+    if degraded:
+        return degraded
+    raise RuntimeError(error_message)
+
 def run_multi_agent(
     repo: Path,
     issue: str,
@@ -3500,622 +4936,226 @@ def run_multi_agent(
     role_callback_cls: Any = None,
 ) -> str:
     """Execute the Adaptive Locate-Suggest-Fix-Verify multi-agent pipeline."""
-    tools_by_name = {t.name: t for t in tools}
-    budgets = allocate_stage_budgets(max_api_calls)
-    issue_contract = extract_issue_contract(issue)
-    blackboard: dict[str, Any] = {
-        "issue_contract": issue_contract,
-        "localization": None,
-        "repair_plan": None,
-        "escalations": [],
-        "unlocked_regressions": [],
-        "qa_history": [],
-        "shared_read_excerpts": {},
-        "shared_ckg_notes": {},
-    }
-    qa_repair_loop_enabled = os.getenv("RUSTBENCH_QA_REPAIR_LOOP", "1").strip().lower() not in (
-        "0", "false", "off", "no"
+    ctx = _init_orchestration_ctx(
+        repo, issue, model, api_key, base_url,
+        tools=tools, state=state, client=client, trace=trace, max_api_calls=max_api_calls,
+        compress_fn=compress_fn, create_agent_fn=create_agent_fn,
+        chat_model_factory=chat_model_factory, prompts_mod=prompts_mod,
+        role_callback_cls=role_callback_cls, topology="staged",
     )
-    if trace:
-        trace.record(
-            "multi_agent_start",
-            budgets=budgets,
-            issue_contract=issue_contract,
-            qa_repair_loop_enabled=qa_repair_loop_enabled,
-        )
-        _record_handoff_snapshot(
-            trace,
-            stage="issue_contract",
-            from_role="issue",
-            to_role="navigator",
-            attempt=1,
-            features=_build_issue_contract_features(issue, issue_contract),
-            extra={"budgets": budgets},
-        )
 
     try:
-            # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Stage 1: Navigator & Reproducer
         # ------------------------------------------------------------------
-        nav_activity: dict[str, Any] = {"files_read": [], "symbols_queried": [], "calls_remaining_in_stage": budgets["navigator_cap"]}
-        nav_handoff, nav_holder = _make_handoff_tools("navigator", state, blackboard, nav_activity)
-        nav_allowed = [
-            "read_file", "read_lines", "search_code", "cargo_workspace",
-            "rust_symbols", "inspect_rust_neighborhood", "write_regression_test",
-            "revert_file", "cargo_test", "cargo_check", "rust_trace", "rust_error_explain",
-        ]
-        nav_tools = _wrap_tools_for_role(
-            "navigator", tools_by_name, nav_allowed, nav_handoff, nav_holder,
-            state, client, _client_calls_made(client), budgets["navigator_cap"], nav_activity,
-            blackboard=blackboard,
-        )
-        nav_prompt = (
-            f"Issue:\n{issue}\n\n"
-            f"Pre-extracted Issue Contract (verify exact names/crates):\n"
-            f"{json.dumps(issue_contract, ensure_ascii=False, indent=2)}\n\n"
-            "Locate root cause / candidate fault chains, reproduce the issue with write_regression_test(run_now=True), "
-            "run rust_trace once if it fails at runtime, then call submit_localization_bundle."
-        )
-        state._submit_hint_override = "Call submit_localization_bundle(...) now to hand off findings."
-        nav_payload, nav_outcome = _run_role_agent(
-            "navigator", prompts_mod.NAVIGATOR_PROMPT, nav_prompt, nav_tools, nav_holder,
-            model=model, api_key=api_key, base_url=base_url, client=client, trace=trace,
-            compress_fn=compress_fn, create_agent_fn=create_agent_fn,
-            chat_model_factory=chat_model_factory, role_callback_cls=role_callback_cls,
-            stage_cap=budgets["navigator_cap"], reserve_floor=budgets["verifier_reserve"],
-            max_continuations=1,
-            continuation_fn=lambda r, s: "Wrap up exploration and call submit_localization_bundle(...) immediately.",
-            handoff_only_tools=nav_handoff,
-            wrapup_prompt="Exploration budget reached. Call submit_localization_bundle(...) IMMEDIATELY using the files and test outputs already observed.",
-        )
-        state._submit_hint_override = None
-        _merge_activity_into_blackboard(blackboard, nav_activity)
-        _prune_unreproduced_regression_targets(state, trace=trace)
-
-        repro_status, repro_meta = _format_repro_status_for_blackboard(state)
-        nav_auto_synthesized = nav_payload is None
-        if nav_payload is None:
-            fallback_chains = []
-            if getattr(state, "ckg", None) is not None:
-                try:
-                    fallback_chains = state.ckg.build_fault_chains(
-                        issue_contract.get("requested_symbols", []),
-                        seed_files=nav_activity["files_read"][:4],
-                        max_chains=3,
-                    )
-                except Exception:
-                    fallback_chains = []
-            nav_payload = {
-                "summary": f"Navigator budget finished. Files inspected: {nav_activity['files_read'][:6]}.",
-                "candidate_chains": fallback_chains,
-                "reproduction_status": repro_status,
-                "requested_apis": issue_contract.get("requested_symbols", []),
-                "needs_architecture_planning": True,
-                "notes": "Auto-synthesized bundle after stage cap.",
-            }
-        else:
-            if repro_status != "not_reproduced":
-                nav_payload["reproduction_status"] = repro_status
-            if len(nav_payload.get("candidate_chains", [])) <= 1 and getattr(state, "ckg", None) is not None and nav_payload.get("needs_architecture_planning"):
-                try:
-                    seeds = list(issue_contract.get("requested_symbols", [])) + nav_activity["symbols_queried"][:3]
-                    extra = state.ckg.build_fault_chains(seeds, seed_files=nav_activity["files_read"][:3], max_chains=3)
-                    if len(extra) > len(nav_payload.get("candidate_chains", [])):
-                        nav_payload.setdefault("ckg_suggested_chains", extra)
-                except Exception:
-                    pass
-        nav_payload["repro_meta"] = repro_meta
-        blackboard["localization"] = nav_payload
-
-        # Save baseline checkpoint AFTER Navigator (preserving Navigator's regression test & Red status)
-        state.save_checkpoint("pre_fix")
-
-        # Adaptive Gate (AdaCoder-inspired): Fast Path vs Planned Path
-        # ------------------------------------------------------------------
-        route, route_reasons = route_after_navigation(blackboard, state)
-        fix_session_history = nav_holder.get("history") if route == "fast" else None
-
-        if trace:
-            trace.record("adaptive_route", route=route, reasons=route_reasons)
-            _record_handoff_snapshot(
-                trace,
-                stage="navigator_handoff",
-                from_role="navigator",
-                to_role=("suggester" if route == "planned" else "fixer"),
-                attempt=1,
-                features=_build_localization_features(
-                    blackboard,
-                    state,
-                    repro_contents=_collect_regression_test_contents(state, max_chars=2000),
-                ),
-                extra={
-                    "outcome": nav_outcome,
-                    "auto_synthesized": nav_auto_synthesized,
-                    "route": route,
-                    "route_reasons": route_reasons,
-                    "files_read_count": len(nav_activity.get("files_read", [])),
-                    "symbols_queried_count": len(nav_activity.get("symbols_queried", [])),
-                },
-            )
-
-        max_escalations = max(2, (max_api_calls or 70) // 25)
-        escalations_used = 0
-        qa_rounds = 0
-        max_qa_rounds = max(2, (max_api_calls or 70) // 15)
-        last_qa_feedback = ""
-        rescue_attempted = False
-        blackboard["environment_blocker"] = False
-        candidate_policy = _repair_candidates.CandidatePolicy(blackboard, state, trace)
-        loc = blackboard.get("localization") or {}
-        if loc.get("unresolved_chain_ids"):
-            candidate_policy.ambiguity(loc["unresolved_chain_ids"], loc.get("ambiguity_reason", ""))
-        unit_coordinator = _repair_units.RepairUnitCoordinator(state, tools_by_name, blackboard, trace, candidate_policy=candidate_policy)
+        rem_init = _client_remaining_calls(ctx.client)
+        if rem_init is not None and rem_init <= 0:
+            return _resolve_fallback_patch(ctx)
+        _route, _reasons, _nav_out, _nav_auto = _exec_navigator_initial(ctx)
+        _record_stage_transition(ctx, "navigator", "suggester" if ctx.route == "planned" else "fixer")
 
         while True:
-            if escalations_used:
-                state.reset_stuck_counters()
-            rem_before_stage = _client_remaining_calls(client)
+            if ctx.escalations_used:
+                ctx.state.reset_stuck_counters()
+            rem_before_stage = _client_remaining_calls(ctx.client)
             if rem_before_stage is not None and rem_before_stage <= 0:
-                fallback = _clean_and_audit_fallback_patch(
-                    state, issue_contract, state.auto_submit_verified_patch(allow_snapshot_fallback=True), trace=trace
-                )
-                if fallback:
-                    return fallback
-                raise RuntimeError("Model API call limit reached")
+                _record_stage_transition(ctx, "stage", "fallback")
+                return _resolve_fallback_patch(ctx)
 
             # --------------------------------------------------------------
             # Stage 2: Rust Architect / Suggester (if Planned Path or Escalated)
             # --------------------------------------------------------------
-            if route == "planned" and (blackboard["repair_plan"] is None or blackboard.get("_need_replan")):
-                if rem_before_stage is not None and rem_before_stage <= budgets["verifier_reserve"]:
-                    blackboard["_need_replan"] = False
-                else:
-                    blackboard["_need_replan"] = False
-                    sug_activity: dict[str, Any] = {"files_read": [], "symbols_queried": [], "candidate_policy": candidate_policy}
-                    sug_handoff, sug_holder = _make_handoff_tools("suggester", state, blackboard, sug_activity)
-                    sug_allowed = [
-                        "read_file", "read_lines", "search_code",
-                        "cargo_workspace", "rust_symbols", "inspect_rust_neighborhood",
-                    ]
-                    sug_tools = _wrap_tools_for_role(
-                        "suggester", tools_by_name, sug_allowed, sug_handoff, sug_holder,
-                        state, client, _client_calls_made(client), budgets["suggester_cap"], sug_activity,
-                        blackboard=blackboard,
+            if ctx.route == "planned" and (ctx.blackboard["repair_plan"] is None or ctx.blackboard.get("_need_replan")):
+                while True:
+                    rem_sug = _client_remaining_calls(ctx.client)
+                    if rem_sug is not None and rem_sug <= 0:
+                        _record_stage_transition(ctx, "suggester", "fallback")
+                        return _resolve_fallback_patch(ctx)
+                    if rem_sug is not None and rem_sug <= ctx.budgets["verifier_reserve"]:
+                        ctx.blackboard["_need_replan"] = False
+                        break
+                    ctx.blackboard["_need_replan"] = False
+                    outcome_kind, sug_payload, _sug_out, _bd = _exec_suggester_step(
+                        ctx, attempt=ctx.escalations_used + 1,
                     )
-                    chains_for_ctx = blackboard["localization"].get("candidate_chains") or blackboard["localization"].get("ckg_suggested_chains") or []
-                    shared_ctx = _build_shared_context(state.root, blackboard, chains_for_ctx, max_chars=10000)
-                    repro_tests_txt = _collect_regression_test_contents(state, max_chars=2000)
-                    escalation_ctx = ""
-                    if blackboard["escalations"]:
-                        prior_route = blackboard["escalations"][-1].get("failure_route", "architect")
-                        escalation_ctx = (
-                            "\n\nPREVIOUS ATTEMPT FAILED & ESCALATED:\n"
-                            + json.dumps(blackboard["escalations"][-1], ensure_ascii=False, indent=2)
-                            + "\nDistinguish wrong implementation/test oracle/environment from evidence refuting the mechanism. If a candidate comparison is pending, compare brief mechanisms first; keep the current mechanism unless contract/execution evidence warrants another. Otherwise, if failure_route is navigator, call request_relocalization and re-map the fault before planning; if failure_route is architect, revise the trait/type/API plan."
+                    if outcome_kind == "relocalize":
+                        _record_stage_transition(ctx, "suggester", "navigator")
+                        reloc_reason = str((sug_payload or {}).get("reason", "")) or "Relocalization requested"
+                        next_to_role, _reloc_reasons, _reloc_out, _new_nav = _exec_navigator_relocalize(
+                            ctx, reloc_reason, attempt=ctx.escalations_used + 1, allow_fast_return=True,
                         )
-                    sug_issue_contract_json = json.dumps(issue_contract, ensure_ascii=False, indent=2)
-                    sug_loc_json = json.dumps(blackboard['localization'], ensure_ascii=False, indent=2)
-                    sug_prompt = (
-                        f"Issue:\n{issue}\n\n"
-                        f"Issue Contract:\n{sug_issue_contract_json}\n\n"
-                        f"LocalizationBundle:\n{sug_loc_json}\n\n"
-                        f"Current Temporary Regression Test(s):\n{repro_tests_txt}\n\n"
-                        f"Pre-loaded Source Excerpts & CKG Context:\n{shared_ctx}"
-                        f"{escalation_ctx}\n\n"
-                        "Use the pre-loaded excerpts first (at most 1-3 extra read/search calls if needed), verify Rust contracts & Expected Result, and call submit_repair_plan."
-                        " Provide repair_units with edit_indices, prerequisites, and targeted verification. "
-                        "Retain stable IDs and definitions of already verified units unless evidence requires changing them.\n"
-                        + json.dumps(blackboard.get("repair_units", {}), ensure_ascii=False)
-                        + candidate_policy.prompt()
-                    )
-                    sug_prompt_breakdown = {
-                        "issue_chars": len(issue or ""),
-                        "issue_contract_chars": len(sug_issue_contract_json),
-                        "localization_chars": len(sug_loc_json),
-                        "repro_tests_chars": len(repro_tests_txt),
-                        "shared_ctx_chars": len(shared_ctx),
-                        "escalation_chars": len(escalation_ctx),
-                        "total_chars": len(sug_prompt),
-                    }
-                    state._submit_hint_override = "Call submit_repair_plan(...) now."
-                    sug_payload, sug_outcome = _run_role_agent(
-                        "suggester", prompts_mod.SUGGESTER_PROMPT, sug_prompt, sug_tools, sug_holder,
-                        model=model, api_key=api_key, base_url=base_url, client=client, trace=trace,
-                        compress_fn=compress_fn, create_agent_fn=create_agent_fn,
-                        chat_model_factory=chat_model_factory, role_callback_cls=role_callback_cls,
-                        stage_cap=budgets["suggester_cap"], reserve_floor=budgets["verifier_reserve"],
-                        attempt=escalations_used + 1, max_continuations=1,
-                        continuation_fn=lambda r, s: "Call submit_repair_plan(...) immediately with your best plan.",
-                        handoff_only_tools=sug_handoff,
-                        wrapup_prompt="Planning exploration complete. Call submit_repair_plan(...) (or request_relocalization if chains are wrong) IMMEDIATELY with concrete file/symbol/line edits.",
-                    )
-                    state._submit_hint_override = None
-                    _merge_activity_into_blackboard(blackboard, sug_activity)
-
-                    if sug_payload and sug_payload.get("action") == "relocalize" and escalations_used < max_escalations:
-                        escalations_used += 1
-                        if trace:
-                            trace.record("escalation", from_role="suggester", to_role="navigator", reason=sug_payload.get("reason", ""))
-                        nav_handoff2, nav_holder2 = _make_handoff_tools("navigator", state, blackboard, nav_activity)
-                        nav_tools2 = _wrap_tools_for_role(
-                            "navigator", tools_by_name, nav_allowed, nav_handoff2, nav_holder2,
-                            state, client, _client_calls_made(client), max(4, budgets["navigator_cap"] // 2), nav_activity,
-                            blackboard=blackboard,
-                        )
-                        reloc_prompt = (
-                            f"Issue:\n{issue}\n\nPrevious localization was insufficient: {sug_payload.get('reason', '')}.\n"
-                            "Search more broadly for the true implementation/trait/module and call submit_localization_bundle."
-                        )
-                        if trace:
-                            _record_handoff_snapshot(
-                                trace,
-                                stage="suggester_handoff",
-                                from_role="suggester",
-                                to_role="navigator",
-                                attempt=escalations_used,
-                                features=_build_repair_plan_features(blackboard.get("repair_plan"), blackboard["escalations"]),
-                                extra={
-                                    "action": "relocalize",
-                                    "outcome": sug_outcome,
-                                    "relocalize_reason": str(sug_payload.get("reason", ""))[:240],
-                                    "sug_prompt_breakdown": sug_prompt_breakdown,
-                                },
-                            )
-                        new_nav, reloc_nav_outcome = _run_role_agent(
-                            "navigator", prompts_mod.NAVIGATOR_PROMPT, reloc_prompt, nav_tools2, nav_holder2,
-                            model=model, api_key=api_key, base_url=base_url, client=client, trace=trace,
-                            compress_fn=compress_fn, create_agent_fn=create_agent_fn,
-                            chat_model_factory=chat_model_factory, role_callback_cls=role_callback_cls,
-                            stage_cap=max(4, budgets["navigator_cap"] // 2), reserve_floor=budgets["verifier_reserve"],
-                            attempt=escalations_used + 1, max_continuations=1,
-                            handoff_only_tools=nav_handoff2,
-                            wrapup_prompt="Relocalization budget reached. Call submit_localization_bundle(...) IMMEDIATELY.",
-                        )
-                        _merge_activity_into_blackboard(blackboard, nav_activity)
-                        if new_nav:
-                            reloc_status, reloc_meta = _format_repro_status_for_blackboard(state)
-                            if reloc_status != "not_reproduced":
-                                new_nav["reproduction_status"] = reloc_status
-                            new_nav["repro_meta"] = reloc_meta
-                            blackboard["localization"] = new_nav
-                        if trace:
-                            _, reloc_reasons = route_after_navigation(blackboard, state)
-                            _record_handoff_snapshot(
-                                trace,
-                                stage="navigator_handoff",
-                                from_role="navigator",
-                                to_role="suggester",
-                                attempt=escalations_used + 1,
-                                features=_build_localization_features(
-                                    blackboard,
-                                    state,
-                                    repro_contents=_collect_regression_test_contents(state, max_chars=2000),
-                                ),
-                                extra={
-                                    "outcome": reloc_nav_outcome,
-                                    "auto_synthesized": new_nav is None,
-                                    "relocalized": True,
-                                    "route": route,
-                                    "route_reasons": reloc_reasons,
-                                    "files_read_count": len(nav_activity.get("files_read", [])),
-                                    "symbols_queried_count": len(nav_activity.get("symbols_queried", [])),
-                                },
-                            )
-                        blackboard["_need_replan"] = True
-                        candidate_policy.relocalized()
+                        _record_stage_transition(ctx, "navigator", next_to_role)
+                        if next_to_role == "fixer":
+                            ctx.route = "fast"
+                            ctx.blackboard["_need_replan"] = False
+                            break
+                        ctx.route = "planned"
+                        ctx.blackboard["_need_replan"] = True
                         continue
-
-                    if sug_payload and sug_payload.get("action") == "plan":
-                        blackboard["repair_plan"] = sug_payload
-                    elif sug_payload and sug_payload.get("action") == "unlock":
-                        # The Architect released a factually wrong Red-phase oracle. Keep the
-                        # current plan/mechanism and let the Fixer correct the test.
-                        blackboard.setdefault("unlocked_regressions", []).append({
-                            "name": sug_payload.get("unlocked", ""),
-                            "path": sug_payload.get("path", ""),
-                            "reason": sug_payload.get("reason", ""),
-                        })
-                        if trace:
-                            trace.record(
-                                "red_lock_release",
-                                name=sug_payload.get("unlocked", ""),
-                                path=sug_payload.get("path", ""),
-                                reason=sug_payload.get("reason", ""),
-                            )
-                    else:
-                        # No full second implementation is synthesized after a
-                        # comparison. Keep only an admissible current mechanism.
-                        prior_plan = candidate_policy.fallback_plan(blackboard.get("repair_plan"))
-                        synth_edits = _synthesize_ordered_edits_from_chains(chains_for_ctx)
-                        blackboard["repair_plan"] = prior_plan or {
-                            "action": "plan",
-                            "selected_chain_id": (chains_for_ctx[0].get("chain_id", "C1") if chains_for_ctx else "C1"),
-                            "arbitration_rationale": (
-                                "Architect budget ended before submitting a plan; start directly from these candidate chain files/symbols "
-                                "and apply minimal edits within 3-5 steps instead of re-reading the repository."
-                            ),
-                            "ordered_edits": synth_edits,
-                            "rust_invariants": ["Keep edits minimal and preserve unrelated doctest line counts."],
-                            "api_checklist": issue_contract.get("new_api_candidates", []),
-                            "_synthesized": True,
-                        }
-                    if trace:
-                        _record_handoff_snapshot(
-                            trace,
-                            stage="suggester_handoff",
-                            from_role="suggester",
-                            to_role="fixer",
-                            attempt=escalations_used + 1,
-                            features=_build_repair_plan_features(blackboard.get("repair_plan"), blackboard["escalations"]),
-                            extra={
-                                "action": "synthesized_fallback" if blackboard["repair_plan"].get("_synthesized") else "plan",
-                                "outcome": sug_outcome,
-                                "synthesized": bool(blackboard["repair_plan"].get("_synthesized")),
-                                "sug_prompt_breakdown": sug_prompt_breakdown,
-                            },
-                        )
+                    _record_stage_transition(ctx, "suggester", "fixer")
+                    break
 
             # --------------------------------------------------------------
             # Stage 3: Rust Fixer
             # --------------------------------------------------------------
-            rem_for_fixer = _client_remaining_calls(client)
-            in_rescue_pass = bool(
-                rem_for_fixer is not None
-                and rem_for_fixer <= budgets["verifier_reserve"]
-                and not rescue_attempted
-                and rem_for_fixer >= 2
-                and _extract_selected_source_paths(state)
-            )
-            if in_rescue_pass:
-                rescue_attempted = True
-                fixer_cap_now = max(1, rem_for_fixer - 1)
-                fixer_reserve_now = 0
-                fixer_continuations = 0
-                allow_escalate_now = False
-            else:
-                fixer_cap_now = budgets["fixer_attempt_cap"]
-                fixer_reserve_now = budgets["verifier_reserve"]
-                fixer_continuations = 2
-                allow_escalate_now = (escalations_used < max_escalations) and not blackboard.get("environment_blocker")
+            fix_res = _exec_fixer_step(ctx, attempt=ctx.escalations_used + ctx.qa_rounds + 1)
+            fix_payload = fix_res["fix_payload"]
+            fix_outcome = fix_res["fix_outcome"]
+            in_rescue_pass = fix_res["in_rescue_pass"]
+            fix_prompt_breakdown = fix_res["fix_prompt_breakdown"]
 
-            unit_paths = [e["file"] for e in _synthesize_ordered_edits_from_chains(
-                blackboard["localization"].get("candidate_chains") or blackboard["localization"].get("ckg_suggested_chains") or []
-            ) if e.get("file")]
-            if escalations_used:
-                state.reset_stuck_counters()
-            unit_coordinator.configure(blackboard.get("repair_plan"), unit_paths)
-            unit_coordinator.select()
-            fix_activity: dict[str, Any] = {"files_read": [], "symbols_queried": [], "unit_coordinator": unit_coordinator,
-                                            "candidate_policy": candidate_policy}
-            fix_handoff, fix_holder = _make_handoff_tools(
-                "fixer", state, blackboard, fix_activity, allow_escalate=allow_escalate_now,
-            )
-            fix_allowed = [
-                "read_file", "read_lines", "search_code", "cargo_workspace",
-                "rust_symbols", "inspect_rust_neighborhood", "edit_file", "write_file",
-                "write_regression_test", "revert_file", "checkpoint",
-                "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
-            ]
-            if "generate_patch" in tools_by_name:
-                gp_orig = tools_by_name["generate_patch"].func
-
-                @tool
-                def preview_patch() -> str:
-                    """Preview current diff without submitting. Call submit_for_qa when verification passes."""
-                    return gp_orig(paths=None, submit=False)
-
-                extra_fixer_tools = fix_handoff + [preview_patch]
-            else:
-                extra_fixer_tools = fix_handoff
-
-            fix_tools = _wrap_tools_for_role(
-                "fixer", tools_by_name, fix_allowed, extra_fixer_tools, fix_holder,
-                state, client, _client_calls_made(client), fixer_cap_now, fix_activity,
-                auto_escalate_on_stuck=allow_escalate_now,
-                blackboard=blackboard,
-            )
-            chains_for_fix = blackboard["localization"].get("candidate_chains") or blackboard["localization"].get("ckg_suggested_chains") or []
-            shared_fix_ctx = _build_shared_context(state.root, blackboard, chains_for_fix, max_chars=1800)
-            repro_fix_txt = _collect_regression_test_contents(state, max_chars=1800)
-            failure_route = str(blackboard.get("last_failure_route") or "")
-            handoff_card = build_handoff_card(
-                issue_contract,
-                blackboard,
-                qa_feedback=last_qa_feedback,
-                failure_route=failure_route,
-                active_unit=unit_coordinator._unit(unit_coordinator.active) if unit_coordinator.active else None,
-            )
-            downstream_note = (
-                f"Workspace Dependents (verify post-strip compilation): {blackboard['downstream_dependents']}\n\n"
-                if blackboard.get("downstream_dependents")
-                else ""
-            )
-            qa_block = f"PREVIOUS QA OBJECTIONS (MUST FIX):\n{last_qa_feedback}\n\n" if last_qa_feedback else ""
-            unlocked = blackboard.get("unlocked_regressions") or []
-            unlock_block = ""
-            if unlocked:
-                lines = [
-                    "RED-PHASE LOCK RELEASED BY THE ARCHITECT (you may correct these tests):",
-                ]
-                for item in unlocked[-3:]:
-                    lines.append(
-                        f"  * {item.get('name')} ({item.get('path')}): {item.get('reason')}"
-                    )
-                lines.append(
-                    "Correct the released test with write_regression_test and re-verify the Red->Green pair."
+            pruned_from_fixer = False
+            if fix_payload and fix_payload.get("action") == "escalate" and ctx.escalations_used < ctx.max_escalations:
+                reason = str(fix_payload.get("reason", "stuck"))
+                if _is_env_dependency_blocker(reason):
+                    ctx.blackboard["environment_blocker"] = True
+                stuck = ctx.state.stuck_status()
+                failure_route = (
+                    "architect"
+                    if fix_payload.get("candidate_comparison")
+                    else _classify_failure_route(reason, stuck)
                 )
-                unlock_block = "\n".join(lines) + "\n\n"
-            last_test_failure = state.stuck_status().get("last_test_failure") or {}
-            observed_failures = list(getattr(state, "_existing_test_failures", []) or [])
-            failure_evidence = (
-                "Observed Cargo test failure evidence (check observed_revision; a later edit may have changed it):\n"
-                + json.dumps({"current_revision": getattr(state, "_revision", None),
-                              "last_failure": last_test_failure,
-                              "existing_test_failures": observed_failures}, ensure_ascii=False, indent=2)
-                + "\n\n"
-            ) if last_test_failure or observed_failures else ""
-            esc_note = (
-                "If stuck, call escalate_for_replan WITHOUT restoring pre_fix; Coordinator preserves verified unrelated units; follow the handoff card's failure_route."
-                if allow_escalate_now
-                else "Final repair phase (escalation limit reached): resolve remaining test/edit issues directly and call submit_for_qa."
-            )
-            fix_prompt = (
-                f"Issue:\n{issue}\n\n"
-                f"Repair Handoff Card (compact; use targeted reads for missing details):\n{handoff_card}\n\n"
-                f"Temporary Regression Test(s):\n{repro_fix_txt}\n\n"
-                f"Targeted Source Excerpts:\n{shared_fix_ctx}\n\n"
-                f"{downstream_note}"
-                f"{unlock_block}"
-                f"{qa_block}"
-                f"{failure_evidence}"
-                "Implement the fix with minimal edits, pass all temporary regression tests + relevant existing tests, "
-                f"and call submit_for_qa(summary=...). {esc_note}"
-            )
-            fix_prompt_breakdown = {
-                "issue_chars": len(issue or ""),
-                "handoff_card_chars": len(handoff_card),
-                "repro_tests_chars": len(repro_fix_txt),
-                "shared_ctx_chars": len(shared_fix_ctx),
-                "downstream_chars": len(downstream_note),
-                "qa_feedback_chars": len(qa_block),
-                "test_failure_evidence_chars": len(failure_evidence),
-                "total_chars": len(fix_prompt),
-            }
-            state._submit_hint_override = _fixer_budget_hint
-            fix_payload, fix_outcome = _run_scheduled_fixer(
-                prompts_mod.FIXER_PROMPT, fix_prompt, fix_tools, fix_holder,
-                coordinator=unit_coordinator, allow_escalate=allow_escalate_now,
-                model=model, api_key=api_key, base_url=base_url, client=client, trace=trace,
-                compress_fn=compress_fn, create_agent_fn=create_agent_fn,
-                chat_model_factory=chat_model_factory, role_callback_cls=role_callback_cls,
-                stage_cap=fixer_cap_now, reserve_floor=fixer_reserve_now,
-                history=fix_session_history,
-                attempt=escalations_used + qa_rounds + 1, max_continuations=fixer_continuations,
-                continuation_fn=lambda r, s: (
-                    "Verification passed - call submit_for_qa(summary=...) now!"
-                    if state.verified() and _extract_selected_source_paths(state)
-                    else f"Continue repair and verification ({state.missing_verification_steps()}), then call submit_for_qa."
-                ),
-            )
-            fix_session_history = fix_holder.get("history") or fix_session_history
-            state._submit_hint_override = None
-            _merge_activity_into_blackboard(blackboard, fix_activity)
-
-            if fix_payload and fix_payload.get("action") == "escalate" and escalations_used < max_escalations:
-                if _is_env_dependency_blocker(fix_payload.get("reason", "")):
-                    blackboard["environment_blocker"] = True
-                escalations_used += 1
-                stuck = state.stuck_status()
-                failure_route = _classify_failure_route(fix_payload.get("reason", ""), stuck)
-                blackboard["last_failure_route"] = failure_route
-                blackboard["escalations"].append({
-                    "attempt": escalations_used,
-                    "reason": fix_payload.get("reason", "stuck"),
-                    "repair_units": unit_coordinator.status(),
-                    "failure_route": failure_route,
-                    "failed_plan": blackboard.get("repair_plan"),
-                    "stuck_status": stuck,
-                    "existing_test_failures": list(getattr(state, "_existing_test_failures", [])),
-                })
-                if trace:
-                    trace.record("escalation", from_role="fixer", to_role=failure_route, reason=fix_payload.get("reason", ""), attempt=escalations_used, failure_route=failure_route)
-                    _record_handoff_snapshot(
-                        trace,
-                        stage="fixer_handoff",
-                        from_role="fixer",
-                        to_role="suggester",
-                        attempt=escalations_used + qa_rounds,
-                        features=_build_fixer_handoff_features(state, blackboard, det_qa=None),
-                        extra={
-                            "action": "escalate",
-                            "outcome": fix_outcome,
-                            "escalate_reason": str(fix_payload.get("reason", ""))[:240],
-                            "failure_route": failure_route,
-                            "in_rescue_pass": in_rescue_pass,
-                            "fix_prompt_breakdown": fix_prompt_breakdown,
-                        },
-                    )
-                state.reset_stuck_counters()
-                route = "planned"
-                blackboard["_need_replan"] = True
-                last_qa_feedback = ""
-                continue
-
-            # --------------------------------------------------------------
-            # Stage 4: Patch QA & Verifier (Deterministic Gate + LLM Audit)
-            # --------------------------------------------------------------
-            _prune_unreproduced_regression_targets(state, trace=trace)
-            unreproduced_reason = (fix_payload or {}).get("unreproduced_reason", "")
-            det_qa = run_deterministic_qa_checks(
-                state, issue_contract, run_doctest_on_shift=True,
-                unreproduced_reason=unreproduced_reason,
-            )
-            if not det_qa["ok"] and "Pending regression verification" in det_qa.get("reason", ""):
-                rem_prune = _client_remaining_calls(client)
-                if in_rescue_pass or fix_outcome in ("reserve_reached", "stage_cap_reached") or (rem_prune is not None and rem_prune <= budgets["verifier_reserve"] + 2):
-                    if _prune_secondary_unverified_regression_targets(state, trace=trace):
-                        det_qa = run_deterministic_qa_checks(
-                            state, issue_contract, run_doctest_on_shift=True,
-                            unreproduced_reason=unreproduced_reason,
-                        )
-
-            if trace:
-                _record_handoff_snapshot(
-                    trace,
-                    stage="fixer_handoff",
+                to_role = "navigator" if failure_route == "navigator" else "suggester"
+                _record_escalation(
+                    ctx,
                     from_role="fixer",
-                    to_role="qa",
-                    attempt=escalations_used + qa_rounds + 1,
-                    features=_build_fixer_handoff_features(state, blackboard, det_qa=det_qa),
-                    extra={
-                        "action": (fix_payload or {}).get("action", "incomplete"),
+                    to_role=to_role,
+                    failure_route=failure_route,
+                    reason=reason,
+                    handoff_stage="fixer_handoff",
+                    handoff_extra={
+                        "action": "escalate",
                         "outcome": fix_outcome,
+                        "escalate_reason": reason[:240],
+                        "failure_route": failure_route,
                         "in_rescue_pass": in_rescue_pass,
                         "fix_prompt_breakdown": fix_prompt_breakdown,
                     },
                 )
+                ctx.last_qa_feedback = ""
+                if to_role == "navigator":
+                    _record_stage_transition(ctx, "fixer", "navigator")
+                    next_to_role, _reloc_reasons, _reloc_out, _new_nav = _exec_navigator_relocalize(
+                        ctx, reason, attempt=ctx.escalations_used + 1, allow_fast_return=True,
+                    )
+                    _record_stage_transition(ctx, "navigator", next_to_role)
+                    if next_to_role == "fixer":
+                        ctx.route = "fast"
+                        ctx.blackboard["_need_replan"] = False
+                    else:
+                        ctx.route = "planned"
+                        ctx.blackboard["_need_replan"] = True
+                    continue
+                if not fix_payload.get("candidate_comparison"):
+                    prune, prune_reason = _should_prune_suggester_replan(ctx)
+                    if prune:
+                        ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                        if ctx.trace:
+                            ctx.trace.record("stage_edge_pruned", from_role="fixer", to_role="suggester", reason=prune_reason)
+                        if not _extract_selected_source_paths(ctx.state):
+                            _record_stage_transition(ctx, "fixer", "fallback")
+                            return _resolve_fallback_patch(ctx, error_message=prune_reason)
+                        pruned_from_fixer = True
+                if not pruned_from_fixer:
+                    _record_stage_transition(ctx, "fixer", "suggester")
+                    ctx.route = "planned"
+                    ctx.blackboard["_need_replan"] = True
+                    continue
+
+            if not pruned_from_fixer:
+                lock_report = ctx.state.locked_regression_report() if hasattr(ctx.state, "locked_regression_report") else {}
+                rem_after_fix = _client_remaining_calls(ctx.client)
+                cur_rev = getattr(ctx.state, "_revision", None)
+                if (
+                    not ctx.state.verified()
+                    and lock_report.get("violations")
+                    and lock_report.get("locked")
+                    and ctx.blackboard.get("_red_lock_escalated_rev") != cur_rev
+                    and ctx.escalations_used < ctx.max_escalations
+                    and (rem_after_fix is None or rem_after_fix > ctx.budgets["verifier_reserve"] + 5)
+                ):
+                    ctx.blackboard["_red_lock_escalated_rev"] = cur_rev
+                    v_summary = "; ".join(
+                        f"{v.get('path')}({v.get('action')} x{v.get('count', 1)})"
+                        for v in (lock_report.get("violations") or [])[:3]
+                    )
+                    reason = f"Fixer hit Red-phase lock violation(s) on {v_summary}; inspect locked oracle and release/replan if wrong"
+                    _record_escalation(
+                        ctx,
+                        from_role="fixer",
+                        to_role="suggester",
+                        failure_route="architect",
+                        reason=reason,
+                        handoff_stage="fixer_handoff",
+                        handoff_extra={
+                            "action": "red_lock_escalate",
+                            "outcome": fix_outcome,
+                            "escalate_reason": reason[:240],
+                            "failure_route": "architect",
+                            "in_rescue_pass": in_rescue_pass,
+                            "fix_prompt_breakdown": fix_prompt_breakdown,
+                        },
+                    )
+                    _record_stage_transition(ctx, "fixer", "suggester")
+                    ctx.last_qa_feedback = ""
+                    ctx.route = "planned"
+                    ctx.blackboard["_need_replan"] = True
+                    continue
+
+            # --------------------------------------------------------------
+            # Stage 4: Patch QA & Verifier (Deterministic Gate + LLM Audit)
+            # --------------------------------------------------------------
+            _record_stage_transition(ctx, "fixer", "deterministic_qa")
+            det_qa = _exec_det_qa_step(
+                ctx,
+                fix_payload=fix_payload,
+                fix_outcome=fix_outcome,
+                in_rescue_pass=in_rescue_pass,
+                fix_prompt_breakdown=fix_prompt_breakdown,
+                attempt=ctx.escalations_used + ctx.qa_rounds + 1,
+            )
+            rem = _client_remaining_calls(ctx.client)
 
             if not det_qa["ok"]:
-                rem = _client_remaining_calls(client)
-                if (rem is not None and rem <= 1) or fix_outcome in ("reserve_reached", "stage_cap_reached") or in_rescue_pass:
-                    raw_fallback = state.auto_submit_verified_patch(allow_snapshot_fallback=True)
-                    fallback = _clean_and_audit_fallback_patch(state, issue_contract, raw_fallback, trace=trace)
+                if (rem is not None and rem <= 1) or fix_outcome in ("reserve_reached", "stage_cap_reached") or in_rescue_pass or pruned_from_fixer:
+                    raw_fallback = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+                    fallback = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, raw_fallback, trace=ctx.trace)
                     if fallback:
-                        if rem is not None and rem >= 3 and not in_rescue_pass:
-                            # Snapshot was restored & verified cleanly; proceed into normal Verifier audit instead of skipping it!
-                            det_qa = run_deterministic_qa_checks(state, issue_contract, run_doctest_on_shift=False)
-                        if not det_qa["ok"] or rem is None or rem <= 2 or in_rescue_pass:
-                            if trace:
-                                trace.record("auto_submit_verified", patch=fallback, stage="deterministic_qa_fallback")
+                        if rem is not None and rem >= 3 and not in_rescue_pass and not pruned_from_fixer:
+                            det_qa = run_deterministic_qa_checks(ctx.state, ctx.issue_contract, run_doctest_on_shift=False)
+                        if not det_qa["ok"] or rem is None or rem <= 2 or in_rescue_pass or pruned_from_fixer:
+                            if ctx.trace:
+                                ctx.trace.record("auto_submit_verified", patch=fallback, stage="deterministic_qa_fallback")
+                            _record_stage_transition(ctx, "deterministic_qa", "submission")
                             return fallback
+                    if pruned_from_fixer:
+                        _record_stage_transition(ctx, "deterministic_qa", "fallback")
+                        return _resolve_fallback_patch(ctx, error_message=f"Pruned zero-progress replanning: {det_qa['reason']}")
 
             if not det_qa["ok"]:
-
-                if fix_outcome == "reserve_reached" or (rem is not None and rem <= budgets["verifier_reserve"]):
-                    if not rescue_attempted and (rem is None or rem >= 2) and _extract_selected_source_paths(state):
-                        last_qa_feedback = (
+                if fix_outcome == "reserve_reached" or (rem is not None and rem <= ctx.budgets["verifier_reserve"]):
+                    if not ctx.rescue_attempted and (rem is None or rem >= 2) and _extract_selected_source_paths(ctx.state):
+                        ctx.last_qa_feedback = (
                             f"LOW BUDGET RESCUE ({rem} API calls remaining): Deterministic QA failed with: {det_qa['reason']}. "
                             "Fix ONLY this verification blocker (e.g., run the missing cargo_test or fix/remove a broken temporary regression test) "
                             "and call submit_for_qa immediately."
                         )
-                        if trace:
-                            trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=qa_rounds + 1, rescue=True)
+                        if ctx.trace:
+                            ctx.trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=ctx.qa_rounds + 1, rescue=True)
+                        _record_stage_transition(ctx, "deterministic_qa", "fixer")
                         continue
-                    degraded = _try_degraded_patch_fallback(
-                        state, trace=trace, allow_unverified_compiling=True, issue_contract=issue_contract, blackboard=blackboard,
-                    )
-                    if degraded:
-                        return degraded
-                    raise RuntimeError(f"Agent failed deterministic QA verification: {det_qa['reason']}")
+                    _record_stage_transition(ctx, "deterministic_qa", "fallback")
+                    return _resolve_fallback_patch(ctx, error_message=f"Agent failed deterministic QA verification: {det_qa['reason']}")
 
-                stuck_now = state.stuck_status()
+                stuck_now = ctx.state.stuck_status()
                 if _is_env_dependency_blocker(det_qa.get("reason", "")):
-                    blackboard["environment_blocker"] = True
+                    ctx.blackboard["environment_blocker"] = True
                 should_escalate_to_arch = (
-                    not state.verified()
-                    and not blackboard.get("environment_blocker")
-                    and escalations_used < max_escalations
-                    and (rem is None or rem > budgets["verifier_reserve"] + 6)
+                    not pruned_from_fixer
+                    and not ctx.state.verified()
+                    and not ctx.blackboard.get("environment_blocker")
+                    and ctx.escalations_used < ctx.max_escalations
+                    and (rem is None or rem > ctx.budgets["verifier_reserve"] + 6)
                     and (
                         fix_outcome == "stage_cap_reached"
                         or stuck_now["compile_repeats"] >= 2
@@ -4123,250 +5163,245 @@ def run_multi_agent(
                     )
                 )
                 if should_escalate_to_arch:
-                    escalations_used += 1
                     failure_route = _classify_failure_route(det_qa.get("reason", ""), stuck_now)
-                    blackboard["last_failure_route"] = failure_route
-                    blackboard["escalations"].append({
-                        "attempt": escalations_used,
-                        "reason": f"Fixer ended without passing verification ({fix_outcome}): {det_qa['reason']}",
-                        "repair_units": unit_coordinator.status(),
-                        "failure_route": failure_route,
-                        "failed_plan": blackboard.get("repair_plan"),
-                        "stuck_status": stuck_now,
-                        "existing_test_failures": list(getattr(state, "_existing_test_failures", [])),
-                    })
-                    if trace:
-                        trace.record("escalation", from_role="fixer", to_role=failure_route, reason=det_qa["reason"], attempt=escalations_used, failure_route=failure_route)
-                    state.reset_stuck_counters()
-                    route = "planned"
-                    blackboard["_need_replan"] = True
-                    last_qa_feedback = ""
+                    to_role = "navigator" if failure_route == "navigator" else "suggester"
+                    reason = f"Fixer ended without passing verification ({fix_outcome}): {det_qa['reason']}"
+                    _record_escalation(
+                        ctx,
+                        from_role="fixer",
+                        to_role=to_role,
+                        failure_route=failure_route,
+                        reason=reason,
+                    )
+                    ctx.last_qa_feedback = ""
+                    if to_role == "navigator":
+                        _record_stage_transition(ctx, "deterministic_qa", "navigator")
+                        next_to_role, _reloc_reasons, _reloc_out, _new_nav = _exec_navigator_relocalize(
+                            ctx, reason, attempt=ctx.escalations_used + 1, allow_fast_return=True,
+                        )
+                        _record_stage_transition(ctx, "navigator", next_to_role)
+                        if next_to_role == "fixer":
+                            ctx.route = "fast"
+                            ctx.blackboard["_need_replan"] = False
+                        else:
+                            ctx.route = "planned"
+                            ctx.blackboard["_need_replan"] = True
+                        continue
+                    prune, prune_reason = _should_prune_suggester_replan(ctx)
+                    if prune:
+                        ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                        if ctx.trace:
+                            ctx.trace.record("stage_edge_pruned", from_role="deterministic_qa", to_role="suggester", reason=prune_reason)
+                        _record_stage_transition(ctx, "deterministic_qa", "fallback")
+                        return _resolve_fallback_patch(ctx, error_message=f"{prune_reason}: {det_qa['reason']}")
+                    _record_stage_transition(ctx, "deterministic_qa", "suggester")
+                    ctx.route = "planned"
+                    ctx.blackboard["_need_replan"] = True
                     continue
 
-                if qa_rounds < max_qa_rounds and (rem is None or rem > budgets["verifier_reserve"] + 2):
-                    qa_rounds += 1
-                    last_qa_feedback = f"Deterministic QA gate failed: {det_qa['reason']}"
-                    if trace:
-                        trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=qa_rounds)
+                if ctx.qa_rounds < ctx.max_qa_rounds and (rem is None or rem > ctx.budgets["verifier_reserve"] + 2):
+                    ctx.qa_rounds += 1
+                    ctx.last_qa_feedback = f"Deterministic QA gate failed: {det_qa['reason']}"
+                    if ctx.trace:
+                        ctx.trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=ctx.qa_rounds)
+                    _record_stage_transition(ctx, "deterministic_qa", "fixer")
                     continue
 
-                fallback = _clean_and_audit_fallback_patch(
-                    state, issue_contract, state.auto_submit_verified_patch(allow_snapshot_fallback=True), trace=trace
-                )
-                if fallback:
-                    if trace:
-                        trace.record("auto_submit_verified", patch=fallback, stage="deterministic_qa_last_resort")
-                    return fallback
-                degraded = _try_degraded_patch_fallback(
-                    state, trace=trace, allow_unverified_compiling=True, issue_contract=issue_contract, blackboard=blackboard,
-                )
-                if degraded:
-                    return degraded
-                raise RuntimeError(f"Agent failed deterministic QA verification: {det_qa['reason']}")
+                _record_stage_transition(ctx, "deterministic_qa", "fallback")
+                return _resolve_fallback_patch(ctx, error_message=f"Agent failed deterministic QA verification: {det_qa['reason']}")
 
             selected = det_qa["selected"]
             hygiene = det_qa["hygiene"]
-            missing_apis = det_qa["missing_contract_apis"]
-            existing_failures = det_qa.get("existing_test_failures") or []
-            latest_test_failure = state.stuck_status().get("last_test_failure") or {}
-            added_inline_tests = det_qa.get("added_inline_tests") or []
-            rem = _client_remaining_calls(client)
+            rem = _client_remaining_calls(ctx.client)
 
             if rem is not None and rem <= 2:
-                state.patch = hygiene["patch"] or state.build_patch(selected)
-                if trace:
-                    consistency_pending = bool(blackboard.get("_qa_repair_pending"))
-                    consistency_unchecked = bool(blackboard.get("repair_plan")) and not consistency_pending
-                    if consistency_pending or consistency_unchecked:
-                        _record_consistency_blocked(
-                            trace, blackboard, state.patch, blackboard.get("_last_qa_payload"),
-                            reason=(
-                                "Verifier rejection was followed by budget exhaustion before a repair could be re-verified."
-                                if consistency_pending else
-                                "Verifier consistency audit was bypassed because the remaining API budget was exhausted."
-                            ),
-                            attempt=qa_rounds + 1,
-                            decision="REJECT" if consistency_pending else "BYPASS_LOW_BUDGET",
-                        )
-                        trace.record("qa_gate", deterministic_ok=True, llm_decision="CONSISTENCY_BLOCKED", missing_apis=missing_apis)
-                    else:
-                        trace.record("qa_gate", deterministic_ok=True, llm_decision="BYPASS_LOW_BUDGET", missing_apis=missing_apis)
-                    _record_plan_consistency_audit(trace, blackboard, state.patch, None,
-                                                   attempt=qa_rounds + 1, outcome="bypassed_low_budget")
-                    _record_handoff_snapshot(
-                        trace,
-                        stage="verifier_handoff",
-                        from_role="verifier",
-                        to_role="submission",
-                        attempt=qa_rounds + 1,
-                        features=_build_verifier_handoff_features(blackboard.get("_last_qa_payload") if consistency_pending else None),
-                        extra={
-                            "decision": "CONSISTENCY_BLOCKED" if (consistency_pending or consistency_unchecked) else "BYPASS_LOW_BUDGET",
-                            "outcome": "blocked" if (consistency_pending or consistency_unchecked) else "bypassed",
-                            "ver_prompt_chars": 0,
-                        },
-                    )
-                return state.patch
+                _record_stage_transition(ctx, "deterministic_qa", "submission")
+                return _handle_low_budget_det_qa_bypass(ctx, det_qa)
 
-            if (det_qa.get("passed_on_original")
-                    and not _documentation_only_patch(state, issue_contract)
-                    and not _is_valid_external_unreproduced_reason(unreproduced_reason, issue_contract, state=state, blackboard=blackboard, issue_text=issue)
-                    and qa_rounds < max_qa_rounds
-                    and (rem is None or rem > budgets["verifier_reserve"] + 6)):
-                qa_rounds += 1
-                last_qa_feedback = (
+            unreproduced_reason = (fix_payload or {}).get("unreproduced_reason", "")
+            if (
+                det_qa.get("passed_on_original")
+                and not _documentation_only_patch(ctx.state, ctx.issue_contract)
+                and not _is_valid_external_unreproduced_reason(
+                    unreproduced_reason, ctx.issue_contract, state=ctx.state, blackboard=ctx.blackboard, issue_text=ctx.issue,
+                )
+                and ctx.qa_rounds < ctx.max_qa_rounds
+                and (rem is None or rem > ctx.budgets["verifier_reserve"] + 6)
+            ):
+                ctx.qa_rounds += 1
+                ctx.last_qa_feedback = (
                     "Deterministic QA rejected submission: your temporary regression test PASSED on the unpatched original checkout, "
                     "so it did not reproduce the bug. Construct a real Red-phase test that fails on original code and passes with your fix, "
                     "or call escalate_for_replan."
                 )
-                if trace:
-                    trace.record("qa_gate", deterministic_ok=False, reason="Temporary regression test passed on unpatched original code.", qa_round=qa_rounds)
-                if qa_rounds >= 2 and escalations_used < max_escalations:
-                    escalations_used += 1
-                    route = "planned"
-                    blackboard["_need_replan"] = True
-                    blackboard["escalations"].append({
-                        "attempt": escalations_used,
-                        "reason": last_qa_feedback,
-                        "repair_units": unit_coordinator.status(),
-                        "failure_route": "architect",
-                        "failed_plan": blackboard.get("repair_plan"),
-                        "stuck_status": state.stuck_status(),
-                        "existing_test_failures": list(getattr(state, "_existing_test_failures", [])),
-                    })
+                if ctx.trace:
+                    ctx.trace.record("qa_gate", deterministic_ok=False, reason="Temporary regression test passed on unpatched original code.", qa_round=ctx.qa_rounds)
+                if ctx.qa_rounds >= 2 and ctx.escalations_used < ctx.max_escalations:
+                    _record_escalation(
+                        ctx,
+                        from_role="deterministic_qa",
+                        to_role="suggester",
+                        failure_route="architect",
+                        reason=ctx.last_qa_feedback,
+                    )
+                    _record_stage_transition(ctx, "deterministic_qa", "suggester")
+                    ctx.route = "planned"
+                    ctx.blackboard["_need_replan"] = True
+                else:
+                    _record_stage_transition(ctx, "deterministic_qa", "fixer")
                 continue
 
-            ver_activity: dict[str, Any] = {"files_read": [], "symbols_queried": []}
-            ver_handoff, ver_holder = _make_handoff_tools("verifier", state, blackboard, ver_activity)
-            ver_tools = _wrap_tools_for_role(
-                "verifier", tools_by_name, list(_VERIFIER_TOOLS),
-                ver_handoff, ver_holder, state, client, _client_calls_made(client),
-                budgets["verifier_cap"], ver_activity,
-                blackboard=blackboard,
+            _record_stage_transition(ctx, "deterministic_qa", "verifier")
+            decision, ver_payload, _ver_outcome = _exec_verifier_step(ctx, det_qa)
+            _update_milestones_and_kpi(ctx, "verifier", det_qa=det_qa, ver_payload=ver_payload)
+
+            if decision in ("APPROVE", "INCONCLUSIVE_FALLBACK"):
+                if decision == "APPROVE":
+                    ctx.blackboard["_qa_repair_pending"] = False
+                    ctx.blackboard.pop("_last_qa_payload", None)
+                ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
+                _record_stage_transition(ctx, "verifier", "submission")
+                return ctx.state.patch
+
+            ctx.blackboard["_qa_repair_pending"] = True
+            ctx.blackboard["_last_qa_payload"] = dict(ver_payload)
+            _reconcile_plan_with_qa_rejection(ctx.blackboard, ver_payload)
+            _append_cognitive_entry(
+                ctx,
+                source="verifier",
+                actual="; ".join(
+                    [str(x) for x in (ver_payload.get("missing_requirements") or [])]
+                    + [str(x) for x in (ver_payload.get("objections") or [])]
+                ) or str(ver_payload.get("summary") or "REJECT"),
             )
-            verifier_patch = hygiene.get("patch") or state.build_patch(selected)
-            ver_prompt = _build_verifier_prompt(issue, issue_contract, det_qa, state, blackboard)
-            ver_payload, ver_outcome = _run_role_agent(
-                "verifier", prompts_mod.VERIFIER_PROMPT, ver_prompt, ver_tools, ver_holder,
-                model=model, api_key=api_key, base_url=base_url, client=client, trace=trace,
-                compress_fn=compress_fn, create_agent_fn=create_agent_fn,
-                chat_model_factory=chat_model_factory, role_callback_cls=role_callback_cls,
-                stage_cap=budgets["verifier_cap"], reserve_floor=0,
-                attempt=qa_rounds + 1, max_continuations=1,
-                 continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); include an issue/evidence explanation when reporting plan_consistency='conflict'.",
-                handoff_only_tools=ver_handoff,
-                 wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; include an issue/evidence explanation for any plan conflict.",
-            )
-
-            if not ver_payload:
-                ver_payload = {
-                    "decision": "REJECT",
-                    "summary": "Verifier did not return a structured QA decision before its stage budget ended.",
-                    "missing_requirements": [],
-                    "objections": ["No structured Verifier decision was returned; the patch requires another audit before submission."],
-                    "plan_consistency": "not_checked",
-                    "plan_conflicts": [],
-                }
-            decision = str(ver_payload.get("decision", "REJECT")).strip().upper()
-            if decision not in ("APPROVE", "REJECT"):
-                decision = "REJECT"
-                ver_payload["decision"] = decision
-            if ver_payload:
-                blackboard["qa_history"].append(dict(ver_payload))
-            if trace:
-                trace.record("qa_gate", deterministic_ok=True, llm_decision=decision, payload=ver_payload,
-                             qa_round=qa_rounds + 1, reproduction=det_qa.get("reproduction"),
-                             unreproduced_reason=det_qa.get("unreproduced_reason"))
-                _record_plan_consistency_audit(trace, blackboard, verifier_patch, ver_payload,
-                                               attempt=qa_rounds + 1, outcome=ver_outcome)
-                _record_handoff_snapshot(
-                    trace,
-                    stage="verifier_handoff",
-                    from_role="verifier",
-                    to_role=("submission" if decision == "APPROVE" else "fixer"),
-                    attempt=qa_rounds + 1,
-                    features=_build_verifier_handoff_features(ver_payload),
-                    extra={
-                        "decision": decision,
-                        "outcome": ver_outcome,
-                        "ver_prompt_chars": len(ver_prompt),
-                    },
-                )
-
-            if decision == "APPROVE":
-                blackboard["_qa_repair_pending"] = False
-                blackboard.pop("_last_qa_payload", None)
-                state.patch = hygiene["patch"] or state.build_patch(selected)
-                return state.patch
-
-            blackboard["_qa_repair_pending"] = True
-            blackboard["_last_qa_payload"] = dict(ver_payload)
-            repair_feedback = _format_qa_repair_feedback(ver_payload, round_number=qa_rounds + 1)
-            rem_after_qa = _client_remaining_calls(client)
-            if not qa_repair_loop_enabled:
-                state.patch = hygiene["patch"] or state.build_patch(selected)
-                if trace:
-                    trace.record(
+            repair_feedback = _format_qa_repair_feedback(ver_payload, round_number=ctx.qa_rounds + 1)
+            rem_after_qa = _client_remaining_calls(ctx.client)
+            if not ctx.qa_repair_loop_enabled:
+                ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
+                if ctx.trace:
+                    ctx.trace.record(
                         "qa_repair_cycle",
                         outcome="bypassed",
                         reason="RUSTBENCH_QA_REPAIR_LOOP is disabled for the control arm.",
-                        qa_round=qa_rounds + 1,
+                        qa_round=ctx.qa_rounds + 1,
                         plan_consistency=ver_payload.get("plan_consistency", "not_checked"),
                         plan_conflicts=list(ver_payload.get("plan_conflicts") or []),
-                        patch=_feature_meta(state.patch),
+                        patch=_feature_meta(ctx.state.patch),
                     )
-                return state.patch
-            if qa_rounds >= max_qa_rounds or (rem_after_qa is not None and rem_after_qa <= 4):
-                state.patch = hygiene["patch"] or state.build_patch(selected)
+                _record_stage_transition(ctx, "verifier", "submission")
+                return ctx.state.patch
+            if ctx.qa_rounds >= ctx.max_qa_rounds or (rem_after_qa is not None and rem_after_qa <= 4):
+                ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
                 _record_consistency_blocked(
-                    trace, blackboard, state.patch, ver_payload,
+                    ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
                     reason=(
                         "Verifier rejected the patch but no repair cycle remained "
-                        f"(qa_rounds={qa_rounds}, remaining_calls={rem_after_qa})."
+                        f"(qa_rounds={ctx.qa_rounds}, remaining_calls={rem_after_qa})."
                     ),
-                    attempt=qa_rounds + 1,
+                    attempt=ctx.qa_rounds + 1,
                 )
-                return state.patch
+                _record_stage_transition(ctx, "verifier", "submission")
+                return ctx.state.patch
 
-            qa_rounds += 1
-            last_qa_feedback = repair_feedback
-            escalate_qa, esc_reason = _should_escalate_qa_to_architect(det_qa, blackboard["qa_history"], qa_rounds - 1)
-            if (escalate_qa and escalations_used < max_escalations
-                    and (rem_after_qa is None or rem_after_qa > budgets["verifier_reserve"] + 6)):
-                escalations_used += 1
-                failure_route = _classify_failure_route(esc_reason + " " + repair_feedback, state.stuck_status())
-                blackboard["last_failure_route"] = failure_route
-                blackboard["escalations"].append({
-                    "attempt": escalations_used,
-                    "reason": f"Repeated Verifier rejection ({esc_reason}): {repair_feedback[:600]}",
-                    "repair_units": unit_coordinator.status(),
-                    "failure_route": failure_route,
-                    "failed_plan": blackboard.get("repair_plan"),
-                    "stuck_status": state.stuck_status(),
-                    "existing_test_failures": list(getattr(state, "_existing_test_failures", [])),
-                })
-                if trace:
-                    trace.record("escalation", from_role="verifier", to_role=failure_route, reason=esc_reason,
-                                 attempt=escalations_used, failure_route=failure_route)
-                state.reset_stuck_counters()
-                route = "planned"
-                blackboard["_need_replan"] = True
-            if trace:
-                trace.record(
+            ctx.qa_rounds += 1
+            ctx.last_qa_feedback = repair_feedback
+            escalate_qa, esc_reason = _should_escalate_qa_to_architect(det_qa, ctx.blackboard["qa_history"], ctx.qa_rounds - 1)
+            if (
+                escalate_qa
+                and ctx.escalations_used < ctx.max_escalations
+                and (rem_after_qa is None or rem_after_qa > ctx.budgets["verifier_reserve"] + 6)
+            ):
+                cur_sig = _repair_progress_signature(ctx.state)
+                if cur_sig in ctx.qa_escalation_sigs:
+                    best_raw = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+                    best_clean = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, best_raw, trace=ctx.trace) if best_raw else ""
+                    ctx.state.patch = best_clean or hygiene["patch"] or ctx.state.build_patch(selected)
+                    _record_consistency_blocked(
+                        ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
+                        reason=f"QA escalation halted after zero progress since previous escalation: {esc_reason}",
+                        attempt=ctx.qa_rounds + 1,
+                    )
+                    if ctx.trace:
+                        ctx.trace.record("qa_stall_stop", reason=esc_reason)
+                    _record_stage_transition(ctx, "verifier", "submission")
+                    return ctx.state.patch
+                ctx.qa_escalation_sigs.add(cur_sig)
+                failure_route = _classify_failure_route(esc_reason + " " + repair_feedback, ctx.state.stuck_status())
+                to_role = "navigator" if failure_route == "navigator" else "suggester"
+                _record_escalation(
+                    ctx,
+                    from_role="verifier",
+                    to_role=to_role,
+                    failure_route=failure_route,
+                    reason=f"Repeated Verifier rejection ({esc_reason}): {repair_feedback[:600]}",
+                )
+                if ctx.trace:
+                    ctx.trace.record(
+                        "qa_repair_cycle",
+                        outcome="scheduled",
+                        qa_round=ctx.qa_rounds,
+                        plan_consistency=ver_payload.get("plan_consistency", "not_checked"),
+                        plan_conflicts=list(ver_payload.get("plan_conflicts") or []),
+                        feedback=_feature_meta(repair_feedback),
+                    )
+                if to_role == "navigator":
+                    _record_stage_transition(ctx, "verifier", "navigator")
+                    next_to_role, _reloc_reasons, _reloc_out, _new_nav = _exec_navigator_relocalize(
+                        ctx, esc_reason, attempt=ctx.escalations_used + 1, allow_fast_return=True,
+                    )
+                    _record_stage_transition(ctx, "navigator", next_to_role)
+                    if next_to_role == "fixer":
+                        ctx.route = "fast"
+                        ctx.blackboard["_need_replan"] = False
+                    else:
+                        ctx.route = "planned"
+                        ctx.blackboard["_need_replan"] = True
+                    continue
+                prune, prune_reason = _should_prune_suggester_replan(ctx)
+                if prune:
+                    ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                    if ctx.trace:
+                        ctx.trace.record("stage_edge_pruned", from_role="verifier", to_role="suggester", reason=prune_reason)
+                    best_raw = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+                    best_clean = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, best_raw, trace=ctx.trace) if best_raw else ""
+                    ctx.state.patch = best_clean or hygiene["patch"] or ctx.state.build_patch(selected)
+                    _record_consistency_blocked(
+                        ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
+                        reason=f"{prune_reason}: {esc_reason}",
+                        attempt=ctx.qa_rounds + 1,
+                    )
+                    _record_stage_transition(ctx, "verifier", "submission")
+                    return ctx.state.patch
+                _record_stage_transition(ctx, "verifier", "suggester")
+                ctx.route = "planned"
+                ctx.blackboard["_need_replan"] = True
+                continue
+
+            if ctx.trace:
+                ctx.trace.record(
                     "qa_repair_cycle",
                     outcome="scheduled",
-                    qa_round=qa_rounds,
+                    qa_round=ctx.qa_rounds,
                     plan_consistency=ver_payload.get("plan_consistency", "not_checked"),
                     plan_conflicts=list(ver_payload.get("plan_conflicts") or []),
                     feedback=_feature_meta(repair_feedback),
                 )
+            if ctx.fix_session_history and callable(ctx.compress_fn):
+                try:
+                    ctx.fix_session_history = ctx.compress_fn(ctx.fix_session_history)
+                except Exception:
+                    pass
+            _record_stage_transition(ctx, "verifier", "fixer")
 
     except Exception as exc:
         fallback = _try_degraded_patch_fallback(
-            state, trace=trace, allow_unverified_compiling=True, issue_contract=issue_contract, blackboard=blackboard,
+            ctx.state, trace=ctx.trace, allow_unverified_compiling=True,
+            issue_contract=ctx.issue_contract, blackboard=ctx.blackboard,
         )
         if fallback:
-            if trace:
-                trace.record("auto_submit_after_error", error=str(exc), error_type=type(exc).__name__)
+            if ctx.trace:
+                ctx.trace.record("auto_submit_after_error", error=str(exc), error_type=type(exc).__name__)
             return fallback
         raise
+    finally:
+        _emit_coordination_metrics(ctx)

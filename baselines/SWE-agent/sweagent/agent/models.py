@@ -521,6 +521,37 @@ class InstantEmptySubmitTestModel(BaseModel):
         return action
 
 
+def resolve_api_env(api: str | None = None, api_limit: int | None = None) -> None:
+    """Resolve API profile (defaulting to yj) and API_LIMIT into os.environ."""
+    if api_limit is not None:
+        if isinstance(api_limit, bool) or api_limit < 1:
+            raise ValueError("--api-limit must be a positive integer")
+        os.environ["API_LIMIT"] = str(api_limit)
+    if api is not None:
+        profile = api.strip().lower()
+        if profile not in ("yj", "ds"):
+            raise ValueError("--api must be one of yj, ds")
+        prefix = profile.upper()
+        base_url = keys_config.get(f"{prefix}_BASE_URL")
+        api_key = keys_config.get(f"{prefix}_API_KEY")
+        model = keys_config.get(f"{prefix}_MODEL")
+        if not base_url or not api_key or not model:
+            raise ValueError(f"Set {prefix}_BASE_URL, {prefix}_API_KEY, and {prefix}_MODEL in .env")
+        os.environ["BASE_URL"] = base_url
+        os.environ["API_KEY"] = api_key
+        os.environ["MODEL"] = model
+        return
+    if keys_config.get("API_KEY") and keys_config.get("MODEL"):
+        return
+    base_url = keys_config.get("YJ_BASE_URL")
+    api_key = keys_config.get("YJ_API_KEY")
+    model = keys_config.get("YJ_MODEL")
+    if base_url and api_key and model:
+        os.environ["BASE_URL"] = base_url
+        os.environ["API_KEY"] = api_key
+        os.environ["MODEL"] = model
+
+
 def get_model(args: ModelArguments, commands: list[Command] | None = None):
     """Use the configured OpenAI-compatible API, retaining offline replay modes."""
     commands = commands or []
@@ -529,7 +560,8 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
     if args.model_name in offline:
         return offline[args.model_name](args, commands)
     from dataclasses import replace
+    resolve_api_env()
     model_name = keys_config.get("MODEL")
     if not model_name:
-        raise ValueError("Set MODEL in the repository root .env file")
+        raise ValueError("Set YJ_*/DS_* (or MODEL and API_KEY) in the repository root .env file")
     return OpenAIModel(replace(args, model_name=model_name), commands)

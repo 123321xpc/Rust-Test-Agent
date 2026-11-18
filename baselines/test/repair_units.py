@@ -5,6 +5,7 @@ local to a unit and its declared prerequisites, never a replacement for final QA
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,17 +100,29 @@ def normalize_units(plan: dict | None, fallback_paths: list[str]) -> list[dict]:
     return units
 
 
+def _spec_core(spec: dict[str, Any]) -> tuple:
+    """Return execution-relevant fields of a normalized unit spec for retention across wording edits."""
+    return (
+        tuple(spec.get("paths") or []),
+        spec.get("work") or [],
+        tuple(sorted(spec.get("depends_on") or spec.get("deps") or [])),
+        spec.get("verification") or [],
+        bool(spec.get("strict_scope", False)),
+    )
+
+
 class RepairUnitCoordinator:
     UNCHECKED_EDITS = 6
     READ_ONLY_TOOLS = frozenset({
         "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
-        "inspect_rust_neighborhood", "rust_error_explain", "rust_trace",
+        "inspect_rust_neighborhood", "rust_error_explain",
     })
 
     def __init__(self, state, tools_by_name, blackboard, trace=None, candidate_policy=None):
         self.state, self.tools, self.blackboard, self.trace = state, tools_by_name, blackboard, trace
         self.candidate_policy = candidate_policy
         self.units: list[dict] = []
+        self.planned_scope: set[str] = set()
         self.active: str | None = None
         self.plan_key = None
         self.steps = self.unchecked_edits = 0
@@ -120,9 +133,10 @@ class RepairUnitCoordinator:
 
     def status(self):
         return {"current_unit": self.active, "units": [
-            {k: u.get(k) for k in ("unit_id", "description", "paths", "depends_on", "status",
-                                   "expected_outcome", "refutation_signals", "refuted_by",
-                                   "completed_changes", "summary", "evidence", "blocker")}
+            {**{k: u.get(k) for k in ("unit_id", "description", "paths", "depends_on", "status",
+                                      "expected_outcome", "refutation_signals", "refuted_by",
+                                      "completed_changes", "summary", "evidence", "blocker")},
+             "frozen": u.get("status") == "verified"}
             for u in self.units]}
 
     def publish(self, event, **extra):
@@ -154,38 +168,61 @@ class RepairUnitCoordinator:
             result |= more
 
     def configure(self, plan, fallback_paths):
-        specs = normalize_units(plan, fallback_paths)
-        self.planned_scope = {p for u in specs for p in u["paths"]}
-        if self.candidate_policy and not self.candidate_policy.data["scope_initialized"]:
-            self.candidate_policy.observe_scope({p for u in specs for p in u["paths"]})
-        key = json.dumps(specs, sort_keys=True)
+        raw_plan = plan or {}
         policy = self.candidate_policy
         switch_paths = set(policy.data.pop("switch_paths", []) if policy else [])
         if policy:
             policy.data.pop("retain_current_patch", None)
+        if self.units and not (raw_plan.get("ordered_edits") or []) and not (raw_plan.get("repair_units") or []):
+            # Guard against empty replans wiping out an established unit DAG.
+            if switch_paths:
+                stale = {u["unit_id"] for u in self.units if set(u["paths"]) & switch_paths}
+                if stale:
+                    self.invalidate(stale, "Candidate hypothesis switched")
+            return
+        specs = normalize_units(plan, fallback_paths)
+        if policy and not policy.data["scope_initialized"]:
+            policy.observe_scope({p for u in specs for p in u["paths"]})
+        key = json.dumps(specs, sort_keys=True)
         if key == self.plan_key and not switch_paths:
             return
         old = {u["unit_id"]: u for u in self.units}
         replan_baseline = self.state._capture_snapshot() if self.units else None
         keep = {s["unit_id"] for s in specs if s["unit_id"] in old
-                and old[s["unit_id"]]["spec"] == s
+                and _spec_core(old[s["unit_id"]]["spec"]) == _spec_core(s)
                 and old[s["unit_id"]]["status"] in {"verified", "completed_unverified"}
                 and self.evidence_valid(old[s["unit_id"]])
                 and not set(s["paths"]) & switch_paths}
-        # A retained unit must also retain all of its verified prerequisites.
+        new_ids = {s["unit_id"] for s in specs}
+        new_paths = {p for s in specs for p in s["paths"]}
+        # Carry over verified units omitted from an incremental replan when paths do not conflict.
+        carried_ids = {
+            uid for uid, prev in old.items()
+            if uid not in new_ids
+            and prev.get("status") == "verified"
+            and self.evidence_valid(prev)
+            and not (set(prev.get("paths") or []) & (switch_paths | new_paths))
+        }
+        retained = keep | carried_ids
+        # A retained unit must also retain all of its verified/retained prerequisites.
         while True:
-            reduced = {uid for uid in keep if set(old[uid]["depends_on"]) <= keep}
-            if reduced == keep:
+            reduced = {uid for uid in retained if set(old[uid]["depends_on"]) <= retained}
+            if reduced == retained:
                 break
-            keep = reduced
-        self.units = [old[s["unit_id"]] if s["unit_id"] in keep else
-                      dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=replan_baseline, touched=set())
-                      for s in specs]
+            retained = reduced
+        keep = retained & new_ids
+        carried = [old[uid] for uid in old if uid in (retained & carried_ids)]
+        self.units = carried + [
+            old[s["unit_id"]] if s["unit_id"] in keep else
+            dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=replan_baseline, touched=set())
+            for s in specs
+        ]
+        self.planned_scope = {p for u in self.units for p in u["paths"]}
         partial_paths = [p.as_posix() for p in self.state.changed_paths()]
         self.check_cache.clear()
         self.active = None
         self.plan_key = key
-        self.publish("repair_unit_plan", retained_units=sorted(keep), preserved_partial_paths=partial_paths)
+        self.publish("repair_unit_plan", retained_units=sorted(retained), preserved_partial_paths=partial_paths)
 
     def evidence_valid(self, unit):
         return unit.get("inputs") == self._images((unit.get("inputs") or {}).keys())
@@ -230,6 +267,20 @@ class RepairUnitCoordinator:
         source_test = bool(kwargs.get("target_src")) or ("src" in relative.parts and relative.suffix == ".rs")
         temporary = ((name == "write_regression_test" and not source_test)
                      or (relative in self.state.regression_tests and relative not in self.state.in_module_regressions))
+        if name == "revert_file" and self.active and path and not temporary:
+            frozen = next(
+                (other for other in self.units
+                 if other["unit_id"] != self.active
+                 and other.get("status") == "verified"
+                 and path in (set(other.get("paths") or []) | set(other.get("completed_changes") or []))),
+                None,
+            )
+            if frozen is not None:
+                return (
+                    f"Error: Cannot revert '{path}' because it belongs to verified repair unit "
+                    f"'{frozen['unit_id']}'. Keep verified units intact; edit only active unit '{self.active}' "
+                    "or call escalate_for_replan."
+                )
         if not self.active:
             owners = {u["unit_id"] for u in self.units if path in u["paths"] or path in u["completed_changes"]}
             if not owners and (temporary or not self.units[-1]["strict_scope"]):
@@ -423,5 +474,4 @@ class RepairUnitCoordinator:
                 + json.dumps(ledger, ensure_ascii=False)
                 + ("\nCurrent unit work:\n" + json.dumps(active["work"], ensure_ascii=False) if active else "")
                 + "\nFinish a dependency-closed unit with complete_repair_unit(summary). Coordinator runs targeted Cargo checks. "
-                  "Edit related files as needed. Checkpoints may be restored explicitly. "
                   "After all units close, run final regression/existing tests and submit_for_qa.")

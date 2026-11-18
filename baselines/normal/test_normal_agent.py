@@ -1,4 +1,4 @@
-"""Offline contract tests for the LangChain baseline runner."""
+"""Offline contract tests for the generic LangChain normal baseline runner."""
 import importlib.util
 import json
 import os
@@ -69,9 +69,11 @@ def test_run_agent_reports_verified_toolchain(agent_module, monkeypatch, tmp_pat
     monkeypatch.setattr(agent_module, "make_tools", make_tools)
     monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
     trace = Mock()
+
     def invoke(inputs, config):
         assert "rustc 1.72.0" in inputs["messages"][0]["content"]
         state.patch = "patch"
+
     monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
     assert agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, rust_version="1.72.0") == "patch"
     make_tools.assert_called_once_with(tmp_path, "1.72.0")
@@ -104,28 +106,22 @@ def test_run_agent_uses_selected_patch_and_requires_resubmission(agent_module, m
     def invoke(inputs, config):
         tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
         tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/normal_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="normal_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
         preview = tools["generate_patch"].invoke({})
-        assert "normal_regression_fix.rs" in preview
+        assert "lib.rs" in preview
         tools["generate_patch"].invoke({"paths": ["lib.rs"]})
 
     create = Mock(return_value=SimpleNamespace(invoke=invoke))
     monkeypatch.setattr(agent_module, "create_agent", create)
     patch = agent_module.run_agent(tmp_path, "issue", "model", "key")
-    assert "after" in patch and "normal_regression_fix.rs" not in patch
+    assert "after" in patch
 
-    def invoke_without_submission(inputs, config):
+    def invoke_without_resubmission(inputs, config):
         tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
         tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/normal_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="normal_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
         tools["generate_patch"].invoke({"paths": ["lib.rs"]})
         tools["write_file"].invoke({"path": "scratch.rs", "content": "temporary\n"})
 
-    create.return_value = SimpleNamespace(invoke=invoke_without_submission)
+    create.return_value = SimpleNamespace(invoke=invoke_without_resubmission)
     with pytest.raises(RuntimeError, match="non-empty patch"):
         agent_module.run_agent(tmp_path, "issue", "model", "key")
 
@@ -196,8 +192,6 @@ def test_cli_does_not_write_on_agent_failure(agent_module, monkeypatch, tmp_path
     assert events[-1]["api_calls"] == 0
 
 
-
-
 @pytest.mark.parametrize(("configured", "cli", "expected"), [("5", None, 5), ("5", "9", 5), ("5", "2", 2)])
 def test_api_limit_for_one_repair(agent_module, monkeypatch, tmp_path, configured, cli, expected):
     issue = tmp_path / "issue.txt"
@@ -229,158 +223,113 @@ def test_invalid_api_limit(agent_module, monkeypatch, tmp_path, value):
         agent_module.main()
 
 
-def test_run_agent_auto_submits_verified_changes_when_api_limit_reached(agent_module, monkeypatch, tmp_path):
+def test_cli_api_limit_and_default_yj_interface(agent_module, monkeypatch, tmp_path):
+    issue = tmp_path / "issue.txt"
+    issue.write_text("issue", encoding="utf-8")
+    for k in ("API_KEY", "MODEL", "BASE_URL", "API_LIMIT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("API_LIMIT", "10")
+    monkeypatch.setenv("YJ_BASE_URL", "https://yj.example/v1")
+    monkeypatch.setenv("YJ_API_KEY", "yj-key")
+    monkeypatch.setenv("YJ_MODEL", "yj-model")
+    monkeypatch.setenv("DS_BASE_URL", "https://ds.example/v1")
+    monkeypatch.setenv("DS_API_KEY", "ds-key")
+    monkeypatch.setenv("DS_MODEL", "ds-model")
+    monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
+    monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
+    run = Mock(return_value="diff --git a/a b/a\n")
+    monkeypatch.setattr(agent_module, "run_agent", run)
+
+    argv = ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", str(issue),
+            "--output", str(tmp_path / "out.jsonl"), "--rust-toolchain", "1.72.0", "--api-limit", "25"]
+    monkeypatch.setattr(sys, "argv", argv)
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "yj-model", "yj-key", "https://yj.example/v1")
+    assert run.call_args.kwargs["max_api_calls"] == 25
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds"])
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "ds-model", "ds-key", "https://ds.example/v1")
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds", "--api-limit", "0"])
+    with pytest.raises(SystemExit):
+        agent_module.main()
+
+
+def test_run_agent_auto_submits_changes_when_api_limit_reached(agent_module, monkeypatch, tmp_path):
     (tmp_path / "lib.rs").write_text("before\n", encoding="utf-8")
     monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
     make_tools = agent_module.make_tools
-    states = []
 
-    def capture_state(repo):
-        tools, state = make_tools(repo)
-        states.append(state)
-        return tools, state
+    monkeypatch.setattr(agent_module, "make_tools", lambda repo: make_tools(repo))
 
-    monkeypatch.setattr(agent_module, "make_tools", capture_state)
-
-    def invoke_verified_then_limit(inputs, config):
+    def invoke_edited_then_limit(inputs, config):
         tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
         tools["write_file"].invoke({"path": "lib.rs", "content": "after\n"})
-        tools["write_regression_test"].invoke({"path": "tests/normal_regression_fix.rs", "content": "test"})
-        states[-1].pass_test(states[-1].start_test(), test_target="normal_regression_fix")
-        states[-1].pass_test(states[-1].start_test())
         raise RuntimeError("Model API call limit reached (5)")
 
-    create = Mock(return_value=SimpleNamespace(invoke=invoke_verified_then_limit))
+    create = Mock(return_value=SimpleNamespace(invoke=invoke_edited_then_limit))
     monkeypatch.setattr(agent_module, "create_agent", create)
     trace = Mock()
     patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace, max_api_calls=5)
-    assert "+after" in patch and "normal_regression_fix.rs" not in patch
+    assert "+after" in patch
     trace.record.assert_called_once_with("auto_submit_on_limit", patch=patch)
 
-    def invoke_unverified_then_limit(inputs, config):
-        tools = {tool.name: tool for tool in create.call_args.kwargs["tools"]}
-        tools["write_file"].invoke({"path": "lib.rs", "content": "unverified\n"})
+    def invoke_no_changes_then_limit(inputs, config):
         raise RuntimeError("Model API call limit reached (5)")
 
-    create.return_value = SimpleNamespace(invoke=invoke_unverified_then_limit)
+    create.return_value = SimpleNamespace(invoke=invoke_no_changes_then_limit)
     with pytest.raises(RuntimeError, match="Model API call limit reached"):
         agent_module.run_agent(tmp_path, "issue", "model", "key", max_api_calls=5)
 
 
-def test_compress_history_messages_trims_old_tool_outputs(agent_module):
+def test_compress_history_messages_trims_old_tool_outputs_and_args(agent_module):
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-    msgs = [HumanMessage(content="issue text")]
-    for i in range(10):
-        msgs.append(AIMessage(content="", tool_calls=[{"id": f"call_{i}", "name": "read_lines", "args": {}}]))
-        if i == 0:
-            content = json.dumps({
-                "status": "passed",
-                "tests_executed": 42,
-                "failed_tests": [],
-                "test_output": "test " * 300,
-                "cargo_output": "Compiling " * 100,
-            })
-        else:
-            content = "\n".join(f"{j}: code line" for j in range(1, 40))
-        msgs.append(ToolMessage(content=content, tool_call_id=f"call_{i}"))
+    big_code = "fn big() {\n" + "".join(f"    let v_{i} = {i};\n" for i in range(100)) + "}\n"
+    long_thought = "Let me think.\n" + "\n".join(f"Step {i}: checking..." for i in range(1, 25)) + "\nDone."
+    msgs = [
+        HumanMessage(content="issue text"),
+        AIMessage(content=long_thought, tool_calls=[{"id": "call_0", "name": "write_file", "args": {"path": "src/lib.rs", "content": big_code}}]),
+        ToolMessage(content="\n".join(f"{j}: code line" for j in range(1, 40)), tool_call_id="call_0"),
+    ]
+    for i in range(1, 10):
+        msgs.append(AIMessage(content="", tool_calls=[{"id": f"call_{i}", "name": "read_file", "args": {}}]))
+        msgs.append(ToolMessage(content="\n".join(f"{j}: code line" for j in range(1, 40)), tool_call_id=f"call_{i}"))
 
-    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=3)
+    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=3, block_size=2)
     assert len(compressed) == len(msgs)
-    # First tool message (index 2) was cargo_test JSON -> compressed JSON
-    old_json = json.loads(compressed[2].content)
-    assert old_json["status"] == "passed"
-    assert old_json["tests_executed"] == 42
-    assert "note" in old_json
-    assert compressed[2].tool_call_id == "call_0"
-    # Second tool message (index 4) was multiline text -> compressed preview
-    assert "omitted" in compressed[4].content
-    assert len(compressed[4].content) < len(msgs[4].content)
-    # Recent tool messages (last 3: indices -5, -3, -1) kept intact
+    assert "earlier thought omitted" in compressed[1].content
+    assert "earlier write omitted" in compressed[1].tool_calls[0]["args"]["content"]
+    assert "omitted" in compressed[2].content
+    assert len(compressed[2].content) < len(msgs[2].content)
     assert compressed[-1].content == msgs[-1].content
     assert compressed[-3].content == msgs[-3].content
     assert compressed[-5].content == msgs[-5].content
 
 
-
-def test_compress_history_messages_handles_cargo_check_and_assistant_tool_args(agent_module):
+def test_compress_history_messages_block_size_stability_and_idempotency(agent_module):
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-    msgs = [HumanMessage(content="start")]
-    # Turn 0: AI with huge write_file args
-    big_code = "fn big() {\n" + "".join(f"    let v_{i} = {i};\n" for i in range(100)) + "}\n"
-    msgs.append(AIMessage(content="", tool_calls=[{"id": "c0", "name": "write_file", "args": {"path": "src/lib.rs", "content": big_code}}]))
-    msgs.append(ToolMessage(content="Updated src/lib.rs", tool_call_id="c0"))
+    def make_msgs(n):
+        m = [HumanMessage(content="issue")]
+        for i in range(n):
+            m.append(AIMessage(content="", tool_calls=[{"id": f"c{i}", "name": "read_file", "args": {}}]))
+            m.append(ToolMessage(content="\n".join(f"{j}: code line" for j in range(1, 30)), tool_call_id=f"c{i}"))
+        return m
 
-    # Turn 1: cargo_check JSON tool output
-    check_json = json.dumps({
-        "exit_code": 101,
-        "diagnostics": [
-            {"level": "error", "code": "E0308", "category": "type_mismatch", "message": "mismatched types", "spans": [{"file_name": "src/lib.rs", "line_start": 5}]}
-        ] * 10,
-        "cargo_output": "error: could not compile\n" * 50,
-    })
-    msgs.append(AIMessage(content="", tool_calls=[{"id": "c1", "name": "cargo_check", "args": {}}]))
-    msgs.append(ToolMessage(content=check_json, tool_call_id="c1"))
+    c18 = agent_module._compress_history_messages(make_msgs(18), keep_recent_steps=12, block_size=5)
+    c19 = agent_module._compress_history_messages(make_msgs(19), keep_recent_steps=12, block_size=5)
+    c21 = agent_module._compress_history_messages(make_msgs(21), keep_recent_steps=12, block_size=5)
+    for idx in range(11):
+        assert c18[idx].content == c19[idx].content == c21[idx].content
 
-    # Turn 2: cargo_workspace JSON
-    ws_json = json.dumps({
-        "workspace_root": "/workspace",
-        "workspace_members": [{"name": "pkg1", "manifest_path": "/workspace/Cargo.toml", "targets": [{"name": f"target_{i}", "kind": ["lib", "test"], "src_path": f"src/target_{i}.rs"} for i in range(10)]}],
-    }, indent=2)
-    msgs.append(AIMessage(content="", tool_calls=[{"id": "c2", "name": "cargo_workspace", "args": {}}]))
-    msgs.append(ToolMessage(content=ws_json, tool_call_id="c2"))
-
-    # Add 4 dummy tool turns to push turns 0-2 past cutoff
-    for k in range(3, 7):
-        msgs.append(AIMessage(content="", tool_calls=[{"id": f"c{k}", "name": "read_lines", "args": {}}]))
-        msgs.append(ToolMessage(content=f"{k}: code line", tool_call_id=f"c{k}"))
-
-    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=3, test_cutoff_steps=2)
-    assert len(compressed) == len(msgs)
-
-    # Check AI message 1 has compacted content
-    ai_args = compressed[1].tool_calls[0]["args"]
-    assert "earlier write omitted" in ai_args["content"]
-    assert len(ai_args["content"]) < len(big_code)
-
-    # Check cargo_check tool message (index 4) is compacted
-    check_obj = json.loads(compressed[4].content)
-    assert check_obj["exit_code"] == 101
-    assert check_obj["error_count"] == 10
-    assert "earlier cargo_check" in check_obj["note"]
-
-    # Check cargo_workspace tool message (index 6) is compacted
-    ws_obj = json.loads(compressed[6].content)
-    assert ws_obj["workspace_members"][0]["name"] == "pkg1"
-    assert "targets" not in ws_obj["workspace_members"][0]
+    again = agent_module._compress_history_messages(c18, keep_recent_steps=12, block_size=5)
+    for m1, m2 in zip(c18, again):
+        assert m1.content == m2.content
 
 
-def test_run_agent_auto_submits_when_verified_without_extra_continuation(agent_module, monkeypatch, tmp_path):
-    state = SimpleNamespace(
-        patch="",
-        close=Mock(),
-        verified=Mock(return_value=True),
-        auto_submit_verified_patch=Mock(return_value="diff --git verified\n"),
-    )
-    monkeypatch.setattr(agent_module, "make_tools", lambda repo: ([], state))
-    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
-    calls = []
-
-    def invoke(inputs, config):
-        calls.append(inputs["messages"])
-        return {"messages": inputs["messages"] + [{"role": "assistant", "content": "Tests pass, finished."}]}
-
-    monkeypatch.setattr(agent_module, "create_agent", Mock(return_value=SimpleNamespace(invoke=invoke)))
-    trace = Mock()
-    result_patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace)
-    assert result_patch == "diff --git verified\n"
-    # Auto-submission must finish on the FIRST invoke without requiring continuation!
-    assert len(calls) == 1
-    trace.record.assert_called_once_with("auto_submit_verified", patch="diff --git verified\n")
-
-
-def test_cli_defaults_require_reproduction_and_accepts_no_require_reproduction(agent_module, monkeypatch, tmp_path):
+def test_cli_defaults_require_reproduction_false_and_accepts_flags(agent_module, monkeypatch, tmp_path):
     issue = tmp_path / "issue.txt"
     issue.write_text("issue text", encoding="utf-8")
     monkeypatch.setenv("API_LIMIT", "70")
@@ -391,44 +340,20 @@ def test_cli_defaults_require_reproduction_and_accepts_no_require_reproduction(a
     run = Mock(return_value="diff --git patch\n")
     monkeypatch.setattr(agent_module, "run_agent", run)
 
-    # Test default: require_reproduction is True
     argv_default = ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", str(issue), "--output", str(tmp_path / "out.jsonl"), "--rust-toolchain", "1.72.0"]
     monkeypatch.setattr(sys, "argv", argv_default)
     agent_module.main()
+    assert run.call_args.kwargs["require_reproduction"] is False
+
+    argv_yes = [*argv_default, "--require-reproduction"]
+    monkeypatch.setattr(sys, "argv", argv_yes)
+    agent_module.main()
     assert run.call_args.kwargs["require_reproduction"] is True
 
-    # Test explicit flag: --no-require-reproduction sets False
-    argv_no = ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", str(issue), "--output", str(tmp_path / "out.jsonl"), "--rust-toolchain", "1.72.0", "--no-require-reproduction"]
+    argv_no = [*argv_default, "--no-require-reproduction"]
     monkeypatch.setattr(sys, "argv", argv_no)
     agent_module.main()
     assert run.call_args.kwargs["require_reproduction"] is False
-
-
-
-def test_compress_history_messages_block_size_stability_and_idempotency(agent_module):
-    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-
-    def make_msgs(n):
-        m = [HumanMessage(content="issue")]
-        for i in range(n):
-            m.append(AIMessage(content="", tool_calls=[{"id": f"c{i}", "name": "read_lines", "args": {}}]))
-            m.append(ToolMessage(content="\n".join(f"{j}: code line" for j in range(1, 30)), tool_call_id=f"c{i}"))
-        return m
-
-    # With block_size=5, keep_recent_steps=12, at n=18 vs n=19 vs n=20:
-    # raw_code_cutoff: 18-12=6 (pos=5), 19-12=7 (pos=5), 20-12=8 (pos=5), 21-12=9 (pos=5)
-    # Prefix up to tool 17 must be byte-for-byte identical across turns 18..21 (preserving prompt cache)!
-    c18 = agent_module._compress_history_messages(make_msgs(18), keep_recent_steps=12, test_cutoff_steps=3, block_size=5)
-    c19 = agent_module._compress_history_messages(make_msgs(19), keep_recent_steps=12, test_cutoff_steps=3, block_size=5)
-    c21 = agent_module._compress_history_messages(make_msgs(21), keep_recent_steps=12, test_cutoff_steps=3, block_size=5)
-    # First 5 tools (indices 1..10) were compacted at n=18 and stay identical at n=19 and n=21!
-    for idx in range(11):
-        assert c18[idx].content == c19[idx].content == c21[idx].content
-
-    # Idempotency check
-    again = agent_module._compress_history_messages(c18, keep_recent_steps=12, test_cutoff_steps=3, block_size=5)
-    for m1, m2 in zip(c18, again):
-        assert m1.content == m2.content
 
 
 def test_run_agent_stops_after_repeated_idle_responses(agent_module, monkeypatch, tmp_path):
@@ -445,23 +370,3 @@ def test_run_agent_stops_after_repeated_idle_responses(agent_module, monkeypatch
     with pytest.raises(RuntimeError, match="stopped calling tools"):
         agent_module.run_agent(tmp_path, "issue", "model", "key")
     assert len(calls) == 4
-
-
-def test_compress_history_messages_compacts_older_assistant_thoughts(agent_module):
-    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-
-    long_thought = "Let me think about this bug.\n" + "\n".join(f"Step {i}: inspecting invariants..." for i in range(1, 25)) + "\nReady to edit."
-    msgs = [
-        HumanMessage(content="issue text"),
-        AIMessage(content=long_thought, tool_calls=[{"id": "c0", "name": "read_lines", "args": {}}]),
-        ToolMessage(content="1: code", tool_call_id="c0"),
-    ]
-    # Add dummy tool turns to push turn 0 past cutoff
-    for k in range(1, 8):
-        msgs.append(AIMessage(content="ok", tool_calls=[{"id": f"c{k}", "name": "read_lines", "args": {}}]))
-        msgs.append(ToolMessage(content=f"{k}: code line", tool_call_id=f"c{k}"))
-
-    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=3, test_cutoff_steps=2, block_size=2)
-    old_ai = compressed[1]
-    assert "earlier thought omitted" in old_ai.content
-    assert len(old_ai.content) < len(long_thought)

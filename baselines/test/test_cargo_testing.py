@@ -359,3 +359,44 @@ def test_cargo_test_passes_tests_started_on_aborted_process(project, monkeypatch
     assert res["status"] == "failed"
     assert res["tests_executed"] == 0
     assert seen_failure[0]["tests_started"] == 2
+
+
+def test_zero_tests_executed_emits_warning_except_no_run(project, monkeypatch):
+    _, tool = project
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", ""
+        ),
+    )
+    res = json.loads(tool.invoke({"test_filter": "nonexistent_case"}))
+    assert res["status"] == "passed"
+    assert res["tests_executed"] == 0
+    assert "Zero tests executed" in res["warning"]
+
+    no_run_res = json.loads(tool.invoke({"tests": True, "no_run": True}))
+    assert no_run_res["status"] == "passed"
+    assert "warning" not in no_run_res
+
+
+def test_insta_snapshot_summary_extracted_in_failure_details(project, monkeypatch):
+    _, tool = project
+    stdout = (
+        "running 1 test\n"
+        "test snap_case ... FAILED\n"
+        "failures:\n\n"
+        "---- snap_case stdout ----\n"
+        "──────────── Snapshot Summary ────────────\n"
+        "Snapshot: parse_json\n"
+        "- JsonObject\n"
+        "+ JsonBogusValue\n"
+        "To update snapshots run cargo insta review\n\n"
+        "failures:\n    snap_case\n"
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a[0], 101, stdout, ""))
+    res = json.loads(tool.invoke({}))
+    detail = res["failure_details"][0]
+    assert "- JsonObject" in detail["snapshot_summary"]
+    assert "+ JsonBogusValue" in detail["snapshot_summary"]

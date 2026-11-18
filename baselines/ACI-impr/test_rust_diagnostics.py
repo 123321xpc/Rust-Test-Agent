@@ -187,3 +187,24 @@ def test_clean_cargo_stderr_strips_progress_lines():
     cleaned = diagnostics.clean_cargo_stderr(raw)
     assert "Compiling libc" not in cleaned
     assert "error: build failed" in cleaned
+
+
+def test_enrich_diagnostic_symbol_lookup_adds_auto_lookup(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "inner.rs").write_text(
+        "pub trait Codec { fn encode_item(&self); }\n"
+        "pub(crate) struct SecretBox;\n"
+        "impl Codec for SecretBox { fn encode_item(&self) {} }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "lib.rs").write_text("pub use crate::inner::Codec;\n", encoding="utf-8")
+    diags = [
+        {"level": "error", "code": "E0599", "message": "no method named `encode_item` found for struct `Other` in the current scope", "spans": []},
+        {"level": "error", "code": "E0412", "message": "cannot find type `SecretBox` in this scope", "spans": []},
+        {"level": "error", "code": "E0277", "message": "the trait bound `Other: Codec` is not satisfied", "spans": []},
+    ]
+    diagnostics.enrich_diagnostic_symbol_lookup(diags, tmp_path)
+    assert "pub trait Codec" in diags[0]["auto_lookup"]
+    assert "pub(crate)" in diags[1]["auto_lookup"]
+    assert "Codec for SecretBox" in diags[2]["auto_lookup"]
+    assert "Auto-Lookup:" in diags[0]["remediation_hint"]

@@ -3,7 +3,7 @@
 Supports:
 - Rust lexical tokenization (comments, nested block comments, raw/byte/c strings, lifetimes vs chars)
 - Structural extraction (mod, pub use re-exports, struct/enum/trait/type/impl/fn/macro)
-- Accurate function body spans & #[test]/#[cfg(test)] separation (also used by rust_trace)
+- Accurate function body spans & #[test]/#[cfg(test)] separation
 - Incremental per-file cache keyed by (mtime_ns, size)
 - Neighborhood queries (definitions, public re-export paths, trait impls, callers, callees)
 - Multi-chain candidate fault propagation paths along call/trait/re-export edges
@@ -369,6 +369,158 @@ def _extract_calls_and_types(tokens: list[RustToken], start_i: int, end_i: int) 
     return callees, type_refs
 
 
+_CFG_FEATURE_RE = re.compile(r'feature\s*=\s*"([A-Za-z0-9_-]+)"')
+
+
+def _extract_cfg_features(attrs: list[str]) -> list[str]:
+    """Extract feature names from `#[cfg(...)]` attributes."""
+    feats: list[str] = []
+    for attr in attrs or ():
+        if not attr.startswith("cfg("):
+            continue
+        for m in _CFG_FEATURE_RE.finditer(attr):
+            name = m.group(1).strip()
+            if name and name not in feats:
+                feats.append(name)
+    return feats
+
+
+def _extract_enum_variants(tokens: list[RustToken], brace_i: int, end_idx: int) -> list[str]:
+    """Extract top-level variant names from an `enum Name { ... }` body."""
+    variants: list[str] = []
+    i = brace_i + 1
+    par = brk = br_d = ang = 0
+    expect_variant = True
+    while i < end_idx and i < len(tokens):
+        t = tokens[i].text
+        if t == "#":
+            if i + 1 < end_idx and tokens[i + 1].text == "[":
+                i = _find_matching(tokens, i + 1, "[", "]") + 1
+                continue
+        if par == 0 and brk == 0 and br_d == 0 and ang == 0:
+            if t == ",":
+                expect_variant = True
+                i += 1
+                continue
+            if expect_variant and tokens[i].kind == "IDENT":
+                variants.append(tokens[i].text.removeprefix("r#"))
+                expect_variant = False
+                i += 1
+                continue
+        if t == "(": par += 1
+        elif t == ")": par = max(0, par - 1)
+        elif t == "[": brk += 1
+        elif t == "]": brk = max(0, brk - 1)
+        elif t == "{": br_d += 1
+        elif t == "}": br_d = max(0, br_d - 1)
+        elif t == "<": ang += 1
+        elif t == ">" and (i == 0 or tokens[i - 1].text != "-"):
+            ang = max(0, ang - 1)
+        i += 1
+    return variants
+
+
+def _extract_wildcard_matches(
+    tokens: list[RustToken],
+    start_i: int,
+    end_i: int,
+    fn_name: str,
+    rel_path: str,
+    enclosing_hdr: str | None,
+    is_test: bool,
+) -> list[dict[str, Any]]:
+    """Detect `match` blocks containing a `_ =>` wildcard arm and record referenced types/variants."""
+    out: list[dict[str, Any]] = []
+    i = start_i
+    while i <= end_i and i < len(tokens):
+        if tokens[i].kind == "IDENT" and tokens[i].text == "match":
+            j = i + 1
+            par = brk = ang = 0
+            brace_i = -1
+            while j <= end_i and j < len(tokens):
+                t = tokens[j].text
+                if t == "(": par += 1
+                elif t == ")": par = max(0, par - 1)
+                elif t == "[": brk += 1
+                elif t == "]": brk = max(0, brk - 1)
+                elif t == "<": ang += 1
+                elif t == ">" and (j == 0 or tokens[j - 1].text != "-"): ang = max(0, ang - 1)
+                elif t == "{" and par == 0 and brk == 0 and ang == 0:
+                    brace_i = j
+                    break
+                elif t == ";" and par == 0 and brk == 0:
+                    break
+                j += 1
+            if brace_i > 0 and brace_i <= end_i:
+                close_b = min(end_i, _find_matching(tokens, brace_i, "{", "}"))
+                has_wildcard = False
+                ref_types: list[str] = []
+                ref_variants: list[str] = []
+                seen_t: set[str] = set()
+                seen_v: set[str] = set()
+                k = brace_i + 1
+                arm_d_par = arm_d_brk = arm_d_br = 0
+                in_pattern = True
+                pat_tokens: list[RustToken] = []
+                while k < close_b:
+                    tk = tokens[k]
+                    if arm_d_par == 0 and arm_d_brk == 0 and arm_d_br == 0:
+                        if in_pattern and tk.text == "=>":
+                            if any(pt.text == "_" for pt in pat_tokens):
+                                has_wildcard = True
+                            for pi, pt in enumerate(pat_tokens):
+                                if pt.kind == "IDENT":
+                                    raw = pt.text.removeprefix("r#")
+                                    if pi + 2 < len(pat_tokens) and pat_tokens[pi + 1].text == "::" and pat_tokens[pi + 2].kind == "IDENT":
+                                        if raw and raw[0].isupper() and raw not in seen_t:
+                                            seen_t.add(raw)
+                                            ref_types.append(raw)
+                                        v_raw = pat_tokens[pi + 2].text.removeprefix("r#")
+                                        if v_raw and v_raw[0].isupper() and v_raw not in seen_v:
+                                            seen_v.add(v_raw)
+                                            ref_variants.append(v_raw)
+                                    elif raw and raw[0].isupper() and any(c.islower() for c in raw) and raw not in _SKIP_CALL_NAMES:
+                                        if raw not in seen_v:
+                                            seen_v.add(raw)
+                                            ref_variants.append(raw)
+                            in_pattern = False
+                            pat_tokens = []
+                            k += 1
+                            continue
+                        if not in_pattern and tk.text == ",":
+                            in_pattern = True
+                            pat_tokens = []
+                            k += 1
+                            continue
+                    if tk.text == "(": arm_d_par += 1
+                    elif tk.text == ")": arm_d_par = max(0, arm_d_par - 1)
+                    elif tk.text == "[": arm_d_brk += 1
+                    elif tk.text == "]": arm_d_brk = max(0, arm_d_brk - 1)
+                    elif tk.text == "{": arm_d_br += 1
+                    elif tk.text == "}":
+                        arm_d_br = max(0, arm_d_br - 1)
+                        if not in_pattern and arm_d_br == 0 and arm_d_par == 0 and arm_d_brk == 0:
+                            in_pattern = True
+                            pat_tokens = []
+                            k += 1
+                            continue
+                    if in_pattern:
+                        pat_tokens.append(tk)
+                    k += 1
+                if has_wildcard and (ref_types or ref_variants):
+                    out.append({
+                        "path": rel_path,
+                        "line": tokens[i].line,
+                        "fn": fn_name,
+                        "enclosing": enclosing_hdr,
+                        "types": ref_types,
+                        "variants": ref_variants[:12],
+                        "is_test": is_test,
+                    })
+        i += 1
+    return out
+
+
 class ParsedRustFile:
     def __init__(self, rel_path: str, module_path: str):
         self.rel_path = rel_path
@@ -378,6 +530,8 @@ class ParsedRustFile:
         self.impl_blocks: list[dict[str, Any]] = []
         self.mod_decls: list[dict[str, Any]] = []
         self.call_edges: list[dict[str, Any]] = []
+        self.wildcard_matches: list[dict[str, Any]] = []
+        self.macro_calls: list[dict[str, Any]] = []
 
 
 def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
@@ -387,7 +541,14 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
     parsed = ParsedRustFile(rel_path=rel_path, module_path=base_mod)
     total_lines = source.count("\n") + 1
 
-    def parse_block(tok_start: int, tok_end: int, mod_stack: list[str], enclosing_hdr: str | None, in_test_scope: bool):
+    def parse_block(
+        tok_start: int,
+        tok_end: int,
+        mod_stack: list[str],
+        enclosing_hdr: str | None,
+        in_test_scope: bool,
+        enclosing_cfgs: tuple[str, ...] = (),
+    ):
         i = tok_start
         pending_attrs: list[str] = []
         pending_is_test = in_test_scope
@@ -506,7 +667,8 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         "is_test": pending_is_test,
                     })
                     child_test = pending_is_test or mod_name == "tests" or mod_name.startswith("__test_regression_")
-                    parse_block(k + 3, close_b, mod_stack + [mod_name], None, child_test)
+                    child_cfgs = tuple(dict.fromkeys([*enclosing_cfgs, *_extract_cfg_features(pending_attrs)]))
+                    parse_block(k + 3, close_b, mod_stack + [mod_name], None, child_test, child_cfgs)
                     pending_attrs.clear()
                     pending_is_test = in_test_scope
                     i = close_b + 1
@@ -645,6 +807,7 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         if ty_idents:
                             for_type = ty_idents[-1]
 
+                    impl_cfgs = list(dict.fromkeys([*enclosing_cfgs, *_extract_cfg_features(pending_attrs)]))
                     impl_entry = {
                         "path": rel_path,
                         "line": tok.line,
@@ -655,8 +818,10 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         "module_path": "::".join(mod_stack),
                         "is_test": pending_is_test,
                     }
+                    if impl_cfgs:
+                        impl_entry["cfg_features"] = impl_cfgs
                     parsed.impl_blocks.append(impl_entry)
-                    parsed.items.append({
+                    impl_item = {
                         "path": rel_path,
                         "line": tok.line,
                         "end_line": tokens[close_b].line,
@@ -666,8 +831,11 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         "module_path": "::".join(mod_stack),
                         "context": hdr_text,
                         "is_test": pending_is_test,
-                    })
-                    parse_block(brace_i + 1, close_b, mod_stack, hdr_text, pending_is_test)
+                    }
+                    if impl_cfgs:
+                        impl_item["cfg_features"] = impl_cfgs
+                    parsed.items.append(impl_item)
+                    parse_block(brace_i + 1, close_b, mod_stack, hdr_text, pending_is_test, tuple(impl_cfgs))
                     pending_attrs.clear()
                     pending_is_test = in_test_scope
                     i = close_b + 1
@@ -696,7 +864,8 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                 if brace_i > 0:
                     close_b = _find_matching(tokens, brace_i, "{", "}")
                     hdr_text = _norm_snippet(source, tokens[i].start, tokens[brace_i].start, 240)
-                    parsed.items.append({
+                    trait_cfgs = list(dict.fromkeys([*enclosing_cfgs, *_extract_cfg_features(pending_attrs)]))
+                    trait_item = {
                         "path": rel_path,
                         "line": tok.line,
                         "end_line": tokens[close_b].line,
@@ -707,8 +876,11 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         "context": hdr_text,
                         "attrs": list(pending_attrs),
                         "is_test": pending_is_test,
-                    })
-                    parse_block(brace_i + 1, close_b, mod_stack, hdr_text, pending_is_test)
+                    }
+                    if trait_cfgs:
+                        trait_item["cfg_features"] = trait_cfgs
+                    parsed.items.append(trait_item)
+                    parse_block(brace_i + 1, close_b, mod_stack, hdr_text, pending_is_test, tuple(trait_cfgs))
                     pending_attrs.clear()
                     pending_is_test = in_test_scope
                     i = close_b + 1
@@ -769,6 +941,12 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                     sig_text = _norm_snippet(source, tokens[i].start, tokens[brace_i].start, 240)
                     callees, type_refs = _extract_calls_and_types(tokens, brace_i + 1, close_b - 1)
                     is_fn_test = pending_is_test or (fn_name.startswith("test_") and in_test_scope)
+                    parsed.wildcard_matches.extend(
+                        _extract_wildcard_matches(
+                            tokens, brace_i + 1, close_b - 1, fn_name, rel_path, enclosing_hdr, is_fn_test
+                        )
+                    )
+                    fn_cfgs = list(dict.fromkeys([*enclosing_cfgs, *_extract_cfg_features(pending_attrs)]))
                     fn_entry = {
                         "path": rel_path,
                         "line": tok.line,
@@ -785,6 +963,8 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         "callees": callees,
                         "type_refs": type_refs,
                     }
+                    if fn_cfgs:
+                        fn_entry["cfg_features"] = fn_cfgs
                     if enclosing_hdr:
                         fn_entry["enclosing"] = enclosing_hdr
                     if pending_attrs:
@@ -880,6 +1060,13 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                         item_entry["enclosing"] = enclosing_hdr
                     if pending_attrs:
                         item_entry["attrs"] = list(pending_attrs)
+                    item_cfgs = list(dict.fromkeys([*enclosing_cfgs, *_extract_cfg_features(pending_attrs)]))
+                    if item_cfgs:
+                        item_entry["cfg_features"] = item_cfgs
+                    if item_kind == "enum" and is_brace:
+                        variants = _extract_enum_variants(tokens, j, end_idx)
+                        if variants:
+                            item_entry["variants"] = variants
                     parsed.items.append(item_entry)
 
                     if item_kind in ("struct", "enum"):
@@ -903,6 +1090,22 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
                     pending_is_test = in_test_scope
                     i = end_idx + 1
                     continue
+
+            if tokens[k].kind == "IDENT" and k + 2 < tok_end and tokens[k + 1].text == "!" and tokens[k + 2].text in ("(", "[", "{"):
+                m_close_ch = {"(": ")", "[": "]", "{": "}"}[tokens[k + 2].text]
+                close_m = _find_matching(tokens, k + 2, tokens[k + 2].text, m_close_ch)
+                parsed.macro_calls.append({
+                    "path": rel_path,
+                    "line": tok.line,
+                    "end_line": tokens[close_m].line,
+                    "name": tokens[k].text,
+                    "context": _norm_snippet(source, tokens[k].start, tokens[close_m].end, 220),
+                    "is_test": pending_is_test,
+                })
+                pending_attrs.clear()
+                pending_is_test = in_test_scope
+                i = close_m + 1
+                continue
 
             if tok.text == "{":
                 close_b = _find_matching(tokens, i, "{", "}")
@@ -1007,6 +1210,29 @@ class RustCodeGraph:
             if pf is not None:
                 res.append(pf)
         return res
+
+    def features_for_file_lines(self, rel_path: str, line_numbers: list[int] | None = None) -> list[str]:
+        """Return #[cfg(feature = "...")] names enclosing any of `line_numbers` (or in the file)."""
+        pf = self.get_parsed_file((self.root / rel_path).resolve())
+        if pf is None:
+            return []
+        feats: list[str] = []
+        target_lines = set(line_numbers or ())
+        for it in pf.items:
+            if it.get("is_test"):
+                continue
+            cfgs = it.get("cfg_features") or []
+            if not cfgs:
+                continue
+            if target_lines:
+                s = int(it.get("line") or 0)
+                e = int(it.get("end_line") or s)
+                if not any(s <= ln <= e for ln in target_lines):
+                    continue
+            for f in cfgs:
+                if f not in feats:
+                    feats.append(f)
+        return feats
 
     def _public_paths_for_item(self, item: dict[str, Any], all_files: list[ParsedRustFile]) -> list[str]:
         crate_name = self.crate_for_path(item["path"])
@@ -1177,7 +1403,7 @@ class RustCodeGraph:
                             break
                     callees.append({"name": cname, "defined_at": c_defs})
 
-        return {
+        res_payload = {
             "target": clean,
             "mode": "symbol",
             "definitions": matched_defs[:8],
@@ -1185,6 +1411,76 @@ class RustCodeGraph:
             "callers": callers,
             "callees": callees[:max_neighbors],
         }
+        line_cache: dict[str, list[str]] = {}
+
+        def _file_lines(rel_p: str) -> list[str]:
+            if rel_p not in line_cache:
+                try:
+                    line_cache[rel_p] = (self.root / rel_p).read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    line_cache[rel_p] = []
+            return line_cache[rel_p]
+
+        sym_word_re = re.compile(rf"\b{re.escape(clean_sym)}\b") if clean_sym else None
+        static_refs: list[dict[str, Any]] = []
+        if sym_word_re is not None:
+            for pf in all_files:
+                for it in pf.items:
+                    if exclude_tests and it.get("is_test"):
+                        continue
+                    if it.get("kind") not in ("static", "const") or it.get("name") == clean_sym:
+                        continue
+                    s_line = int(it.get("line") or 0)
+                    e_line = int(it.get("end_line") or s_line)
+                    if s_line <= 0 or e_line < s_line:
+                        continue
+                    lines = _file_lines(pf.rel_path)
+                    span_text = "\n".join(lines[s_line - 1:min(len(lines), e_line)])
+                    if sym_word_re.search(span_text):
+                        static_refs.append({
+                            "path": pf.rel_path,
+                            "line": s_line,
+                            "kind": it["kind"],
+                            "item": it["name"],
+                            "snippet": re.sub(r"\s+", " ", span_text).strip()[:200],
+                        })
+                        if len(static_refs) >= 6:
+                            break
+                if len(static_refs) >= 6:
+                    break
+        if static_refs:
+            res_payload["static_references"] = static_refs
+
+        if not matched_defs:
+            macro_hits = []
+            for pf in all_files:
+                for mc in getattr(pf, "macro_calls", ()):
+                    if exclude_tests and mc.get("is_test"):
+                        continue
+                    if clean_sym in mc.get("context", "") or mc.get("name") == clean_sym:
+                        macro_hits.append(mc)
+                        if len(macro_hits) >= 6:
+                            break
+                if len(macro_hits) >= 6:
+                    break
+            if macro_hits:
+                res_payload["macro_invocations"] = macro_hits
+
+            lit_val = clean.strip("\"'")
+            if len(lit_val) >= 3 and not callers:
+                quoted = f'"{lit_val}"'
+                lit_hits: list[dict[str, Any]] = []
+                for pf in all_files:
+                    for idx, raw_ln in enumerate(_file_lines(pf.rel_path), 1):
+                        if quoted in raw_ln:
+                            lit_hits.append({"path": pf.rel_path, "line": idx, "text": raw_ln.strip()[:180]})
+                            if len(lit_hits) >= 6:
+                                break
+                    if len(lit_hits) >= 6:
+                        break
+                if lit_hits:
+                    res_payload["literal_references"] = lit_hits
+        return res_payload
 
     def build_fault_chains(
         self,

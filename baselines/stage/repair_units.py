@@ -5,6 +5,7 @@ local to a unit and its declared prerequisites, never a replacement for final QA
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,17 +100,29 @@ def normalize_units(plan: dict | None, fallback_paths: list[str]) -> list[dict]:
     return units
 
 
+def _spec_core(spec: dict[str, Any]) -> tuple:
+    """Return execution-relevant fields of a normalized unit spec for retention across wording edits."""
+    return (
+        tuple(spec.get("paths") or []),
+        spec.get("work") or [],
+        tuple(sorted(spec.get("depends_on") or spec.get("deps") or [])),
+        spec.get("verification") or [],
+        bool(spec.get("strict_scope", False)),
+    )
+
+
 class RepairUnitCoordinator:
     UNCHECKED_EDITS = 6
     READ_ONLY_TOOLS = frozenset({
         "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
-        "inspect_rust_neighborhood", "rust_error_explain", "rust_trace",
+        "inspect_rust_neighborhood", "rust_error_explain",
     })
 
     def __init__(self, state, tools_by_name, blackboard, trace=None, candidate_policy=None):
         self.state, self.tools, self.blackboard, self.trace = state, tools_by_name, blackboard, trace
         self.candidate_policy = candidate_policy
         self.units: list[dict] = []
+        self.planned_scope: set[str] = set()
         self.active: str | None = None
         self.plan_key = None
         self.steps = self.unchecked_edits = 0
@@ -120,9 +133,10 @@ class RepairUnitCoordinator:
 
     def status(self):
         return {"current_unit": self.active, "units": [
-            {k: u.get(k) for k in ("unit_id", "description", "paths", "depends_on", "status",
-                                   "expected_outcome", "refutation_signals", "refuted_by",
-                                   "completed_changes", "summary", "evidence", "blocker")}
+            {**{k: u.get(k) for k in ("unit_id", "description", "paths", "depends_on", "status",
+                                      "expected_outcome", "refutation_signals", "refuted_by",
+                                      "completed_changes", "summary", "evidence", "blocker")},
+             "frozen": u.get("status") == "verified"}
             for u in self.units]}
 
     def publish(self, event, **extra):
@@ -154,38 +168,61 @@ class RepairUnitCoordinator:
             result |= more
 
     def configure(self, plan, fallback_paths):
-        specs = normalize_units(plan, fallback_paths)
-        self.planned_scope = {p for u in specs for p in u["paths"]}
-        if self.candidate_policy and not self.candidate_policy.data["scope_initialized"]:
-            self.candidate_policy.observe_scope({p for u in specs for p in u["paths"]})
-        key = json.dumps(specs, sort_keys=True)
+        raw_plan = plan or {}
         policy = self.candidate_policy
         switch_paths = set(policy.data.pop("switch_paths", []) if policy else [])
         if policy:
             policy.data.pop("retain_current_patch", None)
+        if self.units and not (raw_plan.get("ordered_edits") or []) and not (raw_plan.get("repair_units") or []):
+            # Guard against empty replans wiping out an established unit DAG.
+            if switch_paths:
+                stale = {u["unit_id"] for u in self.units if set(u["paths"]) & switch_paths}
+                if stale:
+                    self.invalidate(stale, "Candidate hypothesis switched")
+            return
+        specs = normalize_units(plan, fallback_paths)
+        if policy and not policy.data["scope_initialized"]:
+            policy.observe_scope({p for u in specs for p in u["paths"]})
+        key = json.dumps(specs, sort_keys=True)
         if key == self.plan_key and not switch_paths:
             return
         old = {u["unit_id"]: u for u in self.units}
         replan_baseline = self.state._capture_snapshot() if self.units else None
         keep = {s["unit_id"] for s in specs if s["unit_id"] in old
-                and old[s["unit_id"]]["spec"] == s
+                and _spec_core(old[s["unit_id"]]["spec"]) == _spec_core(s)
                 and old[s["unit_id"]]["status"] in {"verified", "completed_unverified"}
                 and self.evidence_valid(old[s["unit_id"]])
                 and not set(s["paths"]) & switch_paths}
-        # A retained unit must also retain all of its verified prerequisites.
+        new_ids = {s["unit_id"] for s in specs}
+        new_paths = {p for s in specs for p in s["paths"]}
+        # Carry over verified units omitted from an incremental replan when paths do not conflict.
+        carried_ids = {
+            uid for uid, prev in old.items()
+            if uid not in new_ids
+            and prev.get("status") == "verified"
+            and self.evidence_valid(prev)
+            and not (set(prev.get("paths") or []) & (switch_paths | new_paths))
+        }
+        retained = keep | carried_ids
+        # A retained unit must also retain all of its verified/retained prerequisites.
         while True:
-            reduced = {uid for uid in keep if set(old[uid]["depends_on"]) <= keep}
-            if reduced == keep:
+            reduced = {uid for uid in retained if set(old[uid]["depends_on"]) <= retained}
+            if reduced == retained:
                 break
-            keep = reduced
-        self.units = [old[s["unit_id"]] if s["unit_id"] in keep else
-                      dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=replan_baseline, touched=set())
-                      for s in specs]
+            retained = reduced
+        keep = retained & new_ids
+        carried = [old[uid] for uid in old if uid in (retained & carried_ids)]
+        self.units = carried + [
+            old[s["unit_id"]] if s["unit_id"] in keep else
+            dict(s, spec=s, status="pending", completed_changes=[], evidence=[], blocker="", baseline=replan_baseline, touched=set())
+            for s in specs
+        ]
+        self.planned_scope = {p for u in self.units for p in u["paths"]}
         partial_paths = [p.as_posix() for p in self.state.changed_paths()]
         self.check_cache.clear()
         self.active = None
         self.plan_key = key
-        self.publish("repair_unit_plan", retained_units=sorted(keep), preserved_partial_paths=partial_paths)
+        self.publish("repair_unit_plan", retained_units=sorted(retained), preserved_partial_paths=partial_paths)
 
     def evidence_valid(self, unit):
         return unit.get("inputs") == self._images((unit.get("inputs") or {}).keys())
@@ -230,6 +267,20 @@ class RepairUnitCoordinator:
         source_test = bool(kwargs.get("target_src")) or ("src" in relative.parts and relative.suffix == ".rs")
         temporary = ((name == "write_regression_test" and not source_test)
                      or (relative in self.state.regression_tests and relative not in self.state.in_module_regressions))
+        if name == "revert_file" and self.active and path and not temporary:
+            frozen = next(
+                (other for other in self.units
+                 if other["unit_id"] != self.active
+                 and other.get("status") == "verified"
+                 and path in (set(other.get("paths") or []) | set(other.get("completed_changes") or []))),
+                None,
+            )
+            if frozen is not None:
+                return (
+                    f"Error: Cannot revert '{path}' because it belongs to verified repair unit "
+                    f"'{frozen['unit_id']}'. Keep verified units intact; edit only active unit '{self.active}' "
+                    "or call escalate_for_replan."
+                )
         if not self.active:
             owners = {u["unit_id"] for u in self.units if path in u["paths"] or path in u["completed_changes"]}
             if not owners and (temporary or not self.units[-1]["strict_scope"]):
@@ -411,6 +462,160 @@ class RepairUnitCoordinator:
         self.publish("repair_unit_rollback", affected_units=sorted(affected))
         return sorted(affected)
 
+    def append_unit(
+        self,
+        unit_id: str,
+        description: str,
+        paths: list[str],
+        *,
+        symbol: str = "",
+        depends_on: list[str] | None = None,
+        expected_outcome: str = "",
+    ) -> dict[str, Any]:
+        """Dynamically append a missing subtask unit (or merge into an overlapping owner) without wiping verified units."""
+        norm_paths: list[str] = []
+        for raw_p in paths:
+            p = str(raw_p or "").strip().replace("\\", "/")
+            if not p:
+                continue
+            rel = Path(p)
+            if rel.is_absolute() or ".." in rel.parts or ":" in p:
+                raise ValueError(f"Unit path must be repository-relative: {p}")
+            if p not in norm_paths:
+                norm_paths.append(p)
+        if not norm_paths:
+            raise ValueError("append_unit requires at least one repository-relative file path")
+        uid = str(unit_id or "").strip()
+        if not uid:
+            raise ValueError("append_unit requires a non-empty unit_id")
+        work_items = [
+            {"file": p, "symbol": symbol, "action": "modify", "description": description}
+            for p in norm_paths
+        ]
+        overlapping = [u for u in self.units if set(u["paths"]) & set(norm_paths)]
+        if overlapping:
+            target = next((u for u in overlapping if u["unit_id"] == self.active), overlapping[0])
+            old_status = target.get("status")
+            for w in work_items:
+                if w not in target["work"]:
+                    target["work"].append(w)
+            target["paths"] = sorted(set(target["paths"]) | set(norm_paths))
+            if expected_outcome:
+                target["expected_outcome"] = " / ".join(
+                    x for x in (target.get("expected_outcome", ""), expected_outcome) if x
+                )
+            self.planned_scope |= set(norm_paths)
+            if target["unit_id"] != self.active and old_status in {"verified", "completed_unverified"}:
+                self.invalidate({target["unit_id"]}, f"Appended follow-up work: {description[:120]}")
+                if not self.active:
+                    self.select()
+            self.plan_key = None
+            self.publish("repair_unit_appended", action="merged", target_unit=target["unit_id"], paths=norm_paths)
+            return {"action": "merged", "unit_id": target["unit_id"], "paths": norm_paths, "reopened": old_status == "verified"}
+
+        existing_ids = {u["unit_id"] for u in self.units}
+        base_uid = uid
+        suffix = 2
+        while uid in existing_ids:
+            uid = f"{base_uid}_{suffix}"
+            suffix += 1
+        if depends_on is None:
+            deps = sorted(u["unit_id"] for u in self.units if u.get("status") == "verified")
+        else:
+            deps = sorted({str(d).strip() for d in depends_on if str(d).strip()} & existing_ids)
+        new_spec = {
+            "unit_id": uid,
+            "description": description,
+            "paths": sorted(norm_paths),
+            "work": work_items,
+            "depends_on": deps,
+            "verification": [],
+            "expected_outcome": expected_outcome.strip(),
+            "refutation_signals": [],
+            "strict_scope": bool(self.units and self.units[0].get("strict_scope")),
+        }
+        new_unit = dict(
+            new_spec,
+            spec=new_spec,
+            status="pending",
+            completed_changes=[],
+            evidence=[],
+            blocker="",
+            baseline=self.state._capture_snapshot() if hasattr(self.state, "_capture_snapshot") else None,
+            touched=set(),
+        )
+        self.units.append(new_unit)
+        self.planned_scope |= set(norm_paths)
+        self.plan_key = None
+        if self.candidate_policy:
+            self.candidate_policy.observe_scope(self.planned_scope)
+        if not self.active:
+            self.select()
+        self.publish("repair_unit_appended", action="appended", target_unit=uid, paths=norm_paths, depends_on=deps)
+        return {"action": "appended", "unit_id": uid, "paths": norm_paths, "depends_on": deps}
+
+    def textual_gradient_summary(
+        self,
+        *,
+        last_error: str = "",
+        missing_requirements: list[str] | None = None,
+        candidate_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Compute a deterministic EvoMAC-style 3-part attribution delta (frozen, faulty, missing)."""
+        frozen = [
+            {
+                "unit_id": u["unit_id"],
+                "paths": list(u.get("completed_changes") or u.get("paths") or []),
+                "summary": str(u.get("summary") or "")[:160],
+            }
+            for u in self.units
+            if u.get("status") == "verified"
+        ]
+        faulty = [
+            {
+                "unit_id": u["unit_id"],
+                "status": u.get("status"),
+                "paths": list(u.get("paths") or []),
+                "refuted_by": u.get("refuted_by") or "",
+                "blocker": str(u.get("blocker") or "")[:200],
+            }
+            for u in self.units
+            if u.get("status") in {"active", "completed_unverified"} or u.get("blocker") or u.get("refuted_by")
+        ]
+        planned = set(self.planned_scope) | {p for u in self.units for p in u.get("paths") or []}
+        missing_paths: list[str] = []
+
+        def _consider_path(raw: str) -> None:
+            p = str(raw or "").strip().replace("\\", "/").lstrip("./")
+            if not p or not p.endswith(".rs") or p in planned or p in missing_paths:
+                return
+            parts = Path(p).parts
+            if any(seg in parts for seg in ("tests", "benches", "target", ".cargo")):
+                return
+            if (self.state.root / p).is_file():
+                missing_paths.append(p)
+
+        for diag in getattr(self.state, "_last_check_diagnostics", []) or []:
+            if isinstance(diag, dict):
+                if diag.get("file"):
+                    _consider_path(diag["file"])
+                for sp in diag.get("spans") or []:
+                    if isinstance(sp, dict) and sp.get("file_name"):
+                        _consider_path(sp["file_name"])
+        for m in re.finditer(r"([A-Za-z0-9_./-]+\.rs):\d+", last_error or ""):
+            _consider_path(m.group(1))
+        for cp in candidate_paths or []:
+            _consider_path(cp)
+
+        return {
+            "frozen_verified_units": frozen,
+            "faulty_units": faulty[:4],
+            "missing_subtask_candidates": {
+                "unplanned_files": missing_paths[:6],
+                "unmet_requirements": [str(r)[:180] for r in (missing_requirements or []) if str(r).strip()][:5],
+            },
+        }
+
     def prompt(self):
         active = self._unit(self.active) if self.active else None
         ledger = self.status()
@@ -423,5 +628,5 @@ class RepairUnitCoordinator:
                 + json.dumps(ledger, ensure_ascii=False)
                 + ("\nCurrent unit work:\n" + json.dumps(active["work"], ensure_ascii=False) if active else "")
                 + "\nFinish a dependency-closed unit with complete_repair_unit(summary). Coordinator runs targeted Cargo checks. "
-                  "Edit related files as needed. Checkpoints may be restored explicitly. "
+                  "If a missing companion/consumer file must be updated separately, use append_repair_unit(...) rather than reverting verified units. "
                   "After all units close, run final regression/existing tests and submit_for_qa.")

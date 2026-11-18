@@ -148,3 +148,61 @@ def test_query_neighborhood_line_form_still_works(tmp_path):
     res = graph.query_neighborhood("src/lib.rs:2")
     assert res.get("mode") == "file_line"
     assert res["items"]
+
+
+def test_ckg_extracts_enum_variants_wildcard_matches_cfg_features_and_macros(tmp_path):
+    ckg = _load_ckg()
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "ckg_ext"\nversion = "0.1.0"\n[features]\nserde = []\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text("""
+pub enum Token {
+    Ident,
+    Bogus,
+}
+
+#[cfg(feature = "serde")]
+pub mod ser_support {
+    pub fn encode() {}
+}
+
+pub fn handle(tok: Token) -> i32 {
+    match tok {
+        Token::Ident => 1,
+        _ => 0,
+    }
+}
+
+impl_table!(HashMap, PerCpuHashMap);
+""", encoding="utf-8")
+    graph = ckg.RustCodeGraph(root)
+    parsed = graph.get_parsed_file(root / "src" / "lib.rs")
+    enum_item = next(it for it in parsed.items if it["kind"] == "enum")
+    assert enum_item["variants"] == ["Ident", "Bogus"]
+    assert parsed.wildcard_matches and parsed.wildcard_matches[0]["fn"] == "handle"
+    assert "Token" in parsed.wildcard_matches[0]["types"]
+    assert graph.features_for_file_lines("src/lib.rs", [9]) == ["serde"]
+    nb_macro = graph.query_neighborhood("PerCpuHashMap")
+    assert nb_macro.get("macro_invocations")
+
+
+def test_ckg_surfaces_static_table_and_literal_references(tmp_path):
+    ckg = _load_ckg()
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "tbl"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_text(
+        'pub struct Vtable { pub is_unique: fn() -> bool }\n'
+        'pub static SHARED_VTABLE: Vtable = Vtable {\n'
+        '    is_unique: shared_is_unique,\n'
+        '};\n'
+        'pub const PROG_SEC: &str = "cgroup_skb";\n'
+        'fn shared_is_unique() -> bool { false }\n',
+        encoding="utf-8",
+    )
+    graph = ckg.RustCodeGraph(root)
+    nb_static = graph.query_neighborhood("is_unique")
+    assert nb_static.get("static_references") and nb_static["static_references"][0]["item"] == "SHARED_VTABLE"
+    nb_lit = graph.query_neighborhood("cgroup_skb")
+    assert nb_lit.get("literal_references") and "cgroup_skb" in nb_lit["literal_references"][0]["text"]
+

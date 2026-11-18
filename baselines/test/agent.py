@@ -50,15 +50,24 @@ _prompts = _load_file("agent_prompts", Path(__file__).with_name("agent_prompts.p
 _multi_agent = _load_file("multi_agent", Path(__file__).with_name("multi_agent.py"))
 
 
+def _norm_rel_path(path_val) -> str:
+    if not path_val:
+        return ""
+    norm = str(path_val).strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
 def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2):
     """Compress verbose tool outputs and large edit calls from older turns to reduce prompt token bloat.
 
     Uses block-aligned retention to preserve LLM prompt prefix caching:
     - Recent tool turns (last keep_recent_steps) retain code reads (read_lines, search_code) in full fidelity.
+    - Older reads invalidated by subsequent edit_file/write_file/revert_file/checkpoint(restore) are folded immediately.
     - Older cargo_test and cargo_check JSON payloads (> test_cutoff_steps old) are compacted to essential status/counts.
     - Older cargo_workspace and rust_symbols outputs are compacted to outline/member summaries.
-    - Large write_file/edit_file tool arguments (> 800 chars) in older assistant messages are truncated.
-    - Code reads older than keep_recent_steps have excessive middle lines compacted.
+    - Older non-JSON tool outputs (> keep_recent_steps old) are folded to a single summary line.
     """
     if not isinstance(messages, list) or len(messages) <= test_cutoff_steps * 2:
         return messages
@@ -76,6 +85,7 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
 
     tc_map = {}
     file_modified_indices = {}
+    last_restore_idx = -1
     for idx, m in enumerate(messages):
         is_ai_m = getattr(m, "type", None) == "ai" or (isinstance(m, dict) and m.get("role") == "assistant")
         if is_ai_m:
@@ -86,10 +96,13 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                         tc_map[tc["id"]] = tc
                         t_name = tc.get("name")
                         t_args = tc.get("args") or {}
-                        if t_name in ("edit_file", "write_file", "write_regression_test") and isinstance(t_args, dict):
-                            p = t_args.get("path")
-                            if p:
-                                file_modified_indices.setdefault(str(p), []).append(idx)
+                        if isinstance(t_args, dict):
+                            if t_name in ("edit_file", "write_file", "write_regression_test", "revert_file"):
+                                p = _norm_rel_path(t_args.get("target_src") or t_args.get("path"))
+                                if p:
+                                    file_modified_indices.setdefault(p, []).append(idx)
+                            elif t_name == "checkpoint" and str(t_args.get("action", "")).strip().lower() == "restore":
+                                last_restore_idx = idx
 
     if block_size > 1:
         code_pos = (raw_code_cutoff // block_size) * block_size
@@ -154,16 +167,17 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
         stripped = content.strip()
         new_content = None
 
-        # If file was modified in a later turn, older read outputs are stale
+        # If file was modified or checkpoint restored in a later turn, older read outputs are stale
         t_id = getattr(msg, "tool_call_id", "") or (msg.get("tool_call_id") if isinstance(msg, dict) else "")
         tc_info = tc_map.get(t_id, {})
-        if tc_info.get("name") in ("read_lines", "read_file"):
-            target_p = str((tc_info.get("args") or {}).get("path") or "")
+        tool_name = tc_info.get("name") or (getattr(msg, "name", None) if not isinstance(msg, dict) else msg.get("name")) or "tool"
+        if tool_name in ("read_lines", "read_file"):
+            target_p = _norm_rel_path((tc_info.get("args") or {}).get("path"))
             mod_indices = file_modified_indices.get(target_p, [])
-            if any(mod_idx > i for mod_idx in mod_indices):
+            if last_restore_idx > i or any(mod_idx > i for mod_idx in mod_indices):
                 new_content = f"[earlier read of '{target_p}' omitted: file was modified in subsequent step; line numbers may have shifted]"
 
-        if new_content is None and len(content) <= 300:
+        if new_content is None and len(content) <= 300 and not (i < code_cutoff_idx and content.startswith("Error ") and "\n" in content):
             compressed.append(msg)
             continue
 
@@ -186,6 +200,8 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                             "failed_tests": data.get("failed_tests", [])[:20],
                             "note": "[earlier test output compacted]",
                         }
+                        if data.get("warning"):
+                            payload["warning"] = data["warning"]
                         if err_codes:
                             payload["compiler_errors"] = err_codes[:5]
                         new_content = json.dumps(payload, ensure_ascii=False)
@@ -247,17 +263,15 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
                     pass
 
             if new_content is None:
-                if "[omitted " in content or "[earlier output truncated]" in content:
+                if content.startswith("[earlier ") or "[omitted " in content or "[earlier output truncated]" in content:
                     new_content = content
                 else:
                     lines = content.splitlines()
-                    if len(lines) > 10:
-                        head = "\n".join(lines[:5])
-                        tail = "\n".join(lines[-3:])
-                        omitted = len(lines) - 8
-                        new_content = f"{head}\n... [omitted {omitted} intermediate lines of earlier reading] ...\n{tail}"
-                    elif len(content) > 800:
-                        new_content = content[:500] + "\n... [earlier output truncated] ..."
+                    first_line = next((l.strip() for l in lines if l.strip()), "")[:100]
+                    if content.startswith(("Error editing ", "Error writing ", "Error reading ", "Error searching ")):
+                        new_content = f"[earlier {tool_name} error omitted: {first_line}]"
+                    else:
+                        new_content = f"[earlier {tool_name} output omitted ({len(lines)} lines): {first_line}]"
 
         if new_content is not None and new_content != content:
             if hasattr(msg, "model_copy"):
@@ -340,12 +354,39 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         state.close()
 
 
+def _resolve_api_settings(api=None, model_override=None):
+    if model_override is not None and not model_override.strip():
+        return None, None, None, "--model must not be empty"
+    model_val = model_override.strip() if model_override is not None else None
+    if api is not None:
+        prefix = api.upper()
+        base_url = os.getenv(f"{prefix}_BASE_URL") or None
+        api_key = os.getenv(f"{prefix}_API_KEY")
+        model = model_val or os.getenv(f"{prefix}_MODEL")
+        if not base_url or not api_key or not model:
+            return None, None, None, f"set {prefix}_BASE_URL, {prefix}_API_KEY, and {prefix}_MODEL (or --model) in the project-root .env"
+        return model, api_key, base_url, None
+    api_key = os.getenv("API_KEY")
+    model = model_val or os.getenv("MODEL")
+    if api_key and model:
+        return model, api_key, os.getenv("BASE_URL") or None, None
+    base_url = os.getenv("YJ_BASE_URL") or None
+    api_key = os.getenv("YJ_API_KEY")
+    model = model_val or os.getenv("YJ_MODEL")
+    if base_url and api_key and model:
+        return model, api_key, base_url, None
+    return None, None, None, "set YJ_*/DS_* (or MODEL and API_KEY) in the project-root .env"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="Instance repository checked out at its base commit")
     parser.add_argument("--instance-id", required=True)
     parser.add_argument("--issue-file", required=True, help="UTF-8 file containing the issue description")
     parser.add_argument("--output", required=True, help="Prediction JSONL file (appends one record)")
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"), help="API interface from .env to use (default: yj)")
+    parser.add_argument("--model", help="Override the default model for the selected API interface")
+    parser.add_argument("--api-limit", type=int, default=None, help="Override API_LIMIT from .env (default: 70)")
     parser.add_argument("--max-api-calls", type=int, default=None, help="Optional lower per-task limit for model HTTP calls, including retries")
     parser.add_argument("--trace-dir", help="Directory for per-run JSONL traces (default: traces beside output)")
     repro_group = parser.add_mutually_exclusive_group()
@@ -362,17 +403,21 @@ def main():
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     configure_network_proxy()
-    model = os.getenv("MODEL")
-    api_key = os.getenv("API_KEY")
-    if not model or not api_key:
-        parser.error("set MODEL and API_KEY in the project-root .env")
-    raw_limit = os.getenv("API_LIMIT")
-    try:
-        api_limit = 70 if raw_limit is None else int(raw_limit)
-        if api_limit < 1:
-            raise ValueError
-    except ValueError:
-        parser.error("API_LIMIT must be a positive integer")
+    model, api_key, base_url, api_err = _resolve_api_settings(args.api, args.model)
+    if api_err:
+        parser.error(api_err)
+    if args.api_limit is not None:
+        if args.api_limit < 1:
+            parser.error("--api-limit must be a positive integer")
+        api_limit = args.api_limit
+    else:
+        raw_limit = os.getenv("API_LIMIT")
+        try:
+            api_limit = 70 if raw_limit is None else int(raw_limit)
+            if api_limit < 1:
+                raise ValueError
+        except ValueError:
+            parser.error("API_LIMIT must be a positive integer")
     if args.max_api_calls is not None and args.max_api_calls < 1:
         parser.error("--max-api-calls must be positive")
     max_api_calls = min(api_limit, args.max_api_calls) if args.max_api_calls is not None else api_limit
@@ -398,7 +443,7 @@ def main():
             "require_reproduction": args.require_reproduction,
             "instance_id": args.instance_id,
         }
-        patch = run_agent(repo, issue, model, api_key, os.getenv("BASE_URL") or None, **run_kwargs)
+        patch = run_agent(repo, issue, model, api_key, base_url, **run_kwargs)
         trace.record("patch", patch=patch)
         stage = "prediction"
         prediction = {"instance_id": args.instance_id, "model_name_or_path": f"test__{model}",

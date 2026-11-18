@@ -18,7 +18,10 @@ PYTHON = ROOT / 'envs/rustbench/bin/python'
 SWE_PYTHON = ROOT / 'miniconda3/envs/swe-agent/bin/python'
 HARNESS = ROOT / 'Rust-bench'
 SWE = ROOT / 'sweagent-run/SWE-agent'
-AGENTS = ('swe-agent', 'RustForger', 'normal', 'ACI-impr', 'trace-impr', 'test', 'test-notest', 'stage', 'graph')
+AGENTS = ('swe-agent', 'RustForger', 'normal', 'ACI-impr', 'test', 'stage', 'graph')
+API_PROFILES = ('yj', 'ds')
+DEFAULT_API = 'yj'
+DEFAULT_API_LIMIT = 70
 PROXY = 'http://127.0.0.1:11321'
 PROXY_NAMES = tuple(name for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'FTP_PROXY')
                     for name in (key, key.lower()))
@@ -38,7 +41,7 @@ def write_jsonl(path, rows):
     path.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows), encoding='utf-8')
 
 
-def child_env(network='proxy'):
+def child_env(network='direct'):
     env = os.environ.copy()
     from dotenv import dotenv_values
     for key, value in dotenv_values(ROOT / '.env').items():
@@ -63,6 +66,53 @@ def child_env(network='proxy'):
     return env
 
 
+def resolve_api_env(env, api=None, model=None):
+    """Resolve BASE_URL, API_KEY, and MODEL for the requested API profile."""
+    if model is not None and not model.strip():
+        raise ValueError('--model must not be empty')
+    model_override = model.strip() if model is not None else None
+    profile = api.lower() if api is not None else None
+    if profile is None and env.get('API_KEY') and (model_override or env.get('MODEL')):
+        env['MODEL'] = model_override or env['MODEL']
+        return 'env'
+    target = profile or DEFAULT_API
+    if target not in API_PROFILES:
+        raise ValueError(f'--api must be one of {", ".join(API_PROFILES)}')
+    prefix = target.upper()
+    base_url = env.get(f'{prefix}_BASE_URL')
+    api_key = env.get(f'{prefix}_API_KEY')
+    resolved_model = model_override or env.get(f'{prefix}_MODEL')
+    if not base_url or not api_key or not resolved_model:
+        raise ValueError(
+            f'{prefix}_BASE_URL, {prefix}_API_KEY, and {prefix}_MODEL (or --model) must be configured in .env'
+        )
+    env['BASE_URL'] = base_url
+    env['API_KEY'] = api_key
+    env['MODEL'] = resolved_model
+    return target
+
+
+def resolve_api_limit(env, api_limit=None):
+    """Resolve and validate API_LIMIT for the run environment."""
+    if api_limit is not None:
+        if isinstance(api_limit, bool) or not isinstance(api_limit, int) or api_limit < 1:
+            raise ValueError('--api-limit must be a positive integer')
+        env['API_LIMIT'] = str(api_limit)
+        return api_limit
+    raw = env.get('API_LIMIT')
+    if raw is None:
+        env['API_LIMIT'] = str(DEFAULT_API_LIMIT)
+        return DEFAULT_API_LIMIT
+    try:
+        limit = int(raw)
+        if limit < 1:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError('API_LIMIT must be a positive integer') from exc
+    env['API_LIMIT'] = str(limit)
+    return limit
+
+
 def verify_proxy(env):
     subprocess.run(['curl', '-fsSI', '-x', PROXY, 'https://github.com', '--max-time', '10'],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=True)
@@ -77,7 +127,7 @@ def preflight(tasks, rows, agents, env):
         missing += [str(p) for p in (ROOT / 'RustForger/src/rustforger_main_tracing.py',
                     ROOT / 'RustForger/rustforger-tracer/bin/trace_cli') if not p.exists()]
     missing += [str(ROOT / 'baselines' / a / 'agent.py') for a in agents
-                if a in ('normal', 'ACI-impr', 'trace-impr', 'test', 'test-notest', 'stage', 'graph') and not (ROOT / 'baselines' / a / 'agent.py').exists()]
+                if a in ('normal', 'ACI-impr', 'test', 'stage', 'graph') and not (ROOT / 'baselines' / a / 'agent.py').exists()]
     if missing:
         raise RuntimeError('Required paths missing: ' + ', '.join(missing))
     if SET_NAME == 'testset':
@@ -149,7 +199,7 @@ def run_logged(args, log_path, cwd, env):
 def run_baseline(agent, task, row, folder, env):
     (folder / 'issue.txt').write_text(row['problem_statement'], encoding='utf-8')
     args = docker_base(task, env)
-    if agent in ('test', 'test-notest', 'stage', 'graph'):
+    if agent in ('test', 'stage', 'graph'):
         from swebench.harness.test_spec import evaluation_toolchain_override
         override = evaluation_toolchain_override(row)
         if override:
@@ -251,12 +301,19 @@ def evaluate(agent, tasks, folder, run_id, env, workers, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent', required=True, choices=(*AGENTS, 'all'), help='Agent to run; all runs all registered agents')
-    parser.add_argument('--model', help='Override the MODEL value from the environment and .env file')
+    parser.add_argument('--api', type=str.lower, choices=API_PROFILES,
+                        help=f'API interface from .env to use (default: {DEFAULT_API})')
+    parser.add_argument('--model', help='Override the default MODEL value from the selected API interface')
+    parser.add_argument('--api-limit', type=int, help=f'Override API_LIMIT from .env (default: {DEFAULT_API_LIMIT})')
     parser.add_argument('--instance', action='append', help=f'Restrict to {SET_NAME} instance ID; repeat for multiple')
     parser.add_argument('--max-workers', type=int, default=2, help='Concurrent evaluation workers (default: 2)')
     parser.add_argument('--timeout', type=int, default=1800, help='Evaluation timeout in seconds (default: 1800)')
-    parser.add_argument('--network', choices=('proxy', 'direct'), default='proxy',
-                        help='Network mode for agents and evaluation (default: proxy)')
+    parser.add_argument('--network', choices=('proxy', 'direct'), default='direct',
+                        help='Network mode for agents and evaluation (default: direct)')
+    parser.add_argument('--background', action='store_true', default=True,
+                        help='Run in background (default for launcher scripts)')
+    parser.add_argument('--foreground', action='store_true',
+                        help='Run in foreground directly')
     parser.add_argument('--list', action='store_true', help='Print selection and exit without running')
     parser.add_argument('--dry-run', action='store_true', help='Validate dependencies and images without calling agents')
     args = parser.parse_args()
@@ -273,16 +330,17 @@ def main():
         return 0
     if args.max_workers < 1 or args.timeout < 1:
         parser.error('--max-workers and --timeout must be positive')
-    if args.model is not None and not args.model.strip():
-        parser.error('--model must not be empty')
     agents = list(AGENTS) if args.agent == 'all' else [args.agent]
     rows = {r['instance_id']: r for r in read_jsonl(ROOT / 'data/rustbench-all.jsonl')}
     env = child_env(args.network)
-    if args.model is not None:
-        env['MODEL'] = args.model
+    try:
+        active_api = resolve_api_env(env, api=args.api, model=args.model)
+        api_limit = resolve_api_limit(env, api_limit=args.api_limit)
+    except ValueError as exc:
+        parser.error(str(exc))
     preflight(tasks, rows, agents, env)
     if args.dry_run:
-        print(f'Preflight passed: {len(tasks)} cached images, agents: {", ".join(agents)}, network: {args.network}')
+        print(f'Preflight passed: {len(tasks)} cached images, agents: {", ".join(agents)}, api: {active_api}, model: {env.get("MODEL")}, api_limit: {api_limit}, network: {args.network}')
         return 0
     run_id = SET_NAME + '_' + dt.datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
     run_dir = HERE / 'runs' / run_id
@@ -290,8 +348,8 @@ def main():
     write_json(run_dir / 'manifest.json', manifest)
     sources = {'swe-agent': SWE / 'sweagent', 'RustForger': ROOT / 'RustForger/src',
                'normal': ROOT / 'baselines/normal', 'ACI-impr': ROOT / 'baselines/ACI-impr',
-               'trace-impr': ROOT / 'baselines/trace-impr', 'test': ROOT / 'baselines/test',
-               'test-notest': ROOT / 'baselines/test-notest', 'stage': ROOT / 'baselines/stage',
+               'test': ROOT / 'baselines/test',
+               'stage': ROOT / 'baselines/stage',
                'graph': ROOT / 'baselines/graph'}
     hashes = {}
     for agent in agents:
@@ -311,7 +369,7 @@ def main():
         image_ids[task['instance_id']] = subprocess.check_output(
             ['docker', '-H', 'unix:///var/run/docker.sock', 'image', 'inspect', '--format', '{{.Id}}', task['image']],
             text=True, env=env).strip()
-    write_json(run_dir / 'run_metadata.json', {'model': env.get('MODEL'), 'api_limit': env.get('API_LIMIT'),
+    write_json(run_dir / 'run_metadata.json', {'api': active_api, 'model': env.get('MODEL'), 'api_limit': env.get('API_LIMIT'),
                'agent_source_sha256': hashes, 'instances': [t['instance_id'] for t in tasks],
                'image_ids': image_ids, 'dataset_sha256': hashlib.sha256(
                    (ROOT / 'data/rustbench-all.jsonl').read_bytes()).hexdigest(),

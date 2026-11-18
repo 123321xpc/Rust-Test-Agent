@@ -18,8 +18,8 @@ while an existing failure or timeout is recorded as inconclusive. Doctest line
 shifts are reported for review; mixed code/doc hunks are not discarded solely
 because their line counts changed.
 
-`test` is backed by a deterministic Rust Code Knowledge Graph (CKG), compiler
-diagnostic symbol lookup, and zero-dependency dynamic tracing.
+`test` is backed by a deterministic Rust Code Knowledge Graph (CKG) and compiler
+diagnostic symbol lookup.
 
 ## Red-phase test locking, Verifier probes, and CKG impact injection
 
@@ -59,34 +59,12 @@ injected into the Verifier prompt and the Architect advisory prompt, so a
 cross-layer change (for example a new lexer token missing a parser match arm)
 is surfaced deterministically instead of being rediscovered by ad-hoc grep.
 
-## `test-notest` comparison baseline
-
-`baselines/test-notest` is a copy of `baselines/test` that intentionally omits
-the pre-fix test-generation step, so the contribution of the Red-phase
-regression test can be measured against the rest of the pipeline. It differs
-from `test` in exactly four ways:
-
-1. `write_regression_test` is removed from the Fixer and Navigator tool
-   allow-lists in both `continuous` and `staged` modes.
-2. The prompts direct the agents to analyze the code and rely on the
-   repository's existing tests instead of generating a temporary test.
-3. `--require-reproduction` defaults to disabled, because no generated
-   regression test exists to reproduce against.
-4. The Verifier prompt states that `Reproduction evidence: unverified` is
-   expected and must not by itself cause a rejection.
-
-Everything else — the CKG impact surface, the Verifier sandbox probe, the
-Architect escalation paths, the submission gate, and the fallback handling —
-is identical to `test`, so a difference in resolved tasks isolates the value
-of the Red-phase test.
-
 ## Staged comparison mode
 
 1. **Layer 0 — Deterministic Rust Foundations**:
    - `rust_ckg.py` (`inspect_rust_neighborhood`): Zero-dependency token-aware Rust parser and incremental Code Knowledge Graph resolving `mod` trees, `pub use` re-export import paths, `impl Trait` / `#[derive]` relations, call edges, and candidate fault propagation chains.
    - `rust_diagnostics.py`: Classifies rustc diagnostics, surfaces `MachineApplicable` fixes, and automatically enriches `E0599`, `E0425`, `E0412`, `E0405`, `E0432`, `E0433`, and `E0277` compiler errors in both `cargo_check` and `cargo_test` with symbol/re-export/trait-impl lookups.
-   - `rust_trace.py`: Token-aware non-destructive RAII function tracing (skipping `#[test]`, `#[cfg(test)]`, and `const fn`) with optional `watch_vars` and automatic fallback if `Debug` is not implemented.
-2. **Agent 1 — Navigator & Reproducer** (`multi_agent.py`): Extracts exact requested API names/signals from the issue, maps 1–3 candidate fault propagation chains, creates a temporary regression test (`tests/test_regression_<name>.rs` or in-module `#[cfg(test)]`) to verify the Red phase, optionally runs `rust_trace`, and emits a structured `LocalizationBundle`.
+2. **Agent 1 — Navigator & Reproducer** (`multi_agent.py`): Extracts exact requested API names/signals from the issue, maps 1–3 candidate fault propagation chains, creates a temporary regression test (`tests/test_regression_<name>.rs` or in-module `#[cfg(test)]`) to verify the Red phase, and emits a structured `LocalizationBundle`.
 3. **Adaptive Routing Gate**: Chooses **Fast Path** (skipping Architect for simple, localized single-file bugs) or **Planned Path** (invoking Architect for multi-file, multi-chain, trait/lifetime, macro, new-API, or downstream-dependent tasks).
 4. **Agent 2 — Rust Architect / Suggester**: Runs in a clean context to arbitrate root cause vs. surface callers, audit trait/lifetime/API contracts, and emit a structured `RepairPlan`.
 5. **Agent 3 — Rust Fixer**: Executes dependency-closed repair units in bounded clean-context slices. The deterministic Coordinator checks each unit, records partial-patch evidence, and rolls back only failed units and their dependents on escalation.

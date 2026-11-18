@@ -431,6 +431,11 @@ def make_cargo_test_tool(
             }
             if omitted_diagnostics:
                 payload["diagnostics_omitted"] = omitted_diagnostics
+            if result.returncode == 0 and not no_run and executed == 0:
+                payload["warning"] = (
+                    "Zero tests executed (exit_code=0). Your test_filter may have matched 0 tests, "
+                    "or only doc/unit tests exist under another target."
+                )
             if on_test_feedback and not no_run:
                 strategy_warning = on_test_feedback(
                     manifest_path, test_target, result.returncode, failures, executed, compile_errors,

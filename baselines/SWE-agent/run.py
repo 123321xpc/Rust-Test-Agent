@@ -36,7 +36,7 @@ from pathlib import Path
 
 import yaml
 from rich.markdown import Markdown
-from simple_parsing import parse
+from simple_parsing import DashVariant, parse
 from simple_parsing.helpers.flatten import FlattenedAccess
 from simple_parsing.helpers.serialization.serializable import FrozenSerializable
 KEY_INSTANCE_ID = "instance_id"
@@ -46,7 +46,7 @@ from multi_swe_bench.harness.build_dataset import CliArgs
 from unidiff import PatchSet
 
 from sweagent.agent.agents import Agent, AgentArguments
-from sweagent.agent.models import ModelArguments
+from sweagent.agent.models import ModelArguments, resolve_api_env
 from sweagent.environment.swe_env import EnvironmentArguments, SWEEnv
 from sweagent.environment.utils import (
     InvalidGithubURL,
@@ -111,6 +111,16 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     raise_exceptions: bool = False
     # Dump the entire config to the log
     print_config: bool = True
+    # API interface from .env to use (default: yj)
+    api: str | None = None
+    # Override API_LIMIT from .env (default: 70)
+    api_limit: int | None = None
+
+    def __post_init__(self):
+        if self.api is not None and self.api.strip().lower() not in ("yj", "ds"):
+            raise ValueError("--api must be one of yj, ds")
+        if self.api_limit is not None and self.api_limit < 1:
+            raise ValueError("--api-limit must be a positive integer")
 
     @property
     def run_name(self):
@@ -313,6 +323,7 @@ class Main:
         if args.print_config:
             logger.info(f"📙 Arguments: {args.dumps_yaml()}")
         self.args = args
+        resolve_api_env(api=args.api, api_limit=args.api_limit)
         self.env = SWEEnv(args.environment)
         self.agent = Agent("primary", args.agent)
         self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
@@ -534,6 +545,7 @@ def get_args(args=None) -> ScriptArguments:
         ScriptArguments,
         default=defaults,
         add_config_path_arg=False,
+        add_option_string_dash_variants=DashVariant.UNDERSCORE_AND_DASH,
         args=args,
         formatter_class=RichHelpFormatter,
         description=Markdown(__doc__),

@@ -1,6 +1,8 @@
 # Jifang 50 任务测试集
 
-`~/xpc/testset/manifest.json` 固定了 50 个任务：先从原十项验证集之外的 100 个任务中按仓库名称和实例 ID 排序，逐轮取满 50 个，再将其中 7 个 Rust/Cargo 1.40 之前的任务替换为 1.40 或更新版本的任务。替换任务仍来自原 100 任务清单 `manifest-100.json`；原有任务镜像均保留。清单记录任务、基础提交和镜像标签及来源数据散列；不会随新增镜像自动变化。所选任务覆盖原有的全部 23 个仓库，并未根据历史运行记录排除任务，因此部分任务此前可能已被评测或用于开发，不能仅凭与验证集不重叠而声称它们是未接触过的独立测试集。
+`~/xpc/testset/manifest.json` 固定了 50 个任务：25 个小补丁（参考补丁增删行数不超过 15）和 25 个中补丁（16–150 行），不包含大补丁。任务难度按参考补丁 hunk 中的增删行数计算。新清单从原清单中移除全部 6 个大补丁及 7 个中补丁，保留其余任务；新增 10 个已缓存镜像的小补丁，以及 3 个 Rust 1.40 或更新版本的小补丁。新增任务都排除了旧 Cargo 工具链。三个额外候选记录在 `manifest-additions.json`，原 100 项候选清单 `manifest-100.json` 保持不变。镜像缓存使用代理构建；调整清单时没有删除任何 Docker 镜像，移出测试集的大补丁镜像仍保留在本机。
+
+测试任务与固定验证集不重叠。清单仍记录任务、基础提交、镜像标签及来源数据散列，不会随新增镜像自动变化。原 50 项清单覆盖 23 个仓库；本次按补丁大小重配后仓库覆盖会随入选任务变化，因此不要将其视为与旧清单具有相同的仓库分布。历史运行记录未用于筛选任务，不能仅凭与验证集不重叠而声称它们是未接触过的独立测试集。
 
 Cargo crate 和 Git 依赖保存在服务器共享目录 `~/xpc/cargo-cache/`，评测容器按需挂载共享缓存；每个任务镜像自带的 crates 索引继续从镜像读取，不会复制或改写任务镜像。使用代理预取参考测试补丁所需依赖，并在无网络容器中核验：
 
@@ -15,25 +17,27 @@ Cargo crate 和 Git 依赖保存在服务器共享目录 `~/xpc/cargo-cache/`，
 ~/xpc/testset/testbench --agent all --list
 ~/xpc/testset/testbench --agent all --dry-run
 
-# 选择一个智能体在后台运行完整测试集，输出 PID 和启动日志路径。
-~/xpc/testset/testbench --background --agent normal
-~/xpc/testset/testbench --background --agent swe-agent
-~/xpc/testset/testbench --background --agent RustForger
-~/xpc/testset/testbench --background --agent ACI-impr
-~/xpc/testset/testbench --background --agent trace-impr
-~/xpc/testset/testbench --background --agent test
+# 默认在后台运行完整测试集并使用直连网络，输出 PID 和启动日志路径。
+~/xpc/testset/testbench --agent normal
+~/xpc/testset/testbench --agent swe-agent
+~/xpc/testset/testbench --agent RustForger
+~/xpc/testset/testbench --agent ACI-impr
+~/xpc/testset/testbench --agent test
 
-# 也可按顺序运行全部注册智能体；--background 必须是第一个参数。
-~/xpc/testset/testbench --background --agent all --max-workers 2 --timeout 1800
+# 也可按顺序运行全部注册智能体（默认后台、直连）
+~/xpc/testset/testbench --agent all --max-workers 2 --timeout 1800
 
 # 单次覆盖 .env 和 shell 环境中的 MODEL
-~/xpc/testset/testbench --background --agent normal --model deepseek-v4.1-flash
+~/xpc/testset/testbench --agent normal --model deepseek-v4.1-flash
 
-# 单个或多个清单内任务；省略 --background 可在前台执行。
-~/xpc/testset/testbench --agent normal --instance BurntSushi__ripgrep-2209
+# 前台执行：指定 --foreground
+~/xpc/testset/testbench --foreground --agent normal --instance BurntSushi__ripgrep-2209
+
+# 如需使用本地代理和反向隧道，指定 --network proxy
+~/xpc/testset/testbench --agent normal --network proxy
 ```
 
-每次实验读取服务器 `~/xpc/.env` 和服务器上的智能体代码，可能产生模型调用费用；`--model` 可单次覆盖模型名，实际模型记录在运行元数据中。启动前须在 Windows 端启动 11321 代理并保持 SSH 反向隧道；入口检查服务器到代理的连通性，后台启动前先同步执行一次 dry-run。`--max-workers` 控制补丁评测并发，智能体任务仍顺序运行；`--timeout` 是单任务测试超时（秒）。远程代理或隧道中断会影响运行。
+每次实验读取服务器 `~/xpc/.env` 和服务器上的智能体代码，可能产生模型调用费用；`--model` 可单次覆盖模型名，实际模型记录在运行元数据中。默认使用直连模式，不检查反向隧道；若指定 `--network proxy`，启动前须在 Windows 端启动 11321 代理并保持 SSH 反向隧道。后台启动前先同步执行一次 dry-run。`--max-workers` 控制补丁评测并发，智能体任务仍顺序运行；`--timeout` 是单任务测试超时（秒）。
 
 启动日志位于 `~/xpc/testset/launcher-logs/`。具体运行目录为 `~/xpc/testset/runs/testset_<时间>_<随机数>/`，包含清单、运行元数据、智能体日志、预测及 `summary.json`。测试明细位于 `~/xpc/Rust-bench/logs/run_evaluation/<run_id>_<agent_id>/<agent>/<instance>/`。状态 `resolved`、`unresolved`、`no_patch`、`agent_error` 和 `evaluation_error` 含义与 `~/xpc/validation/README.md` 相同。
 

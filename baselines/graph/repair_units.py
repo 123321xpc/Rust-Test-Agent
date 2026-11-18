@@ -103,7 +103,7 @@ class RepairUnitCoordinator:
     UNCHECKED_EDITS = 6
     READ_ONLY_TOOLS = frozenset({
         "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
-        "inspect_rust_neighborhood", "rust_error_explain", "rust_trace",
+        "inspect_rust_neighborhood", "rust_error_explain",
     })
 
     def __init__(self, state, tools_by_name, blackboard, trace=None, candidate_policy=None):

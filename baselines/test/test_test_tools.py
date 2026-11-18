@@ -28,8 +28,8 @@ def test_edits_produce_applicable_complete_patch_without_mutating_checkout(norma
     repo, tools, state = normal
     assert set(tools) == {"read_file", "write_file", "write_regression_test", "edit_file", "revert_file",
                           "checkpoint", "generate_patch", "read_lines", "search_code", "cargo_workspace",
-                          "cargo_check", "cargo_test", "rust_symbols", "inspect_rust_neighborhood", "rust_error_explain",
-                          "rust_trace", "verifier_probe"}
+                          "cargo_check", "cargo_test", "rust_trace", "rust_symbols", "inspect_rust_neighborhood",
+                          "rust_error_explain", "verifier_probe"}
     write = tools["write_file"]
     write.invoke({"path": "edit.rs", "content": "intermediate\n"})
     write.invoke({"path": "edit.rs", "content": "after\n"})
@@ -216,6 +216,33 @@ def test_write_file_rejects_erasing_existing_rust_source_without_force(normal):
             "path": "src/lib.rs", "content": "//! intentional reset\n", "force": True,
         })
         assert result.startswith("Updated src/lib.rs")
+    finally:
+        state.close()
+
+
+def test_write_file_rejects_truncating_or_deleting_large_rust_file_without_force(normal):
+    _, tools, state = normal
+    (state.root / "src").mkdir()
+    lines = [f"pub fn f{i}() -> i32 {{ {i} }}" for i in range(30)]
+    full_src = "\n".join(lines) + "\n"
+    (state.root / "src" / "large.rs").write_text(full_src, encoding="utf-8")
+    try:
+        res_trunc = tools["write_file"].invoke({"path": "src/large.rs", "content": "pub fn f0() -> i32 { 0 }\n"})
+        assert "Refusing to overwrite existing Rust source file" in res_trunc
+
+        res_del = tools["write_file"].invoke({"path": "src/large.rs", "content": None})
+        assert "Refusing to delete existing Rust source file" in res_del
+
+        # edit_file remains allowed to shrink a large file legitimately
+        old_tail = "\n".join(lines[5:])
+        res_edit = tools["edit_file"].invoke({"path": "src/large.rs", "old_text": old_tail, "new_text": ""})
+        assert res_edit.startswith("Updated src/large.rs")
+
+        # force=True still allows explicit full overwrite
+        res_force = tools["write_file"].invoke({
+            "path": "src/large.rs", "content": "pub fn reset() -> i32 { 42 }\n", "force": True,
+        })
+        assert res_force.startswith("Updated src/large.rs")
     finally:
         state.close()
 
@@ -1185,11 +1212,12 @@ def test_read_file_truncates_large_files(normal):
     (state.root / "src").mkdir(parents=True, exist_ok=True)
     (state.root / "src" / "large.rs").write_text(large_content, encoding="utf-8")
     out = tools["read_file"].invoke({"path": "src/large.rs"})
+    assert "[File: src/large.rs (300 lines total)]" in out
     assert "File has 300 lines" in out
-    assert "pub fn line_1()" in out
-    assert "pub fn line_120()" in out
+    assert "1: pub fn line_1()" in out
+    assert "120: pub fn line_120()" in out
     assert "pub fn line_200()" not in out
-    assert "pub fn line_300()" in out
+    assert "300: pub fn line_300()" in out
     assert "read_lines" in out
 
 
@@ -1801,5 +1829,238 @@ def test_smoke_ignores_snapshot_template_text_and_keeps_snapshot_diff(tmp_path, 
             "thread 'aka_musl' panicked: Connection timed out\n",
             "fatal: unable to access 'https://github.com/x/y': Failed to connect to github.com",
         )
+    finally:
+        state.close()
+
+
+def test_compile_reproduction_does_not_hard_lock_and_bin_only_rejects_crate_import(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        '[package]\nname = "bin-only-app"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (state.root / "src").mkdir(exist_ok=True)
+    (state.root / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+
+    bad_bin = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_bin.rs",
+        "content": "use bin_only_app::opts;\n#[test] fn t() {}\n",
+    })
+    assert "Error" in bad_bin and "binary target" in bad_bin
+
+    (state.root / "src" / "lib.rs").write_text("pub fn exists() {}\n", encoding="utf-8")
+    write_res = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_api.rs",
+        "content": "use demo::missing_fn;\n#[test] fn t() { missing_fn(); }\n",
+    })
+    assert write_res.startswith("Updated")
+    state.fail_test(
+        state.start_test(),
+        manifest_path="Cargo.toml",
+        test_target="test_regression_api",
+        executed=0,
+        returncode=101,
+        compile_errors=[{"code": "E0432"}],
+    )
+    assert state.reproduced()
+    assert not state._locked_regressions
+    rewrite = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_api.rs",
+        "content": "#[test] fn t() { demo::exists(); }\n",
+    })
+    assert rewrite.startswith("Updated")
+
+
+def test_edit_file_warns_inline_test_isolation_top_level_use_and_doctest_placement(tmp_path):
+    repo = tmp_path / "hint_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "hint_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(
+        "use rhai::{Dynamic, Module};\n\n"
+        "/// Example:\n"
+        "/// ```\n"
+        "/// assert_eq!(1, 1);\n"
+        "/// ```\n"
+        "pub fn entry(val: Dynamic) -> Dynamic { val }\n\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    use super::*;\n"
+        "    #[test]\n"
+        "    fn t() { let _ = entry(Dynamic::UNIT); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("tools_hint_test", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    try:
+        out1 = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "/// Example:",
+            "new_text": "fn helper(_a: rhai::Array) {}\n\n/// Example:",
+        })
+        assert "Doctest Line-Shift Notice" in out1 and "below existing doctests" in out1
+        assert "Rust Test-Scope Hint" in out1 and "Array" in out1
+        assert "Inline-Test Isolation Warning" not in out1
+
+        out2 = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "    fn t() { let _ = entry(Dynamic::UNIT); }",
+            "new_text": "    fn t() { let _ = entry(Dynamic::UNIT); /* touched */ }",
+        })
+        assert "Inline-Test Isolation Warning" in out2
+    finally:
+        state.close()
+
+
+def test_guardrail_atomicity_unclosed_literals_and_recovery_context(normal):
+    _, tools, state = normal
+    tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn ok() -> i32 { 1 }\n"})
+    tools["write_regression_test"].invoke({"path": "tests/test_regression_valid.rs", "content": "#[test] fn t() {}\n"})
+    state.pass_test(state.start_test(), test_target="test_regression_valid")
+    assert state.verified()
+
+    # Syntax rejection in write_regression_test must NOT pollute regression_tests or invalidate prior verification
+    bad_reg = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_broken.rs",
+        "content": '#[test] fn broken() { let s = "unclosed;\n}\n',
+    })
+    assert "Syntax guardrail error" in bad_reg
+    assert "unclosed string literal" in bad_reg
+    assert all("broken" not in p.as_posix() for p in state.regression_tests)
+    assert state.verified()
+
+    # edit_file rejection shows Proposed + Original code context and tracks consecutive edit failures
+    bad_edit = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "pub fn ok() -> i32 { 1 }",
+        "new_text": "pub fn ok() -> i32 { /* unclosed comment\n",
+    })
+    assert "Syntax guardrail error" in bad_edit
+    assert "Proposed code around line" in bad_edit
+    assert "Original code around line" in bad_edit
+    assert "Recovery notice" not in bad_edit
+
+    bad_edit_2 = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "missing_symbol",
+        "new_text": "x",
+    })
+    assert "Recovery notice: 2 consecutive edit failures" in bad_edit_2
+
+
+def test_cfg_feature_notice_and_setup_panic_guard(tmp_path):
+    spec = importlib.util.spec_from_file_location("test_tools_cfg", Path(__file__).with_name("tools.py"))
+    tools_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tools_mod)
+    root = tmp_path / "cfg_repo"
+    (root / "src").mkdir(parents=True)
+    (root / "Cargo.toml").write_text('[package]\nname = "cfg_demo"\nversion = "0.1.0"\n[features]\nserde = []\n', encoding="utf-8")
+    (root / "src" / "lib.rs").write_text('#[cfg(feature = "serde")]\npub fn ser() -> i32 { 1 }\n', encoding="utf-8")
+    tools_list, state = tools_mod.make_tools(root, post_strip_check=False, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        assert "rust_trace" in tools
+        out = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub fn ser() -> i32 { 1 }",
+            "new_text": "pub fn ser() -> i32 { 2 }",
+        })
+        assert "Cfg Feature Notice" in out and "serde" in out
+        assert state._active_cfg_features[(state.root / "Cargo.toml").resolve()] == ["serde"]
+
+        # A setup/IO panic outside src/ must be flagged as suspect_setup_panic and not locked
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_io.rs", "content": "#[test] fn t() {}"})
+        state.fail_test(
+            state.start_test(),
+            test_target="test_regression_io",
+            executed=1,
+            failures=["t"],
+            returncode=101,
+            failure_details=[{"test": "t", "kind": "unexpected_panic", "output": "No such file or directory at tests/test_regression_io.rs:1"}],
+        )
+        reg_meta = state._reproduced_regressions[(Path("Cargo.toml"), "test_regression_io")]
+        assert reg_meta["suspect_setup_panic"] is True
+        assert not state._locked_regressions
+    finally:
+        state.close()
+
+
+def test_edit_file_warns_eof_append_and_same_file_parallel_pattern(tmp_path):
+    spec = importlib.util.spec_from_file_location("test_tools_eof_pat", Path(__file__).with_name("tools.py"))
+    tools_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tools_mod)
+    root = tmp_path / "pat_repo"
+    (root / "src").mkdir(parents=True)
+    (root / "Cargo.toml").write_text('[package]\nname = "pat"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src" / "sdl.rs").write_text(
+        "pub fn write_obj(sdl: &mut String, name: &str) {\n"
+        "    writeln!(sdl, \"{{\").unwrap();\n"
+        "    let _ = name;\n"
+        "}\n"
+        "pub fn write_iface(sdl: &mut String, name: &str) {\n"
+        "    writeln!(sdl, \"{{\").unwrap();\n"
+        "    let _ = name;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    tools_list, state = tools_mod.make_tools(root, post_strip_check=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        out1 = tools["edit_file"].invoke({
+            "path": "src/sdl.rs",
+            "old_text": "pub fn write_obj(sdl: &mut String, name: &str) {\n    writeln!(sdl, \"{{\").unwrap();",
+            "new_text": "pub fn write_obj(sdl: &mut String, name: &str) {\n    writeln!(sdl, \" {{\").unwrap();",
+        })
+        assert "Same-File Pattern Notice" in out1 and "line(s) 6" in out1
+        assert "EOF-Append Conflict Warning" not in out1
+
+        out2 = tools["edit_file"].invoke({
+            "path": "src/sdl.rs",
+            "old_text": "pub fn write_iface(sdl: &mut String, name: &str) {\n    writeln!(sdl, \"{{\").unwrap();\n    let _ = name;\n}",
+            "new_text": "pub fn write_iface(sdl: &mut String, name: &str) {\n    writeln!(sdl, \"{{\").unwrap();\n    let _ = name;\n}\nfn helper_at_eof() {}",
+        })
+        assert "EOF-Append Conflict Warning" in out2
+    finally:
+        state.close()
+
+
+def test_discover_integration_targets_and_snapshot_smoke_filter(tmp_path, monkeypatch):
+    repo = tmp_path / "dist_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "templates" / "installer").mkdir(parents=True)
+    (repo / "tests" / "snapshots").mkdir(parents=True)
+    (repo / "tests" / "gallery").mkdir(parents=True)
+    (repo / "src" / "lib.rs").write_text("pub fn render() {}\n", encoding="utf-8")
+    (repo / "templates" / "installer" / "installer.sh.j2").write_text("echo old\n", encoding="utf-8")
+    (repo / "tests" / "snapshots" / "install_path_env.snap").write_text("old\n", encoding="utf-8")
+    (repo / "tests" / "gallery" / "main.rs").write_text("#[test] fn install_path_env() {}\n", encoding="utf-8")
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "dist_repo"\nversion = "0.1.0"\n\n[[test]]\nname = "integration-tests"\npath = "tests/gallery/main.rs"\n',
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("tools_snap_filter", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.discover_integration_test_targets(repo / "Cargo.toml") == ["integration-tests"]
+
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/bin/cargo")
+    try:
+        tools["write_file"].invoke({"path": "templates/installer/installer.sh.j2", "content": "echo new\n"})
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stdout="test result: ok. 1 passed; 0 failed\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        results = state.run_existing_test_smoke([Path("templates/installer/installer.sh.j2")], timeout=3)
+        targets = [r["target"] for r in results]
+        assert any(t.startswith("test:integration-tests[install") for t in targets)
+        assert any("--" in cmd and "install" in cmd for cmd in commands)
     finally:
         state.close()

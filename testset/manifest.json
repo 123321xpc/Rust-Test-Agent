@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "source_image_count": 110,
-  "selection": "50 tasks selected round-robin by sorted repository and instance ID from the 100 cached tasks outside the frozen validation set; seven selected tasks below Rust 1.40 were replaced with tasks at Rust 1.40 or newer",
+  "source_image_count": 113,
+  "selection": "25 small patches (at most 15 changed lines) and 25 medium patches (16-150 changed lines); all six large patches removed; ten small tasks chosen from already-cached candidate images and three additional small task images built through the configured proxy; selected Cargo toolchains are Rust 1.40 or newer",
   "validation_instance_ids": [
     "ast-grep__ast-grep-1707",
     "axodotdev__cargo-dist-555",
@@ -9,12 +9,22 @@
     "biomejs__biome-2621",
     "cargo-generate__cargo-generate-880",
     "chronotope__chrono-991",
+    "dtolnay__async-trait-150",
     "killercup__cargo-edit-572",
     "sharkdp__bat-562",
     "tokio-rs__bytes-377",
     "tokio-rs__tracing-1523"
   ],
   "tasks": [
+    {
+      "instance_id": "BurntSushi__ripgrep-2209",
+      "repo": "BurntSushi/ripgrep",
+      "base_commit": "4dc6c73c5a9203c5a8a89ce2161feca542329812",
+      "image": "rustbench/burntsushi__ripgrep:pr-2209-rust-1.61.0-4dc6c73c5a92-61d47a7f60",
+      "rust_toolchain": "1.61.0",
+      "patch_changed_lines": 70,
+      "size": "medium"
+    },
     {
       "instance_id": "ast-grep__ast-grep-1558",
       "repo": "ast-grep/ast-grep",
@@ -23,33 +33,6 @@
       "rust_toolchain": "1.82.0",
       "patch_changed_lines": 76,
       "size": "medium"
-    },
-    {
-      "instance_id": "ast-grep__ast-grep-1560",
-      "repo": "ast-grep/ast-grep",
-      "base_commit": "d9014f979fd7ee34cd9f449449a32f25296c34f4",
-      "image": "rustbench/ast-grep__ast-grep:pr-1560-rust-1.82.0-d9014f979fd7-d9368993fc",
-      "rust_toolchain": "1.82.0",
-      "patch_changed_lines": 83,
-      "size": "medium"
-    },
-    {
-      "instance_id": "ast-grep__ast-grep-1588",
-      "repo": "ast-grep/ast-grep",
-      "base_commit": "ccdc53168d6fbcff91e9ac095a3ef49eb847a410",
-      "image": "rustbench/ast-grep__ast-grep:pr-1588-rust-1.82.0-ccdc53168d6f-16e1a90436",
-      "rust_toolchain": "1.82.0",
-      "patch_changed_lines": 148,
-      "size": "medium"
-    },
-    {
-      "instance_id": "async-graphql__async-graphql-10",
-      "repo": "async-graphql/async-graphql",
-      "base_commit": "ba64ecc31d8c94b29b481a4c6a6573e397a1a132",
-      "image": "rustbench/async-graphql__async-graphql:pr-10-rust-1.42.0-ba64ecc31d8c-96e98072ab",
-      "rust_toolchain": "1.42.0",
-      "patch_changed_lines": 167,
-      "size": "large"
     },
     {
       "instance_id": "async-graphql__async-graphql-1048",
@@ -79,21 +62,30 @@
       "size": "small"
     },
     {
+      "instance_id": "async-graphql__async-graphql-1491",
+      "repo": "async-graphql/async-graphql",
+      "base_commit": "759fb0e594606aecf4a239b00d6f3f8aeb22d885",
+      "image": "rustbench/async-graphql__async-graphql:pr-1491-rust-1.76.0-759fb0e59460-8ef9f1190f",
+      "rust_toolchain": "1.76.0",
+      "patch_changed_lines": 7,
+      "size": "small"
+    },
+    {
+      "instance_id": "axodotdev__cargo-dist-1024",
+      "repo": "axodotdev/cargo-dist",
+      "base_commit": "19a6a16993acdc577c91955f1963c2838e9d1f42",
+      "image": "rustbench/axodotdev__cargo-dist:pr-1024-rust-1.78.0-19a6a16993ac-d2de994b95",
+      "rust_toolchain": "1.78.0",
+      "patch_changed_lines": 2,
+      "size": "small"
+    },
+    {
       "instance_id": "axodotdev__cargo-dist-1655",
       "repo": "axodotdev/cargo-dist",
       "base_commit": "aa437ee6ed8b01bf28cfcac1d2fa1a7fe95979a6",
       "image": "rustbench/axodotdev__cargo-dist:pr-1655-rust-1.83.0-aa437ee6ed8b-dc92ebf533",
       "rust_toolchain": "1.83.0",
       "patch_changed_lines": 16,
-      "size": "medium"
-    },
-    {
-      "instance_id": "axodotdev__cargo-dist-275",
-      "repo": "axodotdev/cargo-dist",
-      "base_commit": "b9856c45e81d5996d691af60e96bc5f9bfe3d990",
-      "image": "rustbench/axodotdev__cargo-dist:pr-275-rust-1.71.0-b9856c45e81d-3000f0718a",
-      "rust_toolchain": "1.71.0",
-      "patch_changed_lines": 139,
       "size": "medium"
     },
     {
@@ -133,31 +125,22 @@
       "size": "small"
     },
     {
-      "instance_id": "bevyengine__bevy-15546",
+      "instance_id": "aya-rs__aya-90",
+      "repo": "aya-rs/aya",
+      "base_commit": "3a8e4fe9b91538a0fafd8c91ae96185c1a017651",
+      "image": "rustbench/aya-rs__aya:pr-90-rust-1.56.0-3a8e4fe9b915-bf7979c289",
+      "rust_toolchain": "1.56.0",
+      "patch_changed_lines": 6,
+      "size": "small"
+    },
+    {
+      "instance_id": "bevyengine__bevy-15398",
       "repo": "bevyengine/bevy",
-      "base_commit": "429987ebf811da7fa30adc57dca5d83ed9c7e871",
-      "image": "rustbench/bevyengine__bevy:pr-15546-rust-1.81.0-429987ebf811-fa6ea9cadf",
+      "base_commit": "1a41c736b39a01f4dbef75c4282edf3ced5f01e9",
+      "image": "rustbench/bevyengine__bevy:pr-15398-rust-1.81.0-1a41c736b39a-cb8d16c4b2",
       "rust_toolchain": "1.81.0",
-      "patch_changed_lines": 299,
-      "size": "large"
-    },
-    {
-      "instance_id": "biomejs__biome-2404",
-      "repo": "biomejs/biome",
-      "base_commit": "60671ec3a4c59421583d5d1ec8cfe30d45b27cd7",
-      "image": "rustbench/biomejs__biome:pr-2404-rust-1.77.2-60671ec3a4c5-33e5a570ec",
-      "rust_toolchain": "1.77.2",
-      "patch_changed_lines": 317,
-      "size": "large"
-    },
-    {
-      "instance_id": "biomejs__biome-384",
-      "repo": "biomejs/biome",
-      "base_commit": "1aa21df1e6c537b022c130e8d44351d4c244d331",
-      "image": "rustbench/biomejs__biome:pr-384-rust-1.72.0-1aa21df1e6c5-16bf4a99b0",
-      "rust_toolchain": "1.72.0",
-      "patch_changed_lines": 277,
-      "size": "large"
+      "patch_changed_lines": 5,
+      "size": "small"
     },
     {
       "instance_id": "boa-dev__boa-4047",
@@ -167,33 +150,6 @@
       "rust_toolchain": "1.83.0",
       "patch_changed_lines": 136,
       "size": "medium"
-    },
-    {
-      "instance_id": "BurntSushi__ripgrep-2209",
-      "repo": "BurntSushi/ripgrep",
-      "base_commit": "4dc6c73c5a9203c5a8a89ce2161feca542329812",
-      "image": "rustbench/burntsushi__ripgrep:pr-2209-rust-1.61.0-4dc6c73c5a92-61d47a7f60",
-      "rust_toolchain": "1.61.0",
-      "patch_changed_lines": 70,
-      "size": "medium"
-    },
-    {
-      "instance_id": "cargo-generate__cargo-generate-1172",
-      "repo": "cargo-generate/cargo-generate",
-      "base_commit": "26427861bddd32bc2fdca354a76bc7b093871084",
-      "image": "rustbench/cargo-generate__cargo-generate:pr-1172-rust-1.77.2-26427861bddd-689a27a46e",
-      "rust_toolchain": "1.77.2",
-      "patch_changed_lines": 96,
-      "size": "medium"
-    },
-    {
-      "instance_id": "cargo-generate__cargo-generate-372",
-      "repo": "cargo-generate/cargo-generate",
-      "base_commit": "4daf0d95d5238250edbcb4a596b1c85ae25faec7",
-      "image": "rustbench/cargo-generate__cargo-generate:pr-372-rust-1.53.0-4daf0d95d523-836f161c14",
-      "rust_toolchain": "1.53.0",
-      "patch_changed_lines": 178,
-      "size": "large"
     },
     {
       "instance_id": "cargo-generate__cargo-generate-474",
@@ -214,31 +170,13 @@
       "size": "medium"
     },
     {
-      "instance_id": "chronotope__chrono-1157",
+      "instance_id": "chronotope__chrono-1621",
       "repo": "chronotope/chrono",
-      "base_commit": "ea9398eb0d8fa55fe0064093af32f45443e5c0e0",
-      "image": "rustbench/chronotope__chrono:pr-1157-rust-1.70.0-ea9398eb0d8f-026dbbe280",
-      "rust_toolchain": "1.70.0",
-      "patch_changed_lines": 21,
-      "size": "medium"
-    },
-    {
-      "instance_id": "chronotope__chrono-1285",
-      "repo": "chronotope/chrono",
-      "base_commit": "21f9ccc5dc74004bf40f0fd79b92dd606a9cb670",
-      "image": "rustbench/chronotope__chrono:pr-1285-rust-1.72.0-21f9ccc5dc74-0cc8875aa9",
-      "rust_toolchain": "1.72.0",
-      "patch_changed_lines": 24,
-      "size": "medium"
-    },
-    {
-      "instance_id": "chronotope__chrono-1294",
-      "repo": "chronotope/chrono",
-      "base_commit": "46ad2c2b2c901eb20e43a7fca025aac02605bda4",
-      "image": "rustbench/chronotope__chrono:pr-1294-rust-1.72.0-46ad2c2b2c90-6391fa2afe",
-      "rust_toolchain": "1.72.0",
-      "patch_changed_lines": 21,
-      "size": "medium"
+      "base_commit": "d8a177e4f5cc7512b8cbe8a5d27e68d6cfcfb8fd",
+      "image": "rustbench/chronotope__chrono:pr-1621-rust-1.81.0-d8a177e4f5cc-69e232a970",
+      "rust_toolchain": "1.81.0",
+      "patch_changed_lines": 2,
+      "size": "small"
     },
     {
       "instance_id": "chronotope__chrono-378",
@@ -248,6 +186,42 @@
       "rust_toolchain": "1.40.0",
       "patch_changed_lines": 138,
       "size": "medium"
+    },
+    {
+      "instance_id": "chronotope__chrono-445",
+      "repo": "chronotope/chrono",
+      "base_commit": "e90050c852a8be1f1541dabb39294816d891239b",
+      "image": "rustbench/chronotope__chrono:pr-445-rust-1.47.0-e90050c852a8-fbbbc73559",
+      "rust_toolchain": "1.47.0",
+      "patch_changed_lines": 5,
+      "size": "small"
+    },
+    {
+      "instance_id": "chronotope__chrono-508",
+      "repo": "chronotope/chrono",
+      "base_commit": "2e0936bc3dfe4799f49fec6c0e237e0adb2aa2c5",
+      "image": "rustbench/chronotope__chrono:pr-508-rust-1.48.0-2e0936bc3dfe-fd6d176453",
+      "rust_toolchain": "1.48.0",
+      "patch_changed_lines": 13,
+      "size": "small"
+    },
+    {
+      "instance_id": "chronotope__chrono-686",
+      "repo": "chronotope/chrono",
+      "base_commit": "752e69ae1ff600304250a5da117a3dd40f99581a",
+      "image": "rustbench/chronotope__chrono:pr-686-rust-1.61.0-752e69ae1ff6-bce357f797",
+      "rust_toolchain": "1.61.0",
+      "patch_changed_lines": 7,
+      "size": "small"
+    },
+    {
+      "instance_id": "chronotope__chrono-999",
+      "repo": "chronotope/chrono",
+      "base_commit": "1f1e2f8ff0e166ffd80ae95218a80b54fe26e003",
+      "image": "rustbench/chronotope__chrono:pr-999-rust-1.70.0-1f1e2f8ff0e1-3cd54ed24a",
+      "rust_toolchain": "1.70.0",
+      "patch_changed_lines": 2,
+      "size": "small"
     },
     {
       "instance_id": "dtolnay__async-trait-100",
@@ -293,15 +267,6 @@
       "rust_toolchain": "1.43.1",
       "patch_changed_lines": 67,
       "size": "medium"
-    },
-    {
-      "instance_id": "killercup__cargo-edit-732",
-      "repo": "killercup/cargo-edit",
-      "base_commit": "07c27ad3314463f97abdfd6690035aadf129d122",
-      "image": "rustbench/killercup__cargo-edit:pr-732-rust-1.62.0-07c27ad33144-4c6820f7d2",
-      "rust_toolchain": "1.62.0",
-      "patch_changed_lines": 231,
-      "size": "large"
     },
     {
       "instance_id": "mozilla__cbindgen-494",
@@ -385,6 +350,15 @@
       "size": "medium"
     },
     {
+      "instance_id": "rust-lang__cc-rs-991",
+      "repo": "rust-lang/cc-rs",
+      "base_commit": "915420c16c134e6bb458ce634c663305a0ef2504",
+      "image": "rustbench/rust-lang__cc-rs:pr-991-rust-1.76.0-915420c16c13-1fe22665ee",
+      "rust_toolchain": "1.76.0",
+      "patch_changed_lines": 5,
+      "size": "small"
+    },
+    {
       "instance_id": "rust-lang__chalk-755",
       "repo": "rust-lang/chalk",
       "base_commit": "f470f2f493203f58d493c7221863bca2ce1a6dad",
@@ -439,6 +413,33 @@
       "size": "small"
     },
     {
+      "instance_id": "tokio-rs__bytes-560",
+      "repo": "tokio-rs/bytes",
+      "base_commit": "38fd42acbaced11ff19f0a4ca2af44a308af5063",
+      "image": "rustbench/tokio-rs__bytes:pr-560-rust-1.62.0-38fd42acbace-bf47018db7",
+      "rust_toolchain": "1.62.0",
+      "patch_changed_lines": 5,
+      "size": "small"
+    },
+    {
+      "instance_id": "tokio-rs__bytes-721",
+      "repo": "tokio-rs/bytes",
+      "base_commit": "9965a04b5684079bb614addd750340ffc165a9f5",
+      "image": "rustbench/tokio-rs__bytes:pr-721-rust-1.79.0-9965a04b5684-6cf7d0b86e",
+      "rust_toolchain": "1.79.0",
+      "patch_changed_lines": 15,
+      "size": "small"
+    },
+    {
+      "instance_id": "tokio-rs__bytes-732",
+      "repo": "tokio-rs/bytes",
+      "base_commit": "291df5acc94b82a48765e67eeb1c1a2074539e68",
+      "image": "rustbench/tokio-rs__bytes:pr-732-rust-1.80.1-291df5acc94b-3807bca067",
+      "rust_toolchain": "1.80.1",
+      "patch_changed_lines": 10,
+      "size": "small"
+    },
+    {
       "instance_id": "tokio-rs__tokio-4519",
       "repo": "tokio-rs/tokio",
       "base_commit": "43c224ff47e41628ca787d116080d69bd7030c3f",
@@ -467,5 +468,5 @@
     }
   ],
   "dataset_sha256": "5f9ec4b6640cec840214bb2ef35d0bfc9b4c87d4c5598bc99557c5eae5d2a65e",
-  "validation_manifest_sha256": "f2840070bfa44d9212dab7ab5e915508fd07f41125cff2a76ec3d8d74d9f0127"
+  "validation_manifest_sha256": "d212fce4b72cd4ce41f9dbcdea33ea32a66a0eb6ea9dca82cc39c0556ac572f0"
 }

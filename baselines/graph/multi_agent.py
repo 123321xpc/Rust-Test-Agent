@@ -1,8 +1,8 @@
 """Adaptive multi-agent orchestration for Rust repository-level issue resolution.
 
 Architecture:
-  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup, AST-aware rust_trace
-  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test + trace
+  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup
+  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test
   Adaptive Gate (AdaCoder-inspired): Fast Path (simple single-file) vs Planned Path (complex/multi-file/trait)
   Agent 2 (Rust Architect / Suggester): Clean-context root-cause arbitration & Rust contract RepairPlan
   Agent 3 (Rust Fixer): Minimal edit_file loop + compiler/test verification + bounded failure escalation
@@ -18,6 +18,7 @@ import re
 import time
 import difflib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.runnables import RunnableLambda
@@ -39,6 +40,11 @@ RepairCandidate = _repair_candidates.RepairCandidate
 _impact_spec = importlib.util.spec_from_file_location("test_rust_impact", Path(__file__).with_name("rust_impact.py"))
 _rust_impact = importlib.util.module_from_spec(_impact_spec)
 _impact_spec.loader.exec_module(_rust_impact)
+_tools_spec = importlib.util.spec_from_file_location("test_tools_helpers", Path(__file__).with_name("tools.py"))
+_tools_helpers = importlib.util.module_from_spec(_tools_spec)
+_tools_spec.loader.exec_module(_tools_helpers)
+_inline_test_line_ranges = _tools_helpers.inline_test_line_ranges
+_touched_line_hits_inline_tests = _tools_helpers.touched_line_hits_inline_tests
 
 
 class _StageBudgetReached(Exception):
@@ -145,9 +151,19 @@ def extract_issue_contract(issue: str) -> dict[str, Any]:
             seen_files.add(fpath)
             referenced_files.append(fpath)
 
+    companion_api_hints: list[str] = []
+    if (
+        "len" in new_api_candidates
+        or (mentions_new_api and any(s.split("::")[-1] == "len" for s in requested_symbols))
+    ):
+        companion_api_hints.append(
+            "When adding `pub fn len(&self)`, check whether `pub fn is_empty(&self) -> bool` is also expected by Rust/Clippy conventions."
+        )
+
     return {
         "requested_symbols": requested_symbols[:20],
         "new_api_candidates": new_api_candidates[:10],
+        "companion_api_hints": companion_api_hints,
         "referenced_files": referenced_files[:10],
         "expected_result_excerpt": expected_result_excerpt,
         "signals": {
@@ -256,17 +272,23 @@ def route_after_navigation(blackboard: dict[str, Any], state: Any) -> tuple[str,
         reasons.append("navigator could not distinguish root-cause chains")
     if len(effective_files) > 2:
         reasons.append(f"repair spans {len(effective_files)} candidate files")
-    for sig_key, sig_label in (
-        ("mentions_new_api", "issue requests a new public API"),
-        ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
-        ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
-        ("mentions_macro", "issue involves macros"),
-    ):
-        if signals.get(sig_key):
-            reasons.append(sig_label)
+    if signals.get("mentions_new_api"):
+        reasons.append("issue requests a new public API")
+
+    # Keep localized single-file bugs on Fast Path; CLI/trait/macro signals and CKG
+    # consumer fan-out escalate to architecture planning only when multiple files or chains are involved.
+    multi_target = len(effective_files) > 1 or len(chains) > 1
+    if multi_target:
+        for sig_key, sig_label in (
+            ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
+            ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
+            ("mentions_macro", "issue involves macros"),
+        ):
+            if signals.get(sig_key):
+                reasons.append(sig_label)
 
     ckg = getattr(state, "ckg", None)
-    if ckg is not None and effective_files and not reasons:
+    if ckg is not None and multi_target and effective_files and not reasons:
         try:
             surface = _rust_impact.build_impact_surface(ckg, sorted(effective_files))
             extra_consumers = [
@@ -473,6 +495,9 @@ def build_handoff_card(
 
     unit_paths = set((active_unit or {}).get("paths") or [])
     raw_invariants = list(plan.get("rust_invariants") or [])
+    for hint in issue_contract.get("companion_api_hints") or []:
+        if hint not in raw_invariants:
+            raw_invariants.append(hint)
     raw_forbidden = list(plan.get("forbidden_edits") or [])
     if unit_paths:
         raw_invariants.sort(key=lambda x: (0 if any(p in str(x) for p in unit_paths) else 1))
@@ -481,6 +506,8 @@ def build_handoff_card(
     forbidden = "; ".join(_compact_handoff_text(x, 160) for x in raw_forbidden[:6]) or "none recorded"
 
     qa = _compact_handoff_text(qa_feedback, 420) or "none"
+    if plan.get("_qa_conflicts"):
+        qa += f"; plan_conflicts_superseded_by_qa={_compact_handoff_text(plan['_qa_conflicts'], 220)}"
     if det_qa:
         qa = _compact_handoff_text(
             f"deterministic_ok={det_qa.get('ok')}; missing={det_qa.get('missing_contract_apis') or []}; "
@@ -510,7 +537,7 @@ def _classify_failure_route(reason: str, stuck_status: dict[str, Any] | None = N
     low = text.lower()
     localization_signals = (
         "wrong file", "wrong module", "wrong symbol", "unrelated file", "out of scope",
-        "localization", "mislocalized", "candidate chain", "no relevant source",
+        "localization", "mislocalized", "relocalize", "re-localize", "candidate chain", "no relevant source",
     )
     trait_signals = (
         "trait", "lifetime", "borrow", "type mismatch", "bound", "associated type",
@@ -553,6 +580,239 @@ def _invalidate_cached_path(blackboard: dict[str, Any], activity: dict[str, Any]
             continue
         for k in [k for k in store if k == rel_path or k.startswith(rel_path + ":")]:
             store.pop(k, None)
+
+
+_MILESTONE_KEYS = (
+    "m1_reproduced",
+    "m2_compiled",
+    "m3_regression_green",
+    "m4_smoke_passed",
+    "m5_qa_approved",
+)
+
+
+def _compute_milestone_state(
+    state: Any,
+    *,
+    det_qa: dict[str, Any] | None = None,
+    ver_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute deterministic MultiAgentBench milestone flags and monotonic progress score."""
+    selected = _extract_selected_source_paths(state) if hasattr(state, "changed_paths") else []
+    stuck = state.stuck_status() if hasattr(state, "stuck_status") else {}
+    check_errs = stuck.get("last_check_errors") or []
+    failed_tests = (stuck.get("last_test_failure") or {}).get("failed_tests") or []
+    repro_clean = bool(state.reproduced_cleanly()) if hasattr(state, "reproduced_cleanly") else False
+    repro_any = bool(state.reproduced()) if hasattr(state, "reproduced") else False
+    m1 = repro_clean or (repro_any and not getattr(state, "require_reproduction", True))
+    if det_qa is not None:
+        m2 = bool(selected) and det_qa.get("post_strip_status") != "failed" and not check_errs
+    else:
+        m2 = bool(selected) and not check_errs
+    m3 = bool(state.verified()) if hasattr(state, "verified") else False
+    smoke_passed = sum(
+        1 for item in ((det_qa or {}).get("existing_test_smoke") or [])
+        if isinstance(item, dict) and item.get("status") == "passed"
+    )
+    m4 = bool(det_qa and det_qa.get("ok") and smoke_passed > 0)
+    m5 = bool(ver_payload and str(ver_payload.get("decision") or "").upper() == "APPROVE")
+    flags = {
+        "m1_reproduced": m1,
+        "m2_compiled": m2,
+        "m3_regression_green": m3,
+        "m4_smoke_passed": m4,
+        "m5_qa_approved": m5,
+    }
+    achieved = sum(1 for k in _MILESTONE_KEYS if flags[k])
+    score = (
+        int(m1),
+        int(m2),
+        int(m3),
+        int(m4),
+        int(m5),
+        smoke_passed,
+        -len(check_errs),
+        -len(failed_tests),
+    )
+    return {
+        "flags": flags,
+        "achieved": achieved,
+        "total": len(_MILESTONE_KEYS),
+        "progress_score": list(score),
+    }
+
+
+def _update_milestones_and_kpi(
+    ctx: SimpleNamespace,
+    role: str,
+    *,
+    det_qa: dict[str, Any] | None = None,
+    ver_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Update milestone states and attribute newly achieved milestones to `role`."""
+    cur = _compute_milestone_state(ctx.state, det_qa=det_qa, ver_payload=ver_payload)
+    prev = ctx.blackboard.get("milestones") or {k: False for k in _MILESTONE_KEYS}
+    credits = ctx.blackboard.setdefault("milestone_credits", {})
+    newly_achieved = [k for k in _MILESTONE_KEYS if cur["flags"][k] and not prev.get(k)]
+    if newly_achieved:
+        credits[role] = int(credits.get(role, 0)) + len(newly_achieved)
+        ctx.blackboard.setdefault("milestone_history", []).append({
+            "role": role,
+            "newly_achieved": newly_achieved,
+            "achieved_total": cur["achieved"],
+        })
+    # Monotonic milestone latching for reproduction/compile/smoke history when progressing
+    merged = {k: bool(prev.get(k) or cur["flags"][k]) if k == "m1_reproduced" else cur["flags"][k] for k in _MILESTONE_KEYS}
+    ctx.blackboard["milestones"] = merged
+    cur["flags"] = merged
+    cur["achieved"] = sum(1 for k in _MILESTONE_KEYS if merged[k])
+    return cur
+
+
+def _should_prune_suggester_replan(ctx: SimpleNamespace) -> tuple[bool, str]:
+    """Prune redundant -> suggester edges when prior replans produced zero milestone progress."""
+    replan_count = int(ctx.blackboard.get("replan_count") or 0)
+    if replan_count < 1:
+        return False, ""
+    if ctx.candidate_policy and ctx.candidate_policy.data.get("pending"):
+        return False, ""
+    lock_rep = ctx.state.locked_regression_report() if hasattr(ctx.state, "locked_regression_report") else {}
+    if lock_rep.get("violations") and lock_rep.get("locked"):
+        return False, ""
+    last_score = ctx.blackboard.get("last_replan_score")
+    if not last_score:
+        return False, ""
+    cur_score = _compute_milestone_state(ctx.state)["progress_score"]
+    if tuple(cur_score) <= tuple(last_score):
+        zero_runs = int(ctx.blackboard.get("zero_progress_replans") or 0) + 1
+        ctx.blackboard["zero_progress_replans"] = zero_runs
+        has_prod_edits = bool(_extract_selected_source_paths(ctx.state)) if hasattr(ctx.state, "changed_paths") else True
+        threshold = 1 if has_prod_edits else 2
+        if zero_runs >= threshold:
+            return True, f"Zero milestone progress after {replan_count} replan(s); pruning redundant architect loop"
+    else:
+        ctx.blackboard["zero_progress_replans"] = 0
+    return False, ""
+
+
+def _append_cognitive_entry(
+    ctx: SimpleNamespace,
+    *,
+    source: str,
+    actual: str,
+    expected: str = "",
+    falsified: str = "",
+) -> None:
+    """Append an Expected vs Actual reflection record for Cognitive Evolving Planning."""
+    ledger = ctx.blackboard.setdefault("cognitive_ledger", [])
+    changed = [p.as_posix() for p in _extract_selected_source_paths(ctx.state)] if hasattr(ctx.state, "changed_paths") else []
+    exp_text = expected or str(ctx.blackboard.get("last_plan_expectation") or "resolve root cause and pass regression/existing tests")
+    entry = {
+        "step": len(ledger) + 1,
+        "source": source,
+        "changed_files": changed[:6],
+        "expected": _compact_handoff_text(exp_text, 160),
+        "actual": _compact_handoff_text(actual, 220),
+        "falsified": _compact_handoff_text(falsified, 160),
+    }
+    ledger.append(entry)
+    if len(ledger) > 6:
+        del ledger[:-6]
+
+
+def _format_cognitive_ledger(blackboard: dict[str, Any], max_entries: int = 5) -> str:
+    ledger = blackboard.get("cognitive_ledger") or []
+    if not ledger:
+        return ""
+    lines = ["Cognitive Evolving Ledger (Expected -> Actual -> Falsified; do NOT repeat falsified attempts):"]
+    for item in ledger[-max_entries:]:
+        files = ",".join(item.get("changed_files") or []) or "none"
+        fal = f" | falsified={item['falsified']}" if item.get("falsified") else ""
+        lines.append(
+            f"- #{item.get('step')} [{item.get('source')}] files=[{files}] "
+            f"expected={item.get('expected')} | actual={item.get('actual')}{fal}"
+        )
+    return "\n".join(lines)
+
+
+def _reconcile_plan_with_qa_rejection(blackboard: dict[str, Any], ver_payload: dict[str, Any] | None) -> None:
+    """Annotate active RepairPlan with QA rejections so handoff card does not conflict with QA feedback."""
+    plan = blackboard.get("repair_plan")
+    if not isinstance(plan, dict) or not ver_payload:
+        return
+    if str(ver_payload.get("plan_consistency") or "").lower() == "conflict":
+        plan["_qa_conflicts"] = list(ver_payload.get("plan_conflicts") or [])[:5]
+    reqs = list(ver_payload.get("missing_requirements") or []) + list(ver_payload.get("objections") or [])
+    if reqs:
+        plan["_qa_required_fixes"] = [str(r)[:180] for r in reqs[:6]]
+
+
+def _refresh_sibling_contracts(ctx: SimpleNamespace) -> str:
+    """Probe sibling trait impls and existing test expectations for requested/localized symbols."""
+    ckg = getattr(ctx.state, "ckg", None)
+    if ckg is None:
+        return ""
+    loc = ctx.blackboard.get("localization") or {}
+    chains = loc.get("candidate_chains") or loc.get("ckg_suggested_chains") or []
+    symbols: list[str] = list(ctx.issue_contract.get("requested_symbols") or []) + list(ctx.issue_contract.get("new_api_candidates") or [])
+    for ch in chains[:3]:
+        for node in (ch.get("nodes") or [])[:4]:
+            sym = node.get("symbol")
+            if sym and sym not in symbols:
+                symbols.append(sym)
+    try:
+        contracts = _rust_impact.collect_sibling_contracts(ckg, symbols[:10])
+        text = _rust_impact.format_sibling_contracts(contracts, max_chars=1200)
+    except Exception:
+        contracts, text = {"sibling_impls": [], "test_contracts": []}, ""
+    ctx.blackboard["sibling_contracts"] = contracts
+    ctx.blackboard["sibling_contracts_text"] = text
+    return text
+
+
+def _emit_coordination_metrics(ctx: SimpleNamespace) -> None:
+    """Emit MultiAgentBench-aligned coordination KPI, duplicate work, and efficiency metrics."""
+    if not ctx.trace:
+        return
+    milestones = _compute_milestone_state(
+        ctx.state,
+        ver_payload=((ctx.blackboard.get("qa_history") or [])[-1] if ctx.blackboard.get("qa_history") else None),
+    )
+    merged = ctx.blackboard.get("milestones") or milestones["flags"]
+    achieved = sum(1 for k in _MILESTONE_KEYS if merged.get(k))
+    total_m = len(_MILESTONE_KEYS)
+    credits = dict(ctx.blackboard.get("milestone_credits") or {})
+    roles = ("navigator", "suggester", "fixer", "verifier")
+    role_kpi = {r: round(int(credits.get(r, 0)) / total_m, 4) for r in roles}
+    overall_kpi = round(sum(role_kpi.values()) / len(roles), 4)
+    coord_stats = ctx.blackboard.get("coord_stats") or {}
+    downstream_reads = int(coord_stats.get("downstream_reads") or 0)
+    duplicate_reads = int(coord_stats.get("duplicate_reads") or 0)
+    dup_rate = round(duplicate_reads / downstream_reads, 4) if downstream_reads > 0 else 0.0
+    total_trans = int(coord_stats.get("total_transitions") or 0)
+    zero_delta_handoffs = int(coord_stats.get("zero_delta_handoffs") or 0)
+    t_metrics = ctx.trace.metrics() if hasattr(ctx.trace, "metrics") else {}
+    api_calls = int(t_metrics.get("api_calls") or _client_calls_made(ctx.client) or 0)
+    total_tokens = int(t_metrics.get("total_tokens") or 0)
+    eff_per_call = round(achieved / max(1, api_calls), 4)
+    eff_per_100k = round((achieved * 100_000) / total_tokens, 4) if total_tokens > 0 else None
+    ctx.trace.record(
+        "coordination_metrics",
+        milestones=merged,
+        milestones_achieved=achieved,
+        milestones_total=total_m,
+        role_kpi=role_kpi,
+        overall_kpi=overall_kpi,
+        downstream_reads=downstream_reads,
+        duplicate_reads=duplicate_reads,
+        duplicate_work_rate=dup_rate,
+        total_transitions=total_trans,
+        zero_delta_handoffs=zero_delta_handoffs,
+        replan_count=int(ctx.blackboard.get("replan_count") or 0),
+        pruned_replans=int(ctx.blackboard.get("pruned_replans") or 0),
+        coordination_efficiency_per_call=eff_per_call,
+        coordination_efficiency_per_100k_tokens=eff_per_100k,
+    )
 
 
 def _prune_unreproduced_regression_targets(state: Any, trace: Any = None) -> list[str]:
@@ -678,42 +938,6 @@ def _detect_added_inline_tests(patch_text: str) -> list[str]:
                 if tag not in findings:
                     findings.append(tag)
     return findings[:6]
-
-
-def _inline_test_line_ranges(orig_code: str) -> list[tuple[int, int]]:
-    """Return 1-based (start, end) line ranges of #[cfg(test)] or mod tests blocks in orig_code."""
-    lines = orig_code.splitlines()
-    ranges: list[tuple[int, int]] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        stripped = lines[i].strip()
-        is_cfg_test = stripped.startswith("#[cfg(test)]")
-        is_mod_tests = bool(re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests?|[a-z0-9_]*_tests)\b", stripped))
-        if is_cfg_test or is_mod_tests:
-            start_ln = i + 1
-            depth = 0
-            opened = False
-            j = i
-            while j < n:
-                ln_txt = lines[j]
-                if "{" in ln_txt:
-                    depth += ln_txt.count("{")
-                    opened = True
-                if "}" in ln_txt:
-                    depth -= ln_txt.count("}")
-                if opened and depth <= 0:
-                    ranges.append((start_ln, j + 1))
-                    i = j
-                    break
-                if not opened and ";" in ln_txt and j > i:
-                    break
-                j += 1
-            else:
-                if opened:
-                    ranges.append((start_ln, n))
-        i += 1
-    return ranges
 
 
 def _detect_modified_inline_tests(patch_text: str, state: Any = None) -> list[str]:
@@ -874,23 +1098,6 @@ def _patch_hunks(patch_text: str):
         hunk = (path, start, count, has_added, has_removed, touched)
     for item in flush():
         yield item
-
-
-def _touched_line_hits_inline_tests(touched: tuple[tuple[str, int], ...], ranges: list[tuple[int, int]]) -> bool:
-    """Return True when a hunk's real edits touch an inline #[cfg(test)]/mod tests region.
-
-    A removed line inside the region counts as a modification. An insertion counts
-    only when the gap sits inside the region body, i.e. after the `#[cfg(test)]`
-    line and before the closing brace.
-    """
-    for kind, number in touched:
-        for start, end in ranges:
-            if kind == "line":
-                if start <= number <= end:
-                    return True
-            elif start <= number <= end - 1:
-                return True
-    return False
 
 
 def _is_documentation_path(path: str) -> bool:
@@ -1119,8 +1326,11 @@ def _smoke_gate_report(state: Any, smoke_results: list[dict[str, Any]] | None = 
         compile_failure = bool(item.get("compile_errors")) or bool(re.search(
             r"error\[E\d+\]|could not compile", str(item.get("details") or ""), re.IGNORECASE
         ))
-        if status == "failed" and classification == "code" and baseline == "passed" and compile_failure:
-            blocking.append("New compilation failure: " + message)
+        if status == "failed" and classification == "code" and (
+            baseline == "passed" or (baseline == "failed" and new_failures)
+        ):
+            prefix = "New compilation failure: " if compile_failure else "New existing-test regression: "
+            blocking.append(prefix + message)
         else:
             warnings.append("Smoke check: " + message)
     return {"blocking": blocking, "warnings": warnings}
@@ -1157,8 +1367,8 @@ def _plan_conflict_explanation_has_issue_basis(explanation: str, issue_contract:
     low = text.lower()
     contract = issue_contract or {}
     symbols = [str(item).lower() for item in (contract.get("requested_symbols") or []) if len(str(item)) >= 3]
-    context_words = ("issue", "contract", "requirement", "expected", "behavior")
-    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime")
+    context_words = ("issue", "contract", "requirement", "expected", "behavior", "requested", "spec", "bug", "fix", "panic")
+    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime", "cargo", "probe", "diff", "check", "assert", "pass", "fail", "symbol", "impl")
     has_context = any(token in low for token in context_words)
     has_evidence_or_symbol = any(token in low for token in evidence_words) or any(token in low for token in symbols)
     return has_context and has_evidence_or_symbol
@@ -1279,7 +1489,6 @@ def _clean_and_audit_fallback_patch(state: Any, issue_contract: dict[str, Any], 
             trace.record("stripped_scratch_from_fallback", scratch=sorted(scratch))
     if (
         not patch_text
-        or hygiene.get("trace_leftovers")
         or hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
     ):
@@ -1366,6 +1575,9 @@ def _is_env_dependency_blocker(text: str) -> bool:
         "modifying cargo.lock is prohibited" in low
         or "failed to select a version" in low
         or "perhaps a crate was updated and forgotten to be re-vendored" in low
+        or "lock file version" in low
+        or "lockfile version" in low
+        or "requires a newer cargo" in low
     )
 
 
@@ -1571,8 +1783,7 @@ def _try_degraded_patch_fallback(
         hygiene = state.diff_hygiene_report(selected)
 
     if (
-        hygiene.get("trace_leftovers")
-        or hygiene.get("added_dbg_lines")
+        hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
         or _detect_benchmark_test_conflicts(patch_text, state, issue_contract)
     ):
@@ -1647,8 +1858,6 @@ def run_deterministic_qa_checks(
         warnings.append(f"Verification incomplete: {state.missing_verification_steps()}")
 
     hygiene = state.diff_hygiene_report(selected)
-    if hygiene.get("trace_leftovers"):
-        warnings.append(f"Temporary trace probes left in files: {hygiene['trace_leftovers']}")
     if hygiene.get("added_dbg_lines"):
         warnings.append(f"Debug macro dbg!(...) left in patch: {hygiene['added_dbg_lines']}")
     if hygiene.get("scratch_files"):
@@ -1862,6 +2071,26 @@ def _make_handoff_tools(
                 ambiguous = [c for c in chains_dict if c["chain_id"] in unresolved_chain_ids]
                 if len({c["chain_id"] for c in ambiguous}) < 2 or not ambiguity_reason.strip():
                     return "Error: unresolved_chain_ids must name two known chains with a concrete ambiguity_reason."
+            if (
+                callable(getattr(state, "get_regression_targets", None))
+                and not _extract_selected_source_paths(state)
+                and not activity.get("_nav_rejected_orig_pass")
+                and activity.get("calls_remaining_in_stage", 2) > 1
+            ):
+                targets = state.get_regression_targets() or {}
+                passed_keys = getattr(state, "_passed_regressions", set()) or set()
+                repro_notes = getattr(state, "_reproduction_notes", {}) or {}
+                if targets and any(
+                    k in passed_keys or repro_notes.get(k) == "passed on unpatched original code"
+                    for k in targets
+                ):
+                    activity["_nav_rejected_orig_pass"] = True
+                    return (
+                        "Error: temporary regression test already PASSED on the unpatched original code, "
+                        "so it does not reproduce the issue. Inspect the actual buggy crate/path, update the "
+                        "regression test with write_regression_test(run_now=True) so it fails on the unpatched "
+                        "checkout (or remove it with revert_file), then call submit_localization_bundle."
+                    )
             if not chains_dict and getattr(state, "ckg", None) is not None:
                 chains_dict = state.ckg.build_fault_chains(
                     blackboard["issue_contract"].get("requested_symbols", []),
@@ -1905,6 +2134,17 @@ def _make_handoff_tools(
             candidate_id: str = "",
         ) -> str:
             """Submit the structured Rust RepairPlan to guide the Fixer."""
+            concrete_edits = [
+                e for e in ordered_edits
+                if (e.action or "modify").strip().lower() in ("modify", "add")
+                and e.file
+                and not _is_non_prod_path(e.file)
+            ]
+            if not concrete_edits:
+                return (
+                    "Error: ordered_edits must include at least one concrete 'modify' or 'add' "
+                    "step targeting a production source file."
+                )
             payload = {
                 "action": "plan",
                 "selected_chain_id": selected_chain_id,
@@ -1989,7 +2229,18 @@ def _make_handoff_tools(
             changed = state.changed_paths()
             selected = _extract_selected_source_paths(state)
             if not changed or not selected:
-                return "Cannot submit for QA: no source code changes detected in src/."
+                attempts = activity.get("no_edit_qa_attempts", 0) + 1
+                activity["no_edit_qa_attempts"] = attempts
+                if allow_escalate and attempts >= 2:
+                    raise _AutoEscalate(
+                        f"Repeated submit_for_qa calls without production source edits ({attempts} attempts)",
+                        {"no_edit_qa_attempts": attempts},
+                    )
+                return (
+                    "Cannot submit for QA: no source code changes detected in src/. "
+                    "Edit the target production file with edit_file before calling submit_for_qa."
+                )
+            activity["no_edit_qa_attempts"] = 0
             holder["done"] = True
             holder["payload"] = {"action": "qa", "summary": summary,
                                  "unreproduced_reason": unreproduced_reason}
@@ -2021,7 +2272,11 @@ def _make_handoff_tools(
             plan_conflicts: list[str] | None = None,
             explanation: str = "",
         ) -> str:
-            """Finalize QA audit with decision='APPROVE' or 'REJECT'."""
+            """Finalize QA audit with decision='APPROVE' or 'REJECT'.
+
+            When plan_consistency='conflict', provide non-empty plan_conflicts AND a concrete
+            `explanation` citing the issue requirement/contract and test/compile/runtime/caller evidence.
+            """
             norm = decision.strip().upper()
             if norm not in ("APPROVE", "REJECT"):
                 return "Error: decision must be 'APPROVE' or 'REJECT'."
@@ -2046,7 +2301,7 @@ def _make_handoff_tools(
             ):
                 return (
                     "Error: explain how the conflict relates to the issue contract and concrete test, caller, "
-                    "API, compile, or runtime evidence."
+                    "API, compile, or runtime evidence in the `explanation` parameter (not only `summary`)."
                 )
             if consistency == "not_applicable" and has_plan:
                 return "Error: an Architect plan exists; audit it or select not_checked."
@@ -2054,6 +2309,35 @@ def _make_handoff_tools(
                 return "Error: no Architect plan exists; select not_applicable or not_checked."
             if norm == "REJECT" and not (objections or missing_requirements):
                 return "Error: provide concrete objections or missing_requirements when rejecting."
+            if norm == "APPROVE" and state is not None:
+                probes = activity.get("probe_results") or []
+                failing_reg_probes = [
+                    p for p in probes
+                    if p.get("status") == "failed" and int(p.get("tests_failed") or 0) > 0
+                    and any("__test_regression_" in str(ft) or "test_regression_" in str(ft) for ft in (p.get("failed_tests") or []))
+                ]
+                if failing_reg_probes:
+                    return (
+                        "Error: cannot APPROVE while a temporary regression test is failing in verifier_probe "
+                        f"({failing_reg_probes[-1].get('failed_tests')}). Call submit_qa_decision('REJECT', ...) "
+                        "so Fixer fixes the bug or Architect releases/corrects the locked test."
+                    )
+                assertion_probes = [p for p in probes if p.get("probe_type") == "assertion"]
+                if assertion_probes and assertion_probes[-1].get("status") == "failed" and int(assertion_probes[-1].get("tests_failed") or 0) > 0:
+                    return (
+                        "Error: cannot APPROVE when your latest assertion probe failed "
+                        f"({assertion_probes[-1].get('failed_tests')}). Call submit_qa_decision('REJECT', ...) "
+                        "with the failing assertion evidence, or rerun a corrected assertion probe if the probe itself was flawed."
+                    )
+                locked_regs = getattr(state, "_locked_regressions", None) or {}
+                reg_targets = set(state.get_regression_targets().keys()) if hasattr(state, "get_regression_targets") else set()
+                passed_regs = getattr(state, "_passed_regressions", set()) or set()
+                unrepro_reason = str(((blackboard.get("_last_det_qa") or {}).get("unreproduced_reason")) or "")
+                if locked_regs and reg_targets and not (reg_targets <= passed_regs) and not _is_env_dependency_blocker(unrepro_reason):
+                    return (
+                        "Error: cannot APPROVE while a locked Red-phase regression test has not passed. "
+                        "Call submit_qa_decision('REJECT', ...) so Fixer resolves the failure or Architect calls release_locked_regression."
+                    )
             holder["done"] = True
             holder["payload"] = {
                 "decision": norm,
@@ -2087,7 +2371,7 @@ _READ_ONLY_BROWSE_TOOLS = frozenset({
 })
 _PROGRESS_ACTION_TOOLS = frozenset({
     "edit_file", "write_file", "write_regression_test", "revert_file",
-    "checkpoint", "cargo_check", "cargo_test", "rust_trace",
+    "checkpoint", "cargo_check", "cargo_test",
 })
 
 
@@ -2107,6 +2391,7 @@ def _wrap_tools_for_role(
 ):
     activity.setdefault("read_excerpts", {})
     activity.setdefault("ckg_notes", {})
+    activity.setdefault("last_passed_reg_count", len(getattr(state, "_passed_regressions", set())))
     selected = []
     for name in allowed_names:
         t_obj = tools_by_name.get(name)
@@ -2134,6 +2419,15 @@ def _wrap_tools_for_role(
                 p = kwargs.get("path") or (args[0] if args else "")
                 if p and p not in activity["files_read"]:
                     activity["files_read"].append(str(p))
+                if p and blackboard is not None and role in ("suggester", "fixer", "verifier"):
+                    s_l = kwargs.get("start_line")
+                    e_l = kwargs.get("end_line")
+                    r_key = f"{p}:{s_l}-{e_l}" if (s_l is not None or e_l is not None) else str(p)
+                    cached_reads = blackboard.get("shared_read_excerpts") or {}
+                    stats = blackboard.setdefault("coord_stats", {})
+                    stats["downstream_reads"] = int(stats.get("downstream_reads", 0)) + 1
+                    if r_key in cached_reads or str(p) in cached_reads:
+                        stats["duplicate_reads"] = int(stats.get("duplicate_reads", 0)) + 1
             elif __tname == "inspect_rust_neighborhood":
                 tgt = kwargs.get("target") or (args[0] if args else "")
                 if tgt and tgt not in activity["symbols_queried"]:
@@ -2172,6 +2466,13 @@ def _wrap_tools_for_role(
                     p = str(kwargs.get("path") or (args[0] if args else ""))
                     if p and blackboard is not None:
                         _invalidate_cached_path(blackboard, activity, p)
+                elif role == "verifier" and __tname == "verifier_probe" and out.lstrip().startswith("{"):
+                    try:
+                        probe_obj = json.loads(out)
+                        if isinstance(probe_obj, dict):
+                            activity.setdefault("probe_results", []).append(probe_obj)
+                    except Exception:
+                        pass
 
             if isinstance(out, str) and __tname in ("cargo_check", "cargo_test", "edit_file", "write_file") and _is_env_dependency_blocker(out):
                 hits = activity.get("env_blocker_hits", 0) + 1
@@ -2209,30 +2510,33 @@ def _wrap_tools_for_role(
                         activity["read_only_streak"] = activity.get("read_only_streak", 0) + 1
                     elif __tname in _PROGRESS_ACTION_TOOLS:
                         activity["read_only_streak"] = 0
-                    if not coordinator:
-                        if __tname in ("edit_file", "write_file") and not out.startswith("Error"):
+                    if __tname in ("edit_file", "write_file") and not out.startswith("Error"):
+                        if _extract_selected_source_paths(state):
+                            activity["reg_write_streak"] = 0
+                        if not coordinator:
                             activity["edits_since_check"] = activity.get("edits_since_check", 0) + 1
                             if activity["edits_since_check"] >= 4:
                                 out += (
                                     "\n[Pacing notice: 4+ source edits made without running cargo_check or cargo_test. "
                                     "Run cargo_check or cargo_test now to catch compiler/test errors early.]"
                                 )
-                        elif __tname in ("cargo_check", "cargo_test"):
+                    elif __tname in ("cargo_check", "cargo_test"):
+                        if not coordinator:
                             activity["edits_since_check"] = 0
-                        if __tname == "write_regression_test":
-                            prev_passed = len(getattr(state, "_passed_regressions", set()))
-                            activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
-                            if prev_passed > activity.get("last_passed_reg_count", 0):
-                                activity["reg_write_streak"] = 0
-                            activity["last_passed_reg_count"] = prev_passed
-                            if activity["reg_write_streak"] >= 4:
-                                out += (
-                                    "\n[Pacing notice: multiple write_regression_test edits without passing; "
-                                    "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
-                                )
-                        elif __tname == "cargo_test" and len(getattr(state, "_passed_regressions", set())) > activity.get("last_passed_reg_count", 0):
+                        if len(getattr(state, "_passed_regressions", set())) > activity.get("last_passed_reg_count", 0):
                             activity["reg_write_streak"] = 0
                             activity["last_passed_reg_count"] = len(getattr(state, "_passed_regressions", set()))
+                    elif __tname == "write_regression_test":
+                        prev_passed = len(getattr(state, "_passed_regressions", set()))
+                        activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
+                        if prev_passed > activity.get("last_passed_reg_count", 0):
+                            activity["reg_write_streak"] = 0
+                        activity["last_passed_reg_count"] = prev_passed
+                        if activity["reg_write_streak"] >= 4:
+                            out += (
+                                "\n[Pacing notice: multiple write_regression_test edits without passing; "
+                                "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
+                            )
                     streak = activity.get("read_only_streak", 0)
                     if streak >= 10 and not auto_escalate_on_stuck:
                         out += (
@@ -2247,11 +2551,12 @@ def _wrap_tools_for_role(
                         f"Fixer read-only exploration stalled ({streak} consecutive browse calls without edits or Cargo checks); clarify localization or concrete next edit",
                         {"read_only_streak": streak},
                     )
-            if auto_escalate_on_stuck and role == "fixer" and not coordinator:
-                if activity.get("reg_write_streak", 0) >= 6:
+                no_src_edits = not _extract_selected_source_paths(state)
+                reg_streak = activity.get("reg_write_streak", 0)
+                if (not coordinator and reg_streak >= 6) or (no_src_edits and reg_streak >= 3):
                     raise _AutoEscalate(
-                        "Repeated temporary regression test rewrites without passing (>=6 attempts)",
-                        {"reg_write_streak": activity.get("reg_write_streak", 0)},
+                        f"Repeated temporary regression test rewrites without progress ({reg_streak} attempts)",
+                        {"reg_write_streak": reg_streak, "has_source_edits": not no_src_edits},
                     )
             if auto_escalate_on_stuck and __tname in ("cargo_check", "cargo_test"):
                 stuck = state.stuck_status()
@@ -2456,6 +2761,8 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
     history = kwargs.pop("history", None)
     slices = idle_slices = 0
     feedback = ""
+    injected_digests: dict[str, str] = {}
+    last_diff_digest = ""
     while True:
         used = max(_client_calls_made(client) - start, slices)
         if total_cap is not None and used >= total_cap:
@@ -2469,15 +2776,30 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
         current_ctx = ""
         if slices:
             paths = (unit["paths"] if unit else [p.as_posix() for p in coordinator.state.changed_paths()])
+            file_blocks: list[str] = []
             for path in paths[:6]:
                 p = coordinator.state.root / path
                 if p.is_file():
-                    current_ctx += f"\n{path}:\n{p.read_text(encoding='utf-8', errors='replace')[:1800]}\n"
+                    raw_txt = p.read_text(encoding="utf-8", errors="replace")
+                    dig = hashlib.sha256(raw_txt.encode("utf-8", errors="replace")).hexdigest()[:16]
+                    if injected_digests.get(path) != dig:
+                        injected_digests[path] = dig
+                        file_blocks.append(f"\n{path}:\n{raw_txt[:1800]}\n")
             diff_scope = set(paths) | (unit.get("touched", set()) if unit else set())
             diff_paths = [p for p in coordinator.state.changed_paths() if p.as_posix() in diff_scope]
             diff = coordinator.state.build_patch(diff_paths) if diff_paths else "(No changes in this unit yet)"
-            current_ctx = ("\nCURRENT source excerpts (supersede earlier pre-loaded excerpts):\n" + current_ctx[:5000]
-                           + "\nCurrent unit diff:\n" + diff[:3500])
+            diff_dig = hashlib.sha256(diff.encode("utf-8", errors="replace")).hexdigest()[:16]
+            diff_block = ""
+            if diff_dig != last_diff_digest:
+                last_diff_digest = diff_dig
+                diff_block = "\nCurrent unit diff:\n" + diff[:3500]
+            if file_blocks or diff_block:
+                current_ctx = (
+                    ("\nCURRENT modified source excerpts (unchanged files omitted):\n" + "".join(file_blocks)[:5000] if file_blocks else "")
+                    + diff_block
+                )
+            else:
+                current_ctx = "\n(Unit files and diff unchanged since previous slice.)"
         policy = getattr(coordinator, "candidate_policy", None)
         base_prompt = (
             f"Continue repair on unit '{unit['unit_id']}'.\n" if unit else "Continue final repair and verification.\n"
@@ -2814,7 +3136,6 @@ def _build_fixer_handoff_features(
             "untouched_referenced_files": list(det_qa.get("untouched_referenced_files") or [])[:8],
             "static_manifest_tests": list(det_qa.get("static_manifest_tests") or [])[:6],
             "untested_integration_targets_count": len(det_qa.get("untested_integration_targets") or []),
-            "trace_leftovers_count": len(hygiene.get("trace_leftovers") or []),
             "added_dbg_lines_count": len(hygiene.get("added_dbg_lines") or []),
             "scratch_files_count": len(hygiene.get("scratch_files") or []),
         }
@@ -3163,6 +3484,8 @@ def _build_verifier_prompt(
     )
     impact_block = _build_impact_prompt_block(state, selected)
     red_lock_block = _build_red_lock_prompt_block(state)
+    sibling_block = (blackboard.get("sibling_contracts_text") or "").strip()
+    sibling_section = f"{sibling_block}\n\n" if sibling_block else ""
     return (
         f"Issue:\n{issue}\n\n"
         f"Issue Contract:\n{json.dumps(issue_contract, ensure_ascii=False, indent=2)}\n\n"
@@ -3189,6 +3512,7 @@ def _build_verifier_prompt(
         f"- Doc-test Check Status: {det_qa.get('doctest_status')}\n\n"
         f"Temporary Regression Test(s):\n{repro_contents}\n\n"
         f"{red_lock_block}"
+        f"{sibling_section}"
         f"{impact_block}"
         f"{qa_hist_block}"
         f"Architect RepairPlan (actual plan used by Fixer):\n{json.dumps(verifier_plan, ensure_ascii=False, indent=2) if verifier_plan else 'No Architect plan: fast path.'}\n\n"
@@ -3254,11 +3578,6 @@ def _should_escalate_qa_to_architect(
         return False, ""
     if det_qa.get("passed_on_original"):
         return True, "QA rejected while temporary regression test still passes on the original code."
-    if det_qa.get("untouched_referenced_files"):
-        return True, (
-            "Repeated QA rejection while issue-referenced source files remain untouched: "
-            + ", ".join(det_qa["untouched_referenced_files"])
-        )
     if len(qa_history) >= 2 and qa_history[-2].get("decision") == "REJECT":
         prev = qa_history[-2]
         prev_reqs = {str(x).strip().lower() for x in (prev.get("missing_requirements") or []) if str(x).strip()}
@@ -3387,7 +3706,7 @@ def run_continuous_repair(
             allowed = [
                 "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
                 "inspect_rust_neighborhood", "edit_file", "write_file", "write_regression_test",
-                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
+                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_error_explain",
             ]
             role_tools = _wrap_tools_for_role(
                 "fixer", tools_by_name, allowed, handoffs, holder, state, client,
@@ -3559,7 +3878,7 @@ from types import SimpleNamespace
 _NAV_ALLOWED = [
     "read_file", "read_lines", "search_code", "cargo_workspace",
     "rust_symbols", "inspect_rust_neighborhood", "write_regression_test",
-    "revert_file", "cargo_test", "cargo_check", "rust_trace", "rust_error_explain",
+    "revert_file", "cargo_test", "cargo_check", "rust_error_explain",
 ]
 _SUG_ALLOWED = [
     "read_file", "read_lines", "search_code",
@@ -3569,7 +3888,7 @@ _FIX_ALLOWED = [
     "read_file", "read_lines", "search_code", "cargo_workspace",
     "rust_symbols", "inspect_rust_neighborhood", "edit_file", "write_file",
     "write_regression_test", "revert_file", "checkpoint",
-    "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
+    "cargo_check", "cargo_test", "rust_error_explain",
 ]
 
 AGENT_GRAPH_EDGES: dict[str, tuple[str, ...]] = {
@@ -3629,10 +3948,22 @@ def _init_orchestration_ctx(
         "localization": None,
         "repair_plan": None,
         "escalations": [],
+        "cognitive_ledger": [],
         "unlocked_regressions": [],
         "qa_history": [],
         "shared_read_excerpts": {},
         "shared_ckg_notes": {},
+        "sibling_contracts": {"sibling_impls": [], "test_contracts": []},
+        "sibling_contracts_text": "",
+        "milestones": {k: False for k in _MILESTONE_KEYS},
+        "milestone_credits": {},
+        "milestone_history": [],
+        "coord_stats": {"downstream_reads": 0, "duplicate_reads": 0, "total_transitions": 0, "zero_delta_handoffs": 0},
+        "replan_count": 0,
+        "zero_progress_replans": 0,
+        "pruned_replans": 0,
+        "last_replan_score": None,
+        "last_plan_expectation": "",
         "environment_blocker": False,
     }
     qa_repair_loop_enabled = os.getenv("RUSTBENCH_QA_REPAIR_LOOP", "1").strip().lower() not in (
@@ -3675,8 +4006,8 @@ def _init_orchestration_ctx(
         role_callback_cls=role_callback_cls,
         blackboard=blackboard,
         qa_repair_loop_enabled=qa_repair_loop_enabled,
-        max_escalations=max(2, (max_api_calls or 70) // 25),
-        max_qa_rounds=max(2, (max_api_calls or 70) // 15),
+        max_escalations=min(3, max(2, (max_api_calls or 70) // 25)),
+        max_qa_rounds=min(4, max(2, (max_api_calls or 70) // 15)),
         escalations_used=0,
         qa_rounds=0,
         qa_escalation_sigs=set(),
@@ -3726,7 +4057,7 @@ def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, 
         f"Pre-extracted Issue Contract (verify exact names/crates):\n"
         f"{json.dumps(ctx.issue_contract, ensure_ascii=False, indent=2)}\n\n"
         "Locate root cause / candidate fault chains, reproduce the issue with write_regression_test(run_now=True), "
-        "run rust_trace once if it fails at runtime, then call submit_localization_bundle."
+        "then call submit_localization_bundle."
     )
     ctx.state._submit_hint_override = "Call submit_localization_bundle(...) now to hand off findings."
     nav_payload, nav_outcome = _run_role_agent(
@@ -3778,6 +4109,8 @@ def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, 
                 pass
     nav_payload["repro_meta"] = repro_meta
     ctx.blackboard["localization"] = nav_payload
+    _refresh_sibling_contracts(ctx)
+    _update_milestones_and_kpi(ctx, "navigator")
 
     ctx.state.save_checkpoint("pre_fix")
     route, route_reasons = route_after_navigation(ctx.blackboard, ctx.state)
@@ -3852,8 +4185,8 @@ def _exec_navigator_relocalize(
         ctx.blackboard["localization"] = new_nav
     reloc_route, reloc_reasons = route_after_navigation(ctx.blackboard, ctx.state)
     to_role = "fixer" if (allow_fast_return and reloc_route == "fast" and ctx.blackboard.get("repair_plan") is None) else "suggester"
-    if to_role == "fixer":
-        ctx.fix_session_history = nav_holder2.get("history")
+    _refresh_sibling_contracts(ctx)
+    _update_milestones_and_kpi(ctx, "navigator")
     if ctx.trace:
         _record_handoff_snapshot(
             ctx.trace,
@@ -3892,11 +4225,20 @@ def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, di
     shared_ctx = _build_shared_context(ctx.state.root, ctx.blackboard, chains_for_ctx, max_chars=10000)
     repro_tests_txt = _collect_regression_test_contents(ctx.state, max_chars=2000)
     red_lock_txt = _build_red_lock_prompt_block(ctx.state)
+    sibling_txt = (ctx.blackboard.get("sibling_contracts_text") or "").strip()
+    sibling_block = f"{sibling_txt}\n\n" if sibling_txt else ""
+    ledger_txt = _format_cognitive_ledger(ctx.blackboard)
     escalation_ctx = ""
-    if ctx.blackboard["escalations"]:
+    if ctx.blackboard["escalations"] or ledger_txt:
+        latest_esc = (
+            "\nLatest Escalation Detail:\n"
+            + json.dumps(ctx.blackboard["escalations"][-1], ensure_ascii=False, indent=2)
+            if ctx.blackboard["escalations"] else ""
+        )
         escalation_ctx = (
             "\n\nPREVIOUS ATTEMPT FAILED & ESCALATED:\n"
-            + json.dumps(ctx.blackboard["escalations"][-1], ensure_ascii=False, indent=2)
+            + (f"{ledger_txt}\n" if ledger_txt else "")
+            + latest_esc
             + "\nDistinguish wrong implementation/test oracle/environment from evidence refuting the mechanism. "
             "If a candidate comparison is pending, compare brief mechanisms first; keep the current mechanism unless contract/execution evidence warrants another. "
             "Otherwise, if failure_route is navigator, call request_relocalization and re-map the fault before planning; if failure_route is architect, revise the trait/type/API plan."
@@ -3909,6 +4251,7 @@ def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, di
         f"LocalizationBundle:\n{sug_loc_json}\n\n"
         f"Current Temporary Regression Test(s):\n{repro_tests_txt}\n\n"
         f"{red_lock_txt}"
+        f"{sibling_block}"
         f"Pre-loaded Source Excerpts & CKG Context:\n{shared_ctx}"
         f"{escalation_ctx}\n\n"
         "Use the pre-loaded excerpts first (at most 1-3 extra read/search calls if needed), verify Rust contracts & Expected Result, and call submit_repair_plan."
@@ -4007,6 +4350,15 @@ def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, di
             "_synthesized": True,
         }
         ctx.fix_session_history = None
+    plan_now = ctx.blackboard.get("repair_plan") or {}
+    if attempt > 1 or ctx.blackboard.get("escalations"):
+        ctx.blackboard["replan_count"] = int(ctx.blackboard.get("replan_count") or 0) + 1
+        ctx.blackboard["last_replan_score"] = _compute_milestone_state(ctx.state)["progress_score"]
+    ctx.blackboard["last_plan_expectation"] = _compact_handoff_text(
+        plan_now.get("arbitration_rationale") or ", ".join(str(e.get("description") or "") for e in (plan_now.get("ordered_edits") or [])[:3]),
+        180,
+    )
+    _update_milestones_and_kpi(ctx, "suggester")
     if ctx.trace:
         plan_now = ctx.blackboard.get("repair_plan") or {}
         _record_handoff_snapshot(
@@ -4115,6 +4467,10 @@ def _exec_fixer_step(ctx: SimpleNamespace, *, attempt: int) -> dict[str, Any]:
         else ""
     )
     qa_block = f"PREVIOUS QA OBJECTIONS (MUST FIX):\n{ctx.last_qa_feedback}\n\n" if ctx.last_qa_feedback else ""
+    sibling_fix = (ctx.blackboard.get("sibling_contracts_text") or "").strip()[:1000]
+    sibling_fix_block = f"{sibling_fix}\n\n" if sibling_fix else ""
+    ledger_fix = _format_cognitive_ledger(ctx.blackboard, max_entries=3) if (ctx.blackboard.get("escalations") or ctx.last_qa_feedback) else ""
+    ledger_fix_block = f"{ledger_fix[:700]}\n\n" if ledger_fix else ""
     unlocked = ctx.blackboard.get("unlocked_regressions") or []
     unlock_block = ""
     if unlocked:
@@ -4149,9 +4505,11 @@ def _exec_fixer_step(ctx: SimpleNamespace, *, attempt: int) -> dict[str, Any]:
         f"Temporary Regression Test(s):\n{repro_fix_txt}\n\n"
         f"Targeted Source Excerpts:\n{shared_fix_ctx}\n\n"
         f"{impact_fix_txt}"
+        f"{sibling_fix_block}"
         f"{cur_diff_txt}"
         f"{downstream_note}"
         f"{unlock_block}"
+        f"{ledger_fix_block}"
         f"{qa_block}"
         f"{failure_evidence}"
         "Implement the fix with minimal edits, pass all temporary regression tests + relevant existing tests, "
@@ -4218,6 +4576,12 @@ def _record_escalation(
         "stuck_status": ctx.state.stuck_status(),
         "existing_test_failures": list(getattr(ctx.state, "_existing_test_failures", [])),
     })
+    _append_cognitive_entry(
+        ctx,
+        source=from_role,
+        actual=reason,
+        falsified=str((ctx.blackboard.get("repair_plan") or {}).get("selected_chain_id") or ""),
+    )
     if ctx.trace:
         ctx.trace.record(
             "escalation",
@@ -4273,6 +4637,7 @@ def _exec_det_qa_step(
         and hasattr(ctx.state, "_capture_snapshot")
     ):
         ctx.state._best_verified_snapshot = ctx.state._capture_snapshot()
+    _update_milestones_and_kpi(ctx, "fixer", det_qa=det_qa)
 
     if ctx.trace:
         _record_handoff_snapshot(
@@ -4338,6 +4703,7 @@ def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[s
     selected = det_qa["selected"]
     hygiene = det_qa["hygiene"]
     ver_activity: dict[str, Any] = {"files_read": [], "symbols_queried": []}
+    ctx.blackboard["_last_det_qa"] = det_qa
     ver_handoff, ver_holder = _make_handoff_tools("verifier", ctx.state, ctx.blackboard, ver_activity)
     ver_tools = _wrap_tools_for_role(
         "verifier", ctx.tools_by_name, list(_VERIFIER_TOOLS),
@@ -4354,9 +4720,9 @@ def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[s
         chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
         stage_cap=ctx.budgets["verifier_cap"], reserve_floor=0,
         attempt=ctx.qa_rounds + 1, max_continuations=1,
-        continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); include an issue/evidence explanation when reporting plan_consistency='conflict'.",
+        continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); when reporting plan_consistency='conflict', populate the `explanation` parameter with issue contract and test/compile/runtime/caller evidence.",
         handoff_only_tools=ver_handoff,
-        wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; include an issue/evidence explanation for any plan conflict.",
+        wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; if plan_consistency='conflict', set `explanation` to cite the issue contract and concrete test/compile/caller evidence.",
     )
     if not ver_payload:
         ver_payload = {
@@ -4442,6 +4808,8 @@ def run_graph_agent(
         prompts_mod=prompts_mod, role_callback_cls=role_callback_cls, topology="graph",
     )
 
+    last_progress_sig: list[Any] = [None]
+
     def _transition(
         state_in: RepairGraphState,
         from_role: str,
@@ -4452,6 +4820,16 @@ def run_graph_agent(
         update: dict[str, Any] | None = None,
     ) -> Command[Any]:
         step_num = len(state_in.get("transition_history") or []) + 1
+        cstats = ctx.blackboard.setdefault("coord_stats", {})
+        cstats["total_transitions"] = int(cstats.get("total_transitions", 0)) + 1
+        if from_role in ("fixer", "verifier") and to_role not in (END, "fallback"):
+            try:
+                sig_now = _repair_progress_signature(ctx.state)
+                if last_progress_sig[0] is not None and sig_now == last_progress_sig[0]:
+                    cstats["zero_delta_handoffs"] = int(cstats.get("zero_delta_handoffs", 0)) + 1
+                last_progress_sig[0] = sig_now
+            except Exception:
+                pass
         if ctx.trace:
             ctx.trace.record(
                 "graph_transition",
@@ -4552,6 +4930,23 @@ def run_graph_agent(
                     state_in, "fixer", "navigator", "relocalize_direct", reason,
                     update={"relocalize_reason": reason, "last_qa_feedback": ""},
                 )
+            if not fix_payload.get("candidate_comparison"):
+                prune, prune_reason = _should_prune_suggester_replan(ctx)
+                if prune:
+                    ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                    if ctx.trace:
+                        ctx.trace.record("graph_edge_pruned", from_role="fixer", to_role="suggester", reason=prune_reason)
+                    dest = "deterministic_qa" if _extract_selected_source_paths(ctx.state) else "fallback"
+                    return _transition(
+                        state_in, "fixer", dest, "prune_no_progress", prune_reason,
+                        update={
+                            "fix_payload": fix_payload,
+                            "fix_outcome": fix_outcome,
+                            "in_rescue_pass": fix_res["in_rescue_pass"],
+                            "fix_prompt_breakdown": fix_res["fix_prompt_breakdown"],
+                            "error_message": prune_reason,
+                        },
+                    )
             ctx.route = "planned"
             return _transition(
                 state_in, "fixer", "suggester", "replan", reason,
@@ -4688,6 +5083,15 @@ def run_graph_agent(
                         state_in, "deterministic_qa", "navigator", "escalate_relocalize", det_qa["reason"],
                         update={"relocalize_reason": reason, "last_qa_feedback": ""},
                     )
+                prune, prune_reason = _should_prune_suggester_replan(ctx)
+                if prune:
+                    ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                    if ctx.trace:
+                        ctx.trace.record("graph_edge_pruned", from_role="deterministic_qa", to_role="suggester", reason=prune_reason)
+                    return _transition(
+                        state_in, "deterministic_qa", "fallback", "prune_no_progress", prune_reason,
+                        update={"error_message": f"{prune_reason}: {det_qa['reason']}"},
+                    )
                 ctx.route = "planned"
                 return _transition(
                     state_in, "deterministic_qa", "suggester", "escalate_replan", det_qa["reason"],
@@ -4764,6 +5168,7 @@ def run_graph_agent(
         selected = det_qa["selected"]
         hygiene = det_qa["hygiene"]
         decision, ver_payload, _ver_outcome = _exec_verifier_step(ctx, det_qa)
+        _update_milestones_and_kpi(ctx, "verifier", det_qa=det_qa, ver_payload=ver_payload)
 
         if decision == "APPROVE":
             ctx.blackboard["_qa_repair_pending"] = False
@@ -4776,6 +5181,15 @@ def run_graph_agent(
 
         ctx.blackboard["_qa_repair_pending"] = True
         ctx.blackboard["_last_qa_payload"] = dict(ver_payload)
+        _reconcile_plan_with_qa_rejection(ctx.blackboard, ver_payload)
+        _append_cognitive_entry(
+            ctx,
+            source="verifier",
+            actual="; ".join(
+                [str(x) for x in (ver_payload.get("missing_requirements") or [])]
+                + [str(x) for x in (ver_payload.get("objections") or [])]
+            ) or str(ver_payload.get("summary") or "REJECT"),
+        )
         repair_feedback = _format_qa_repair_feedback(ver_payload, round_number=ctx.qa_rounds + 1)
         rem_after_qa = _client_remaining_calls(ctx.client)
         if not ctx.qa_repair_loop_enabled:
@@ -4855,6 +5269,23 @@ def run_graph_agent(
                     state_in, "verifier", "navigator", "qa_escalate_navigator", esc_reason,
                     update={"relocalize_reason": esc_reason, "last_qa_feedback": repair_feedback},
                 )
+            prune, prune_reason = _should_prune_suggester_replan(ctx)
+            if prune:
+                ctx.blackboard["pruned_replans"] = int(ctx.blackboard.get("pruned_replans") or 0) + 1
+                if ctx.trace:
+                    ctx.trace.record("graph_edge_pruned", from_role="verifier", to_role="suggester", reason=prune_reason)
+                best_raw = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+                best_clean = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, best_raw, trace=ctx.trace) if best_raw else ""
+                ctx.state.patch = best_clean or hygiene["patch"] or ctx.state.build_patch(selected)
+                _record_consistency_blocked(
+                    ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
+                    reason=f"{prune_reason}: {esc_reason}",
+                    attempt=ctx.qa_rounds + 1,
+                )
+                return _transition(
+                    state_in, "verifier", END, "qa_pruned_no_progress", prune_reason,
+                    update={"final_patch": ctx.state.patch},
+                )
             ctx.route = "planned"
             return _transition(
                 state_in, "verifier", "suggester", "qa_escalate_architect", esc_reason,
@@ -4870,7 +5301,11 @@ def run_graph_agent(
                 plan_conflicts=list(ver_payload.get("plan_conflicts") or []),
                 feedback=_feature_meta(repair_feedback),
             )
-        ctx.fix_session_history = None
+        if ctx.fix_session_history and callable(ctx.compress_fn):
+            try:
+                ctx.fix_session_history = ctx.compress_fn(ctx.fix_session_history)
+            except Exception:
+                pass
         return _transition(
             state_in, "verifier", "fixer", "qa_reject_fix", ver_payload.get("summary", ""),
             update={"last_qa_feedback": repair_feedback},
@@ -4923,6 +5358,8 @@ def run_graph_agent(
                 trace.record("auto_submit_after_error", error=str(exc), error_type=type(exc).__name__)
             return fallback
         raise
+    finally:
+        _emit_coordination_metrics(ctx)
 
 
 def run_multi_agent(

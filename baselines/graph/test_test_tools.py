@@ -29,7 +29,7 @@ def test_edits_produce_applicable_complete_patch_without_mutating_checkout(norma
     assert set(tools) == {"read_file", "write_file", "write_regression_test", "edit_file", "revert_file",
                           "checkpoint", "generate_patch", "read_lines", "search_code", "cargo_workspace",
                           "cargo_check", "cargo_test", "rust_symbols", "inspect_rust_neighborhood", "rust_error_explain",
-                          "rust_trace", "verifier_probe"}
+                          "verifier_probe"}
     write = tools["write_file"]
     write.invoke({"path": "edit.rs", "content": "intermediate\n"})
     write.invoke({"path": "edit.rs", "content": "after\n"})
@@ -1185,11 +1185,12 @@ def test_read_file_truncates_large_files(normal):
     (state.root / "src").mkdir(parents=True, exist_ok=True)
     (state.root / "src" / "large.rs").write_text(large_content, encoding="utf-8")
     out = tools["read_file"].invoke({"path": "src/large.rs"})
+    assert "[File: src/large.rs (300 lines total)]" in out
     assert "File has 300 lines" in out
-    assert "pub fn line_1()" in out
-    assert "pub fn line_120()" in out
+    assert "1: pub fn line_1()" in out
+    assert "120: pub fn line_120()" in out
     assert "pub fn line_200()" not in out
-    assert "pub fn line_300()" in out
+    assert "300: pub fn line_300()" in out
     assert "read_lines" in out
 
 
@@ -1803,3 +1804,155 @@ def test_smoke_ignores_snapshot_template_text_and_keeps_snapshot_diff(tmp_path, 
         )
     finally:
         state.close()
+
+
+def test_compile_reproduction_does_not_hard_lock_and_bin_only_rejects_crate_import(normal):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text(
+        '[package]\nname = "bin-only-app"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (state.root / "src").mkdir(exist_ok=True)
+    (state.root / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+
+    bad_bin = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_bin.rs",
+        "content": "use bin_only_app::opts;\n#[test] fn t() {}\n",
+    })
+    assert "Error" in bad_bin and "binary target" in bad_bin
+
+    (state.root / "src" / "lib.rs").write_text("pub fn exists() {}\n", encoding="utf-8")
+    write_res = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_api.rs",
+        "content": "use demo::missing_fn;\n#[test] fn t() { missing_fn(); }\n",
+    })
+    assert write_res.startswith("Updated")
+    state.fail_test(
+        state.start_test(),
+        manifest_path="Cargo.toml",
+        test_target="test_regression_api",
+        executed=0,
+        returncode=101,
+        compile_errors=[{"code": "E0432"}],
+    )
+    assert state.reproduced()
+    assert not state._locked_regressions
+    rewrite = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_api.rs",
+        "content": "#[test] fn t() { demo::exists(); }\n",
+    })
+    assert rewrite.startswith("Updated")
+
+
+def test_edit_file_warns_inline_test_isolation_top_level_use_and_doctest_placement(tmp_path):
+    repo = tmp_path / "hint_repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "Cargo.toml").write_text('[package]\nname = "hint_repo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(
+        "use rhai::{Dynamic, Module};\n\n"
+        "/// Example:\n"
+        "/// ```\n"
+        "/// assert_eq!(1, 1);\n"
+        "/// ```\n"
+        "pub fn entry(val: Dynamic) -> Dynamic { val }\n\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    use super::*;\n"
+        "    #[test]\n"
+        "    fn t() { let _ = entry(Dynamic::UNIT); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("tools_hint_test", Path(__file__).with_name("tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools_list, state = module.make_tools(repo, post_strip_check=False)
+    tools = {item.name: item for item in tools_list}
+    try:
+        out1 = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "/// Example:",
+            "new_text": "fn helper(_a: rhai::Array) {}\n\n/// Example:",
+        })
+        assert "Doctest Line-Shift Notice" in out1 and "below existing doctests" in out1
+        assert "Rust Test-Scope Hint" in out1 and "Array" in out1
+        assert "Inline-Test Isolation Warning" not in out1
+
+        out2 = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "    fn t() { let _ = entry(Dynamic::UNIT); }",
+            "new_text": "    fn t() { let _ = entry(Dynamic::UNIT); /* touched */ }",
+        })
+        assert "Inline-Test Isolation Warning" in out2
+    finally:
+        state.close()
+
+
+def test_guardrail_atomicity_unclosed_literals_and_recovery_context(normal):
+    _, tools, state = normal
+    tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn ok() -> i32 { 1 }\n"})
+    tools["write_regression_test"].invoke({"path": "tests/test_regression_valid.rs", "content": "#[test] fn t() {}\n"})
+    state.pass_test(state.start_test(), test_target="test_regression_valid")
+    assert state.verified()
+
+    # Syntax rejection in write_regression_test must NOT pollute regression_tests or invalidate prior verification
+    bad_reg = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_broken.rs",
+        "content": '#[test] fn broken() { let s = "unclosed;\n}\n',
+    })
+    assert "Syntax guardrail error" in bad_reg
+    assert "unclosed string literal" in bad_reg
+    assert all("broken" not in p.as_posix() for p in state.regression_tests)
+    assert state.verified()
+
+    # edit_file rejection shows Proposed + Original code context and tracks consecutive edit failures
+    bad_edit = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "pub fn ok() -> i32 { 1 }",
+        "new_text": "pub fn ok() -> i32 { /* unclosed comment\n",
+    })
+    assert "Syntax guardrail error" in bad_edit
+    assert "Proposed code around line" in bad_edit
+    assert "Original code around line" in bad_edit
+    assert "Recovery notice" not in bad_edit
+
+    bad_edit_2 = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "missing_symbol",
+        "new_text": "x",
+    })
+    assert "Recovery notice: 2 consecutive edit failures" in bad_edit_2
+
+
+def test_e0753_guardrail_respects_module_scopes_and_block_comments_and_duplicate_edit_reports_lines(normal):
+    _, tools, _ = normal
+    # Valid inner doc inside nested `pub mod error` and `#![deny(missing_docs)]` after block comment without `*`
+    valid_nested = (
+        "/*\nLicense header without leading stars\n*/\n"
+        "#![deny(missing_docs)]\n"
+        "pub struct Receiver;\n"
+        "pub mod error {\n"
+        "    //! Broadcast error types\n"
+        "    pub struct RecvError;\n"
+        "}\n"
+    )
+    ok_res = tools["write_file"].invoke({"path": "src/nested_mod.rs", "content": valid_nested})
+    assert "Updated src/nested_mod.rs" in ok_res
+
+    # In-module regression test mounting must also succeed on files with nested `//!` or header `#![...]`
+    reg_res = tools["write_regression_test"].invoke({
+        "path": "test_nested",
+        "target_src": "src/nested_mod.rs",
+        "content": "#[test] fn ok() {}",
+    })
+    assert "Mounted temporary in-module regression test" in reg_res
+
+    # Invalid top-level `//!` after code declaration still rejects as E0753
+    bad_nested = "pub struct S;\npub mod m {\n    //! ok\n}\n//! bad top-level doc\n"
+    bad_res = tools["write_file"].invoke({"path": "src/bad_e0753.rs", "content": bad_nested})
+    assert "E0753" in bad_res
+
+    # Duplicate matches report line numbers
+    tools["write_file"].invoke({"path": "src/dup.rs", "content": "fn a() {\n    let x = 1;\n}\nfn b() {\n    let x = 1;\n}\n"})
+    dup_err = tools["edit_file"].invoke({"path": "src/dup.rs", "old_text": "let x = 1;", "new_text": "let x = 2;"})
+    assert "more than once" in dup_err and "2" in dup_err and "5" in dup_err

@@ -206,34 +206,6 @@ def test_scope_growth_requires_two_expansions_not_just_a_large_plan(policy):
     assert p.data["pending"]["kind"] == "scope_growth"
 
 
-def test_handoff_compares_briefs_then_accepts_only_selected_detailed_plan(policy):
-    p, state = policy
-    ma = load("multi_agent")
-    tools, holder = ma._make_handoff_tools("suggester", state, p.board, {"candidate_policy": p})
-    tools = {t.name: t for t in tools}
-    payload = {"selected_chain_id": "C2", "arbitration_rationale": "Repair propagation", "ordered_edits": [{"file": "src/b.rs", "description": "Repair Context propagation"}]}
-    tools["request_candidate_comparison"].invoke({"trigger": "ambiguous_chains", "reason": "Two causal mechanisms fit observations", "chain_ids": ["C1", "C2"]})
-    assert "comparison is required" in tools["submit_repair_plan"].invoke(payload)
-    assert not holder["done"]
-    result = json.loads(tools["compare_repair_candidates"].invoke({"candidates_brief": cards()}))
-    assert result["selected_candidate"] == "B" and not holder["done"]
-    assert "Only selected candidate B" in tools["submit_repair_plan"].invoke(payload)
-    tools["submit_repair_plan"].invoke(dict(payload, candidate_id="B"))
-    assert holder["done"] and holder["payload"]["candidate_id"] == "B"
-
-
-def test_planner_cap_cannot_synthesize_an_unimplemented_or_refuted_second_plan(policy):
-    p, _ = policy
-    original = {"selected_chain_id": "C1", "ordered_edits": [{"file": "src/a.rs"}]}
-    ambiguous(p)
-    assert p.compare(cards())["selected_candidate"] == "B"
-    assert p.fallback_plan(original) is original and p.data["selected_candidate"] == "A"
-    ambiguous(p)
-    p.compare(cards(a_contract="conflict"))
-    with pytest.raises(ValueError, match="admissible"):
-        p.fallback_plan(original)
-
-
 @pytest.fixture
 def scheduled(tmp_path):
     ma, fixture = load("multi_agent"), load("test_repair_units")
@@ -298,29 +270,6 @@ def test_repeated_scope_requests_extend_current_unit(scheduled):
     assert coord.before_tool("edit_file", {"path": "src/more.rs"}) is None
     assert {"src/extra.rs", "src/more.rs"} <= set(coord._unit(coord.active)["paths"])
     assert not (state.root / "src/extra.rs").exists() and not (state.root / "src/more.rs").exists()
-
-
-def test_coordinator_runtime_failures_compare_before_generic_rollback(scheduled, monkeypatch):
-    ma, _, state, tools, p, coord = scheduled
-    coord.configure({"ordered_edits": [{"file": "src/a.rs", "description": "Fix state"}],
-                     "repair_units": [{"unit_id": "state", "edit_indices": [0],
-                                       "verification": [{"tool": "cargo_test", "arguments": {}}]}]}, [])
-    edits = []
-
-    def role(*args, **kwargs):
-        before = len(edits)
-        tools["edit_file"].invoke({"path": "src/a.rs", "old_text": f"{{ {before} }}", "new_text": f"{{ {before + 1} }}"})
-        edits.append(before + 1)
-        return {"action": "unit_complete"}, "completed"
-
-    tools["cargo_test"] = SimpleNamespace(invoke=lambda _: '{"exit_code":101,"status":"failed","tests_executed":1}')
-    monkeypatch.setattr(ma, "_run_role_agent", role)
-    monkeypatch.setattr(state, "stuck_status", lambda: {"compile_repeats": 0, "test_repeats": 2})
-    payload, outcome = ma._run_scheduled_fixer("system", "issue", [], {}, coordinator=coord,
-        allow_escalate=True, client=SimpleNamespace(calls_made=0), stage_cap=40)
-    assert payload["candidate_comparison"] and outcome == "candidate_comparison"
-    assert "{ 2 }" in (state.root / "src/a.rs").read_text()
-    assert coord._unit("state")["evidence"][0]["candidate_evidence_id"] == "E2"
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo unavailable")

@@ -190,23 +190,3 @@ def test_api_limit_stops_additional_http_attempts(tmp_path):
     assert len(calls) == 2
     assert [e['event'] for e in entries(path)].count('api_request') == 2
     assert entries(path)[-1]['event'] == 'api_limit'
-
-
-def test_metrics_count_retries_and_provider_usage(tmp_path):
-    recorder = TraceRecorder(tmp_path / 'metrics.jsonl')
-    client = TraceHTTPClient(recorder)
-    responses = iter([
-        httpx.Response(500, json={'error': 'retry'}),
-        httpx.Response(200, json={'usage': {'prompt_tokens': 12, 'completion_tokens': 5, 'total_tokens': 17}}),
-        httpx.Response(200, json={'choices': []}),
-        httpx.Response(200, json={'usage': {'prompt_tokens': 2, 'completion_tokens': 3, 'total_tokens': None}}),
-    ])
-    client._transport = httpx.MockTransport(lambda request: next(responses))
-    client._mounts = {}
-    try:
-        for _ in range(4):
-            client.post('https://example.test/v1/chat/completions', json={})
-    finally:
-        client.close()
-    assert recorder.metrics() == {'api_calls': 4, 'input_tokens': 14, 'output_tokens': 8,
-                                  'total_tokens': 22, 'responses_without_usage': 1}

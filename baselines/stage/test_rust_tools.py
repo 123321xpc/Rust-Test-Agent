@@ -28,7 +28,12 @@ def rust_tools(tmp_path):
 
 def test_read_and_search(rust_tools):
     root, tools = rust_tools
-    assert tools["read_lines"].invoke({"path": "src/lib.rs", "start_line": 2, "end_line": 3}) == "2: // needle\n3: pub fn second() {}"
+    assert tools["read_lines"].invoke({"path": "src/lib.rs", "start_line": 2, "end_line": 3}) == (
+        "[File: src/lib.rs (3 lines total)]\n"
+        "(1 lines above)\n"
+        "2: // needle\n"
+        "3: pub fn second() {}"
+    )
     assert "Error" in tools["read_lines"].invoke({"path": "../outside"})
     assert "Error" in tools["read_lines"].invoke({"path": "src/lib.rs", "start_line": 0})
     assert tools["search_code"].invoke({"query": "needle"}) == "src/lib.rs:2: // needle"
@@ -109,3 +114,29 @@ def test_search_code_summarize_and_file_listing(rust_tools):
     # empty query file_glob listing
     files_list = tools["search_code"].invoke({"query": "", "file_glob": "other.rs"})
     assert "src/other.rs" in files_list
+
+    # empty query with default *.rs glob lists Rust files
+    default_rs_list = tools["search_code"].invoke({"query": ""})
+    assert "src/lib.rs" in default_rs_list
+    assert "src/other.rs" in default_rs_list
+
+
+def test_read_lines_defaults_to_100_lines_and_lists_dirs(rust_tools):
+    root, tools = rust_tools
+    (root / "src" / "medium.rs").write_text("\n".join(f"line {i}" for i in range(1, 151)) + "\n", encoding="utf-8")
+    out = tools["read_lines"].invoke({"path": "src/medium.rs"})
+    assert "[File: src/medium.rs (150 lines total)]" in out
+    assert "100: line 100" in out
+    assert "101: line 101" not in out
+    assert "(50 lines below)" in out
+    dir_out = tools["read_lines"].invoke({"path": "src"})
+    assert "lib.rs" in dir_out
+
+
+def test_search_code_overflow_returns_refinement_summary_without_raw_lines(rust_tools):
+    root, tools = rust_tools
+    (root / "src" / "many.rs").write_text("\n".join(f"let hit_{i} = needle_val;" for i in range(60)) + "\n", encoding="utf-8")
+    out = tools["search_code"].invoke({"query": "needle_val"})
+    assert "Search returned too many results" in out
+    assert "src/many.rs: 60 match(es)" in out
+    assert "let hit_0 = needle_val;" not in out

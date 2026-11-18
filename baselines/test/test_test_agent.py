@@ -164,6 +164,39 @@ def test_invalid_api_limit(agent_module, monkeypatch, tmp_path, value):
         agent_module.main()
 
 
+def test_cli_api_limit_and_default_yj_interface(agent_module, monkeypatch, tmp_path):
+    issue = tmp_path / "issue.txt"
+    issue.write_text("issue", encoding="utf-8")
+    for k in ("API_KEY", "MODEL", "BASE_URL", "API_LIMIT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("API_LIMIT", "10")
+    monkeypatch.setenv("YJ_BASE_URL", "https://yj.example/v1")
+    monkeypatch.setenv("YJ_API_KEY", "yj-key")
+    monkeypatch.setenv("YJ_MODEL", "yj-model")
+    monkeypatch.setenv("DS_BASE_URL", "https://ds.example/v1")
+    monkeypatch.setenv("DS_API_KEY", "ds-key")
+    monkeypatch.setenv("DS_MODEL", "ds-model")
+    monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
+    monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
+    run = Mock(return_value="diff --git a/a b/a\n")
+    monkeypatch.setattr(agent_module, "run_agent", run)
+
+    argv = ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", str(issue),
+            "--output", str(tmp_path / "out.jsonl"), "--rust-toolchain", "1.72.0", "--api-limit", "25"]
+    monkeypatch.setattr(sys, "argv", argv)
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "yj-model", "yj-key", "https://yj.example/v1")
+    assert run.call_args.kwargs["max_api_calls"] == 25
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds"])
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "ds-model", "ds-key", "https://ds.example/v1")
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds", "--api-limit", "0"])
+    with pytest.raises(SystemExit):
+        agent_module.main()
+
+
 def test_compress_history_messages_trims_old_tool_outputs(agent_module):
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -359,3 +392,22 @@ def test_cli_rejects_removed_single_agent_flag(agent_module, monkeypatch, tmp_pa
     ])
     with pytest.raises(SystemExit):
         agent_module.main()
+
+
+def test_compress_history_invalidates_on_revert_and_folds_old_errors_to_one_line(agent_module):
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    msgs = [
+        HumanMessage(content="start"),
+        AIMessage(content="", tool_calls=[{"id": "c0", "name": "read_lines", "args": {"path": "./src/lib.rs"}}]),
+        ToolMessage(content="1: fn a() {}\n" * 30, tool_call_id="c0"),
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "edit_file", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="Error editing src/lib.rs: old_text was not found.\n[Region hint: lines 1-5:\n1: a\n2: b\n3: c\n4: d\n5: e\n6: f\n7: g]", tool_call_id="c1"),
+        AIMessage(content="", tool_calls=[{"id": "c2", "name": "revert_file", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="Reverted src/lib.rs to its original state.", tool_call_id="c2"),
+        AIMessage(content="", tool_calls=[{"id": "c3", "name": "read_lines", "args": {"path": "src/other.rs"}}]),
+        ToolMessage(content="1: ok\n", tool_call_id="c3"),
+    ]
+    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=2, test_cutoff_steps=1)
+    assert "subsequent step" in compressed[2].content
+    assert "\n" not in compressed[4].content
+    assert "earlier edit_file error omitted" in compressed[4].content

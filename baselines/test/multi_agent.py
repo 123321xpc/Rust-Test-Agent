@@ -1,8 +1,8 @@
 """Adaptive multi-agent orchestration for Rust repository-level issue resolution.
 
 Architecture:
-  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup, AST-aware rust_trace
-  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test + trace
+  Layer 0 (Deterministic): Rust CKG, rustc diagnostics + auto-lookup
+  Agent 1 (Navigator & Reproducer): Issue contract extraction, 1-3 fault chains, Red test
   Adaptive Gate (AdaCoder-inspired): Fast Path (simple single-file) vs Planned Path (complex/multi-file/trait)
   Agent 2 (Rust Architect / Suggester): Clean-context root-cause arbitration & Rust contract RepairPlan
   Agent 3 (Rust Fixer): Minimal edit_file loop + compiler/test verification + bounded failure escalation
@@ -15,6 +15,7 @@ import operator
 import os
 import json
 import re
+import shutil
 import time
 import difflib
 from pathlib import Path
@@ -40,6 +41,11 @@ RepairCandidate = _repair_candidates.RepairCandidate
 _impact_spec = importlib.util.spec_from_file_location("test_rust_impact", Path(__file__).with_name("rust_impact.py"))
 _rust_impact = importlib.util.module_from_spec(_impact_spec)
 _impact_spec.loader.exec_module(_rust_impact)
+_tools_spec = importlib.util.spec_from_file_location("test_tools_helpers", Path(__file__).with_name("tools.py"))
+_tools_helpers = importlib.util.module_from_spec(_tools_spec)
+_tools_spec.loader.exec_module(_tools_helpers)
+_inline_test_line_ranges = _tools_helpers.inline_test_line_ranges
+_touched_line_hits_inline_tests = _tools_helpers.touched_line_hits_inline_tests
 
 
 class _StageBudgetReached(Exception):
@@ -72,6 +78,33 @@ _TRIVIAL_BACKTICKS = frozenset({
     "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
     "f32", "f64", "bool", "char", "vec", "string", "option", "result",
 })
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    return re.sub(r"```[\s\S]*?```", "", text or "")
+
+
+def _strip_inline_commands(text: str) -> str:
+    """Remove fenced blocks, URLs, and multi-token inline shell commands before scanning CLI flags."""
+    cleaned = _strip_fenced_code_blocks(text or "")
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    return re.sub(
+        r"\x60([^\x60\n]+)\x60",
+        lambda m: (
+            " "
+            if (re.search(r"[\s|;&]", m.group(1).strip()) and not m.group(1).strip().startswith("--"))
+            else m.group(0)
+        ),
+        cleaned,
+    )
+
+
+def _extract_cli_flags(text: str) -> list[str]:
+    """Extract unique CLI long flags (`--flag`) outside fenced blocks, URLs, and shell commands."""
+    cleaned = _strip_inline_commands(text)
+    return list(dict.fromkeys(
+        re.findall(r"(?<![A-Za-z0-9_-])(--[a-z][a-z0-9_-]*)(?!\.\d|[A-Za-z0-9_-])", cleaned)
+    ))
 
 
 def extract_issue_contract(issue: str) -> dict[str, Any]:
@@ -112,8 +145,10 @@ def extract_issue_contract(issue: str) -> dict[str, Any]:
         or re.search(r"\b(?:add\s+(?:method|function|support|api|a\s+new)|feature\s+request|new\s+method|missing\s+method)\b", low)
     )
     mentions_feature_flag = bool(re.search(r"\b(?:feature\s+flag|cfg\(|--features|--all-features|no_default_features|no_std)\b", low))
+    cli_flags = _extract_cli_flags(issue or "")
     mentions_cli_or_additive_flag = bool(
-        re.search(r"(?:--[a-z0-9][a-z0-9_-]*|\banother\s+(?:argument|flag|option)\b|\bnew\s+(?:flag|option|argument|field)\b)", low)
+        cli_flags
+        or re.search(r"(?:\banother\s+(?:argument|flag|option)\b|\bnew\s+(?:flag|option|argument|field)\b)", low)
     )
     mentions_test_change = bool(
         re.search(r"\b(?:test|tests|snapshot|snapshots|fixture|fixtures|assert(?:ion)?|golden)\b", low)
@@ -146,9 +181,19 @@ def extract_issue_contract(issue: str) -> dict[str, Any]:
             seen_files.add(fpath)
             referenced_files.append(fpath)
 
+    companion_api_hints: list[str] = []
+    if (
+        "len" in new_api_candidates
+        or (mentions_new_api and any(s.split("::")[-1] == "len" for s in requested_symbols))
+    ):
+        companion_api_hints.append(
+            "When adding `pub fn len(&self)`, check whether `pub fn is_empty(&self) -> bool` is also expected by Rust/Clippy conventions."
+        )
+
     return {
         "requested_symbols": requested_symbols[:20],
         "new_api_candidates": new_api_candidates[:10],
+        "companion_api_hints": companion_api_hints,
         "referenced_files": referenced_files[:10],
         "expected_result_excerpt": expected_result_excerpt,
         "signals": {
@@ -257,17 +302,23 @@ def route_after_navigation(blackboard: dict[str, Any], state: Any) -> tuple[str,
         reasons.append("navigator could not distinguish root-cause chains")
     if len(effective_files) > 2:
         reasons.append(f"repair spans {len(effective_files)} candidate files")
-    for sig_key, sig_label in (
-        ("mentions_new_api", "issue requests a new public API"),
-        ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
-        ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
-        ("mentions_macro", "issue involves macros"),
-    ):
-        if signals.get(sig_key):
-            reasons.append(sig_label)
+    if signals.get("mentions_new_api"):
+        reasons.append("issue requests a new public API")
+
+    # Keep localized single-file bugs on Fast Path; CLI/trait/macro signals and CKG
+    # consumer fan-out escalate to architecture planning only when multiple files or chains are involved.
+    multi_target = len(effective_files) > 1 or len(chains) > 1
+    if multi_target:
+        for sig_key, sig_label in (
+            ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
+            ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
+            ("mentions_macro", "issue involves macros"),
+        ):
+            if signals.get(sig_key):
+                reasons.append(sig_label)
 
     ckg = getattr(state, "ckg", None)
-    if ckg is not None and effective_files and not reasons:
+    if ckg is not None and multi_target and effective_files and not reasons:
         try:
             surface = _rust_impact.build_impact_surface(ckg, sorted(effective_files))
             extra_consumers = [
@@ -474,6 +525,9 @@ def build_handoff_card(
 
     unit_paths = set((active_unit or {}).get("paths") or [])
     raw_invariants = list(plan.get("rust_invariants") or [])
+    for hint in issue_contract.get("companion_api_hints") or []:
+        if hint not in raw_invariants:
+            raw_invariants.append(hint)
     raw_forbidden = list(plan.get("forbidden_edits") or [])
     if unit_paths:
         raw_invariants.sort(key=lambda x: (0 if any(p in str(x) for p in unit_paths) else 1))
@@ -653,8 +707,13 @@ def _should_prune_suggester_replan(ctx: SimpleNamespace) -> tuple[bool, str]:
     if ctx.candidate_policy and ctx.candidate_policy.data.get("pending"):
         return False, ""
     lock_rep = ctx.state.locked_regression_report() if hasattr(ctx.state, "locked_regression_report") else {}
-    if lock_rep.get("violations") and lock_rep.get("locked"):
-        return False, ""
+    if lock_rep.get("locked"):
+        if lock_rep.get("violations"):
+            return False, ""
+        escs = ctx.blackboard.get("escalations") or []
+        last_esc = str((escs[-1] if escs else {}).get("reason") or "").lower()
+        if any(tok in last_esc for tok in ("locked regression", "locked test", "locked oracle", "regression test", "test oracle", "release_locked_regression")):
+            return False, ""
     last_score = ctx.blackboard.get("last_replan_score")
     if not last_score:
         return False, ""
@@ -667,6 +726,18 @@ def _should_prune_suggester_replan(ctx: SimpleNamespace) -> tuple[bool, str]:
     else:
         ctx.blackboard["zero_progress_replans"] = 0
     return False, ""
+
+
+def _record_det_qa_failure_streak(ctx: SimpleNamespace, reason: str) -> int:
+    """Track consecutive identical deterministic-QA failure signatures so blind retry loops escalate."""
+    sig = (reason or "").split(":", 1)[0].strip().lower()[:80]
+    if not sig:
+        return 0
+    prev = str(ctx.blackboard.get("_det_qa_last_sig") or "")
+    streak = int(ctx.blackboard.get("_det_qa_sig_streak") or 0) + 1 if sig == prev else 1
+    ctx.blackboard["_det_qa_last_sig"] = sig
+    ctx.blackboard["_det_qa_sig_streak"] = streak
+    return streak
 
 
 def _append_cognitive_entry(
@@ -722,26 +793,130 @@ def _reconcile_plan_with_qa_rejection(blackboard: dict[str, Any], ver_payload: d
 
 
 def _refresh_sibling_contracts(ctx: SimpleNamespace) -> str:
-    """Probe sibling trait impls and existing test expectations for requested/localized symbols."""
+    """Probe sibling trait impls, paired methods, and localized wildcard/cfg surfaces."""
     ckg = getattr(ctx.state, "ckg", None)
     if ckg is None:
         return ""
     loc = ctx.blackboard.get("localization") or {}
     chains = loc.get("candidate_chains") or loc.get("ckg_suggested_chains") or []
     symbols: list[str] = list(ctx.issue_contract.get("requested_symbols") or []) + list(ctx.issue_contract.get("new_api_candidates") or [])
+    loc_files: list[str] = []
     for ch in chains[:3]:
         for node in (ch.get("nodes") or [])[:4]:
             sym = node.get("symbol")
             if sym and sym not in symbols:
                 symbols.append(sym)
+            p = node.get("path")
+            if p and p.endswith(".rs") and not _is_non_prod_path(p) and p not in loc_files:
+                loc_files.append(p)
     try:
         contracts = _rust_impact.collect_sibling_contracts(ckg, symbols[:10])
-        text = _rust_impact.format_sibling_contracts(contracts, max_chars=1200)
+        text = _rust_impact.format_sibling_contracts(contracts, max_chars=1400)
     except Exception:
-        contracts, text = {"sibling_impls": [], "test_contracts": []}, ""
+        contracts, text = {"sibling_impls": [], "test_contracts": [], "trait_docs": [], "paired_methods": []}, ""
     ctx.blackboard["sibling_contracts"] = contracts
     ctx.blackboard["sibling_contracts_text"] = text
+    loc_impact_text = ""
+    if loc_files:
+        try:
+            surf = _rust_impact.build_impact_surface(ckg, loc_files[:6], max_consumers=6)
+            wildcards = surf.get("wildcard_matches") or []
+            cfgs = surf.get("cfg_features") or []
+            lines = []
+            if wildcards:
+                lines.append(
+                    "Localized Enum Wildcard `_ =>` Match Sites (update matching arms if enum variants change): "
+                    + ", ".join(f"{w['path']}:{w['line']} ({w.get('fn') or 'match'})" for w in wildcards[:6])
+                )
+            if cfgs:
+                lines.append(f"Localized #[cfg(feature = ...)] Gates: {', '.join(cfgs[:8])}")
+            loc_impact_text = "\n".join(lines)[:900]
+        except Exception:
+            loc_impact_text = ""
+    ctx.blackboard["localization_impact_text"] = loc_impact_text
     return text
+
+
+def _maybe_run_conditional_trace(ctx: SimpleNamespace, *, on_escalation: bool = False) -> str:
+    """Conditionally run type-safe dynamic value tracing when runtime logic failure or ambiguity exists."""
+    trace_tool = ctx.tools_by_name.get("rust_trace")
+    if trace_tool is None or not shutil.which("cargo"):
+        return ""
+    cargo_target = (
+        (getattr(ctx.state, "rust_env", None) or {}).get("CARGO_TARGET_DIR")
+        or os.environ.get("CARGO_TARGET_DIR")
+        or ""
+    ).strip()
+    if not (ctx.state.root / "target").exists() and not (cargo_target and Path(cargo_target).exists()):
+        return ""
+    cur_rev = getattr(ctx.state, "_revision", 0)
+    if ctx.blackboard.get("_dynamic_trace_rev") == cur_rev:
+        return str(ctx.blackboard.get("dynamic_trace_report") or "")
+    repro_map = getattr(ctx.state, "_reproduced_regressions", {}) or {}
+    targets = ctx.state.get_regression_targets() if hasattr(ctx.state, "get_regression_targets") else {}
+    repro_items = [
+        (k, info) for k, info in repro_map.items()
+        if info.get("clean_red") and info.get("runtime_failure")
+        and not info.get("compile_reproduction") and not info.get("suspect_setup_panic")
+    ]
+    if not repro_items:
+        return ""
+    loc = ctx.blackboard.get("localization") or {}
+    chains = loc.get("candidate_chains") or loc.get("ckg_suggested_chains") or []
+    last_fail = (ctx.state.stuck_status() or {}).get("last_test_failure") or {}
+    fail_blob = json.dumps(last_fail, ensure_ascii=False).lower()
+    non_panic_logic = "panicked at" not in fail_blob
+    if not (on_escalation or len(chains) > 1 or non_panic_logic):
+        return ""
+
+    by_file: dict[str, list[str]] = {}
+    for ch in chains[:3]:
+        for node in (ch.get("nodes") or [])[:4]:
+            p = str(node.get("path") or "").strip()
+            sym = str(node.get("symbol") or "").strip().split("::")[-1]
+            if not p or not p.endswith(".rs") or _is_non_prod_path(p) or not sym:
+                continue
+            syms = by_file.setdefault(p, [])
+            if sym not in syms:
+                syms.append(sym)
+    if on_escalation:
+        for p_obj in _extract_selected_source_paths(ctx.state)[:2]:
+            p_str = p_obj.as_posix()
+            if p_str.endswith(".rs") and p_str not in by_file:
+                by_file[p_str] = []
+    instrument = [
+        f"{p}:{','.join(syms[:3])}" if syms else p
+        for p, syms in list(by_file.items())[:3]
+    ]
+    if not instrument:
+        return ""
+
+    key, _ = repro_items[0]
+    tinfo = targets.get(key) or {}
+    manifest_rel = key[0].as_posix() if hasattr(key[0], "as_posix") else str(key[0])
+    kwargs: dict[str, Any] = {"instrument": instrument, "manifest_path": manifest_rel, "timeout": 45}
+    if tinfo.get("is_in_module"):
+        kwargs["lib"] = True
+        kwargs["test_filter"] = key[1]
+    else:
+        kwargs["test_target"] = key[1]
+    active_feats = list(
+        (getattr(ctx.state, "_active_cfg_features", None) or {}).get((ctx.state.root / manifest_rel).resolve()) or ()
+    )
+    if active_feats:
+        kwargs["features"] = active_feats
+    try:
+        report = str(trace_tool.func(**kwargs) or "")
+    except Exception:
+        return ""
+    ctx.blackboard["_dynamic_trace_rev"] = cur_rev
+    if not report or report.startswith("Error:"):
+        return ""
+    compact = report[:1600]
+    ctx.blackboard["dynamic_trace_report"] = compact
+    if ctx.trace:
+        ctx.trace.record("conditional_dynamic_trace", on_escalation=on_escalation, instrument=instrument, chars=len(compact))
+    return compact
 
 
 def _emit_coordination_metrics(ctx: SimpleNamespace) -> None:
@@ -914,42 +1089,6 @@ def _detect_added_inline_tests(patch_text: str) -> list[str]:
     return findings[:6]
 
 
-def _inline_test_line_ranges(orig_code: str) -> list[tuple[int, int]]:
-    """Return 1-based (start, end) line ranges of #[cfg(test)] or mod tests blocks in orig_code."""
-    lines = orig_code.splitlines()
-    ranges: list[tuple[int, int]] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        stripped = lines[i].strip()
-        is_cfg_test = stripped.startswith("#[cfg(test)]")
-        is_mod_tests = bool(re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests?|[a-z0-9_]*_tests)\b", stripped))
-        if is_cfg_test or is_mod_tests:
-            start_ln = i + 1
-            depth = 0
-            opened = False
-            j = i
-            while j < n:
-                ln_txt = lines[j]
-                if "{" in ln_txt:
-                    depth += ln_txt.count("{")
-                    opened = True
-                if "}" in ln_txt:
-                    depth -= ln_txt.count("}")
-                if opened and depth <= 0:
-                    ranges.append((start_ln, j + 1))
-                    i = j
-                    break
-                if not opened and ";" in ln_txt and j > i:
-                    break
-                j += 1
-            else:
-                if opened:
-                    ranges.append((start_ln, n))
-        i += 1
-    return ranges
-
-
 def _detect_modified_inline_tests(patch_text: str, state: Any = None) -> list[str]:
     """Flag hunks in production src/ files that edit pre-existing inline #[cfg(test)] / mod tests functions."""
     if not patch_text:
@@ -1108,23 +1247,6 @@ def _patch_hunks(patch_text: str):
         hunk = (path, start, count, has_added, has_removed, touched)
     for item in flush():
         yield item
-
-
-def _touched_line_hits_inline_tests(touched: tuple[tuple[str, int], ...], ranges: list[tuple[int, int]]) -> bool:
-    """Return True when a hunk's real edits touch an inline #[cfg(test)]/mod tests region.
-
-    A removed line inside the region counts as a modification. An insertion counts
-    only when the gap sits inside the region body, i.e. after the `#[cfg(test)]`
-    line and before the closing brace.
-    """
-    for kind, number in touched:
-        for start, end in ranges:
-            if kind == "line":
-                if start <= number <= end:
-                    return True
-            elif start <= number <= end - 1:
-                return True
-    return False
 
 
 def _is_documentation_path(path: str) -> bool:
@@ -1307,7 +1429,41 @@ def _classify_smoke_failure(item: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _smoke_gate_report(state: Any, smoke_results: list[dict[str, Any]] | None = None) -> dict[str, list[str]]:
+def _sample_failed_tests(names: list[str], limit: int = 12) -> list[str]:
+    """Sample failed test names across module/prefix clusters so one prefix does not crowd out others."""
+    ordered = [str(n).strip() for n in names if str(n).strip()]
+    if len(ordered) <= limit:
+        return ordered
+    buckets: dict[str, list[str]] = {}
+    for name in ordered:
+        if "::" in name:
+            mod, item = name.rsplit("::", 1)
+            prefix = f"{mod}::{item.split('_', 1)[0]}"
+        else:
+            prefix = name.split("_", 1)[0]
+        buckets.setdefault(prefix, []).append(name)
+    sampled: list[str] = []
+    idx = 0
+    while len(sampled) < limit:
+        progressed = False
+        for group in buckets.values():
+            if idx < len(group):
+                sampled.append(group[idx])
+                progressed = True
+                if len(sampled) >= limit:
+                    break
+        if not progressed:
+            break
+        idx += 1
+    return sampled
+
+
+def _smoke_gate_report(
+    state: Any,
+    smoke_results: list[dict[str, Any]] | None = None,
+    *,
+    allow_legacy_regression_audit: bool = False,
+) -> dict[str, list[str]]:
     """Block confirmed compilation regressions and report other smoke failures."""
     items = [
         {**dict(item), "_from_existing_failure_log": True}
@@ -1334,7 +1490,7 @@ def _smoke_gate_report(state: Any, smoke_results: list[dict[str, Any]] | None = 
         target = item.get("target") or item.get("test_target") or "existing-test-smoke"
         raw_detail = str(item.get("details") or item.get("failure_details") or "")
         detail_lines = [ln for ln in raw_detail.splitlines() if not ln.lstrip().startswith("stored new snapshot ")]
-        detail = ("\n".join(detail_lines) if detail_lines else raw_detail).strip().replace("\n", " ")[:420]
+        detail = ("\n".join(detail_lines) if detail_lines else raw_detail).strip().replace("\n", " ")[:900]
         key = f"{target}:{status}:{detail}"
         if key in seen:
             continue
@@ -1343,8 +1499,12 @@ def _smoke_gate_report(state: Any, smoke_results: list[dict[str, Any]] | None = 
         if detail:
             message += f": {detail}"
         new_failures = item.get("new_failed_tests") or []
-        if baseline == "failed" and new_failures:
-            message += "; newly failing tests: " + ", ".join(new_failures[:10])
+        all_failures = item.get("failed_tests") or []
+        sampled_failures = _sample_failed_tests(new_failures or (all_failures if baseline == "passed" else []), limit=12)
+        if baseline == "failed" and sampled_failures:
+            message += "; newly failing tests: " + ", ".join(sampled_failures)
+        elif baseline == "passed" and sampled_failures:
+            message += "; failing tests: " + ", ".join(sampled_failures)
         elif classification == "code" and baseline in {"", "unknown", "none"}:
             message += " (no confirmed passing baseline)"
         baseline_label = str(item.get("baseline_label") or "")
@@ -1353,8 +1513,14 @@ def _smoke_gate_report(state: Any, smoke_results: list[dict[str, Any]] | None = 
         compile_failure = bool(item.get("compile_errors")) or bool(re.search(
             r"error\[E\d+\]|could not compile", str(item.get("details") or ""), re.IGNORECASE
         ))
-        if status == "failed" and classification == "code" and baseline == "passed" and compile_failure:
-            blocking.append("New compilation failure: " + message)
+        if status == "failed" and classification == "code" and (
+            baseline == "passed" or (baseline == "failed" and new_failures)
+        ):
+            if compile_failure or not allow_legacy_regression_audit:
+                prefix = "New compilation failure: " if compile_failure else "New existing-test regression: "
+                blocking.append(prefix + message)
+            else:
+                warnings.append("Legacy/existing-test failure for Verifier audit: " + message)
         else:
             warnings.append("Smoke check: " + message)
     return {"blocking": blocking, "warnings": warnings}
@@ -1366,6 +1532,8 @@ def _submission_gate_report(
     patch_text: str,
     selected: list[Path],
     smoke_results: list[dict[str, Any]] | None = None,
+    *,
+    allow_legacy_regression_audit: bool = False,
 ) -> dict[str, list[str]]:
     findings = _detect_non_substantive_patch(patch_text, selected, issue_contract)
     findings.extend(_detect_benchmark_test_conflicts(patch_text, state, issue_contract))
@@ -1377,7 +1545,9 @@ def _submission_gate_report(
                 "target": "existing-test-smoke", "status": "error", "classification": "unknown",
                 "observed_revision": getattr(state, "_revision", None), "details": str(exc),
             }]
-    smoke = _smoke_gate_report(state, smoke_results)
+    smoke = _smoke_gate_report(
+        state, smoke_results, allow_legacy_regression_audit=allow_legacy_regression_audit,
+    )
     return {
         "blocking": list(dict.fromkeys(findings + smoke["blocking"])),
         "warnings": list(dict.fromkeys(smoke["warnings"])),
@@ -1391,8 +1561,8 @@ def _plan_conflict_explanation_has_issue_basis(explanation: str, issue_contract:
     low = text.lower()
     contract = issue_contract or {}
     symbols = [str(item).lower() for item in (contract.get("requested_symbols") or []) if len(str(item)) >= 3]
-    context_words = ("issue", "contract", "requirement", "expected", "behavior")
-    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime")
+    context_words = ("issue", "contract", "requirement", "expected", "behavior", "requested", "spec", "bug", "fix", "panic")
+    evidence_words = ("test", "verification", "caller", "public api", "regression", "compile", "runtime", "cargo", "probe", "diff", "check", "assert", "pass", "fail", "symbol", "impl")
     has_context = any(token in low for token in context_words)
     has_evidence_or_symbol = any(token in low for token in evidence_words) or any(token in low for token in symbols)
     return has_context and has_evidence_or_symbol
@@ -1513,7 +1683,6 @@ def _clean_and_audit_fallback_patch(state: Any, issue_contract: dict[str, Any], 
             trace.record("stripped_scratch_from_fallback", scratch=sorted(scratch))
     if (
         not patch_text
-        or hygiene.get("trace_leftovers")
         or hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
     ):
@@ -1726,14 +1895,9 @@ def _find_untested_integration_targets(state: Any, selected: list[Path]) -> list
         rel_mf = mf.relative_to(root).as_posix() if mf.is_relative_to(root) else mf.as_posix()
         if (rel_mf, "tests") in ran_targets or (rel_mf, "default") in ran_targets:
             continue
-        tests_dir = mf.parent / "tests"
-        if not tests_dir.is_dir():
-            continue
-        for tf in sorted(tests_dir.glob("*.rs")):
-            if tf.name.startswith(("test_regression_", "normal_regression_")):
-                continue
-            if (rel_mf, tf.stem) not in ran_targets:
-                untested.append(f"{rel_mf}:{tf.stem}")
+        for target_name in _tools_helpers.discover_integration_test_targets(mf):
+            if (rel_mf, target_name) not in ran_targets:
+                untested.append(f"{rel_mf}:{target_name}")
     return untested[:8]
 
 
@@ -1805,8 +1969,7 @@ def _try_degraded_patch_fallback(
         hygiene = state.diff_hygiene_report(selected)
 
     if (
-        hygiene.get("trace_leftovers")
-        or hygiene.get("added_dbg_lines")
+        hygiene.get("added_dbg_lines")
         or _detect_added_inline_tests(patch_text)
         or _detect_benchmark_test_conflicts(patch_text, state, issue_contract)
     ):
@@ -1839,9 +2002,48 @@ def _try_degraded_patch_fallback(
     return patch_text
 
 
+def _detect_bare_assert_sibling_mismatch(state: Any, patch_text: str) -> str:
+    """Warn if patch adds a bare `assert!(...)` inside a method whose siblings use formatted panic/assert wording."""
+    ckg = getattr(state, "ckg", None)
+    if ckg is None or not patch_text:
+        return ""
+    cur_fn = ""
+    bare_fns: list[str] = []
+    for line in patch_text.splitlines():
+        if line.startswith("@@ "):
+            m_fn = re.search(r"\bfn\s+([A-Za-z_]\w*)", line)
+            cur_fn = m_fn.group(1) if m_fn else ""
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            body = line[1:].strip()
+            m_def = re.search(r"\bfn\s+([A-Za-z_]\w*)", body)
+            if m_def:
+                cur_fn = m_def.group(1)
+            if cur_fn and re.search(r"\bassert!\s*\([^\"{}]+(?:\)|$)", body) and '"' not in body:
+                if cur_fn not in bare_fns:
+                    bare_fns.append(cur_fn)
+    if not bare_fns:
+        return ""
+    try:
+        contracts = _rust_impact.collect_sibling_contracts(ckg, bare_fns[:4], max_entries=3)
+    except Exception:
+        return ""
+    wording_examples = [
+        f"{s['path']}:{s['line']} ({' | '.join(s['clauses'])})"
+        for s in (contracts.get("sibling_impls") or [])
+        if any('"' in c for c in (s.get("clauses") or ()))
+    ]
+    if not wording_examples:
+        return ""
+    return (
+        f"Bare assert!(...) added in {', '.join(bare_fns[:3])} without error message while sibling impls use "
+        f"formatted panic/assert wording: {'; '.join(wording_examples[:2])}"
+    )
+
+
 def run_deterministic_qa_checks(
     state: Any, issue_contract: dict[str, Any], run_doctest_on_shift: bool = True,
-    unreproduced_reason: str = "",
+    unreproduced_reason: str = "", allow_legacy_regression_audit: bool = False,
 ) -> dict[str, Any]:
     """Collect verification findings without blocking a non-empty source patch."""
     _prune_invalid_regression_targets(state)
@@ -1882,11 +2084,13 @@ def run_deterministic_qa_checks(
 
     hygiene = state.diff_hygiene_report(selected)
     if hygiene.get("trace_leftovers"):
-        warnings.append(f"Temporary trace probes left in files: {hygiene['trace_leftovers']}")
+        return {"ok": False, "reason": f"Dynamic trace instrumentation left in source files: {hygiene['trace_leftovers']}"}
     if hygiene.get("added_dbg_lines"):
         warnings.append(f"Debug macro dbg!(...) left in patch: {hygiene['added_dbg_lines']}")
     if hygiene.get("scratch_files"):
         warnings.append(f"Temporary helper/scratch files left in repository: {hygiene['scratch_files']}")
+    if targets and any((repro_map.get(k) or {}).get("suspect_setup_panic") for k in targets):
+        warnings.append("Red-phase regression test panicked on a setup/IO error outside src/; verify it reproduces the actual bug.")
 
     post_strip_status = "not_run"
     if state.post_strip_check:
@@ -1915,10 +2119,28 @@ def run_deterministic_qa_checks(
     if modified_inline_tests and (signals.get("mentions_new_api") or signals.get("mentions_cli_or_additive_flag")):
         warnings.append(f"Modified existing inline tests in production source files: {modified_inline_tests}")
 
-    submission_gate = _submission_gate_report(state, issue_contract, patch_text, selected, smoke_results)
+    submission_gate = _submission_gate_report(
+        state, issue_contract, patch_text, selected, smoke_results,
+        allow_legacy_regression_audit=allow_legacy_regression_audit,
+    )
     if submission_gate["blocking"]:
         return {"ok": False, "reason": "Submission gate failed: " + "; ".join(submission_gate["blocking"])}
     warnings.extend(submission_gate["warnings"])
+
+    dead_variants = _rust_impact.find_dead_enum_variant_producers(
+        getattr(state, "ckg", None), patch_text,
+        requested_symbols=issue_contract.get("requested_symbols") or (),
+    )
+    if dead_variants:
+        details = "; ".join(
+            f"{dv['file']} added variant `{dv['variant']}` with 0 production consumers while wildcard `_ =>` match(es) exist at {', '.join(dv['wildcard_matches'])}"
+            for dv in dead_variants[:3]
+        )
+        return {"ok": False, "reason": f"One-sided enum edit: {details}"}
+
+    sibling_assert_warn = _detect_bare_assert_sibling_mismatch(state, patch_text)
+    if sibling_assert_warn:
+        warnings.append(sibling_assert_warn)
 
     comment_shifts = _detect_comment_only_doctest_shifts(patch_text, state, selected) if hygiene.get("doctest_shifts") else []
 
@@ -2096,6 +2318,26 @@ def _make_handoff_tools(
                 ambiguous = [c for c in chains_dict if c["chain_id"] in unresolved_chain_ids]
                 if len({c["chain_id"] for c in ambiguous}) < 2 or not ambiguity_reason.strip():
                     return "Error: unresolved_chain_ids must name two known chains with a concrete ambiguity_reason."
+            if (
+                callable(getattr(state, "get_regression_targets", None))
+                and not _extract_selected_source_paths(state)
+                and not activity.get("_nav_rejected_orig_pass")
+                and activity.get("calls_remaining_in_stage", 2) > 1
+            ):
+                targets = state.get_regression_targets() or {}
+                passed_keys = getattr(state, "_passed_regressions", set()) or set()
+                repro_notes = getattr(state, "_reproduction_notes", {}) or {}
+                if targets and any(
+                    k in passed_keys or repro_notes.get(k) == "passed on unpatched original code"
+                    for k in targets
+                ):
+                    activity["_nav_rejected_orig_pass"] = True
+                    return (
+                        "Error: temporary regression test already PASSED on the unpatched original code, "
+                        "so it does not reproduce the issue. Inspect the actual buggy crate/path, update the "
+                        "regression test with write_regression_test(run_now=True) so it fails on the unpatched "
+                        "checkout (or remove it with revert_file), then call submit_localization_bundle."
+                    )
             if not chains_dict and getattr(state, "ckg", None) is not None:
                 chains_dict = state.ckg.build_fault_chains(
                     blackboard["issue_contract"].get("requested_symbols", []),
@@ -2139,6 +2381,17 @@ def _make_handoff_tools(
             candidate_id: str = "",
         ) -> str:
             """Submit the structured Rust RepairPlan to guide the Fixer."""
+            concrete_edits = [
+                e for e in ordered_edits
+                if (e.action or "modify").strip().lower() in ("modify", "add")
+                and e.file
+                and not _is_non_prod_path(e.file)
+            ]
+            if not concrete_edits:
+                return (
+                    "Error: ordered_edits must include at least one concrete 'modify' or 'add' "
+                    "step targeting a production source file."
+                )
             payload = {
                 "action": "plan",
                 "selected_chain_id": selected_chain_id,
@@ -2223,7 +2476,18 @@ def _make_handoff_tools(
             changed = state.changed_paths()
             selected = _extract_selected_source_paths(state)
             if not changed or not selected:
-                return "Cannot submit for QA: no source code changes detected in src/."
+                attempts = activity.get("no_edit_qa_attempts", 0) + 1
+                activity["no_edit_qa_attempts"] = attempts
+                if allow_escalate and attempts >= 2:
+                    raise _AutoEscalate(
+                        f"Repeated submit_for_qa calls without production source edits ({attempts} attempts)",
+                        {"no_edit_qa_attempts": attempts},
+                    )
+                return (
+                    "Cannot submit for QA: no source code changes detected in src/. "
+                    "Edit the target production file with edit_file before calling submit_for_qa."
+                )
+            activity["no_edit_qa_attempts"] = 0
             holder["done"] = True
             holder["payload"] = {"action": "qa", "summary": summary,
                                  "unreproduced_reason": unreproduced_reason}
@@ -2255,7 +2519,11 @@ def _make_handoff_tools(
             plan_conflicts: list[str] | None = None,
             explanation: str = "",
         ) -> str:
-            """Finalize QA audit with decision='APPROVE' or 'REJECT'."""
+            """Finalize QA audit with decision='APPROVE' or 'REJECT'.
+
+            When plan_consistency='conflict', provide non-empty plan_conflicts AND a concrete
+            `explanation` citing the issue requirement/contract and test/compile/runtime/caller evidence.
+            """
             norm = decision.strip().upper()
             if norm not in ("APPROVE", "REJECT"):
                 return "Error: decision must be 'APPROVE' or 'REJECT'."
@@ -2280,7 +2548,7 @@ def _make_handoff_tools(
             ):
                 return (
                     "Error: explain how the conflict relates to the issue contract and concrete test, caller, "
-                    "API, compile, or runtime evidence."
+                    "API, compile, or runtime evidence in the `explanation` parameter (not only `summary`)."
                 )
             if consistency == "not_applicable" and has_plan:
                 return "Error: an Architect plan exists; audit it or select not_checked."
@@ -2321,7 +2589,7 @@ _READ_ONLY_BROWSE_TOOLS = frozenset({
 })
 _PROGRESS_ACTION_TOOLS = frozenset({
     "edit_file", "write_file", "write_regression_test", "revert_file",
-    "checkpoint", "cargo_check", "cargo_test", "rust_trace",
+    "checkpoint", "cargo_check", "cargo_test",
 })
 
 
@@ -2341,6 +2609,7 @@ def _wrap_tools_for_role(
 ):
     activity.setdefault("read_excerpts", {})
     activity.setdefault("ckg_notes", {})
+    activity.setdefault("last_passed_reg_count", len(getattr(state, "_passed_regressions", set())))
     selected = []
     for name in allowed_names:
         t_obj = tools_by_name.get(name)
@@ -2381,6 +2650,8 @@ def _wrap_tools_for_role(
                 tgt = kwargs.get("target") or (args[0] if args else "")
                 if tgt and tgt not in activity["symbols_queried"]:
                     activity["symbols_queried"].append(str(tgt))
+            elif __tname == "verifier_probe":
+                activity.setdefault("probes_run", []).append(str(kwargs.get("probe_type") or "existing_test"))
 
             out = __fn(*args, **kwargs)
             if coordinator:
@@ -2452,30 +2723,33 @@ def _wrap_tools_for_role(
                         activity["read_only_streak"] = activity.get("read_only_streak", 0) + 1
                     elif __tname in _PROGRESS_ACTION_TOOLS:
                         activity["read_only_streak"] = 0
-                    if not coordinator:
-                        if __tname in ("edit_file", "write_file") and not out.startswith("Error"):
+                    if __tname in ("edit_file", "write_file") and not out.startswith("Error"):
+                        if _extract_selected_source_paths(state):
+                            activity["reg_write_streak"] = 0
+                        if not coordinator:
                             activity["edits_since_check"] = activity.get("edits_since_check", 0) + 1
                             if activity["edits_since_check"] >= 4:
                                 out += (
                                     "\n[Pacing notice: 4+ source edits made without running cargo_check or cargo_test. "
                                     "Run cargo_check or cargo_test now to catch compiler/test errors early.]"
                                 )
-                        elif __tname in ("cargo_check", "cargo_test"):
+                    elif __tname in ("cargo_check", "cargo_test"):
+                        if not coordinator:
                             activity["edits_since_check"] = 0
-                        if __tname == "write_regression_test":
-                            prev_passed = len(getattr(state, "_passed_regressions", set()))
-                            activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
-                            if prev_passed > activity.get("last_passed_reg_count", 0):
-                                activity["reg_write_streak"] = 0
-                            activity["last_passed_reg_count"] = prev_passed
-                            if activity["reg_write_streak"] >= 4:
-                                out += (
-                                    "\n[Pacing notice: multiple write_regression_test edits without passing; "
-                                    "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
-                                )
-                        elif __tname == "cargo_test" and len(getattr(state, "_passed_regressions", set())) > activity.get("last_passed_reg_count", 0):
+                        if len(getattr(state, "_passed_regressions", set())) > activity.get("last_passed_reg_count", 0):
                             activity["reg_write_streak"] = 0
                             activity["last_passed_reg_count"] = len(getattr(state, "_passed_regressions", set()))
+                    elif __tname == "write_regression_test":
+                        prev_passed = len(getattr(state, "_passed_regressions", set()))
+                        activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
+                        if prev_passed > activity.get("last_passed_reg_count", 0):
+                            activity["reg_write_streak"] = 0
+                        activity["last_passed_reg_count"] = prev_passed
+                        if activity["reg_write_streak"] >= 4:
+                            out += (
+                                "\n[Pacing notice: multiple write_regression_test edits without passing; "
+                                "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
+                            )
                     streak = activity.get("read_only_streak", 0)
                     if streak >= 10 and not auto_escalate_on_stuck:
                         out += (
@@ -2490,11 +2764,12 @@ def _wrap_tools_for_role(
                         f"Fixer read-only exploration stalled ({streak} consecutive browse calls without edits or Cargo checks); clarify localization or concrete next edit",
                         {"read_only_streak": streak},
                     )
-            if auto_escalate_on_stuck and role == "fixer" and not coordinator:
-                if activity.get("reg_write_streak", 0) >= 6:
+                no_src_edits = not _extract_selected_source_paths(state)
+                reg_streak = activity.get("reg_write_streak", 0)
+                if (not coordinator and reg_streak >= 6) or (no_src_edits and reg_streak >= 3):
                     raise _AutoEscalate(
-                        "Repeated temporary regression test rewrites without passing (>=6 attempts)",
-                        {"reg_write_streak": activity.get("reg_write_streak", 0)},
+                        f"Repeated temporary regression test rewrites without progress ({reg_streak} attempts)",
+                        {"reg_write_streak": reg_streak, "has_source_edits": not no_src_edits},
                     )
             if auto_escalate_on_stuck and __tname in ("cargo_check", "cargo_test"):
                 stuck = state.stuck_status()
@@ -3074,7 +3349,6 @@ def _build_fixer_handoff_features(
             "untouched_referenced_files": list(det_qa.get("untouched_referenced_files") or [])[:8],
             "static_manifest_tests": list(det_qa.get("static_manifest_tests") or [])[:6],
             "untested_integration_targets_count": len(det_qa.get("untested_integration_targets") or []),
-            "trace_leftovers_count": len(hygiene.get("trace_leftovers") or []),
             "added_dbg_lines_count": len(hygiene.get("added_dbg_lines") or []),
             "scratch_files_count": len(hygiene.get("scratch_files") or []),
         }
@@ -3517,11 +3791,6 @@ def _should_escalate_qa_to_architect(
         return False, ""
     if det_qa.get("passed_on_original"):
         return True, "QA rejected while temporary regression test still passes on the original code."
-    if det_qa.get("untouched_referenced_files"):
-        return True, (
-            "Repeated QA rejection while issue-referenced source files remain untouched: "
-            + ", ".join(det_qa["untouched_referenced_files"])
-        )
     if len(qa_history) >= 2 and qa_history[-2].get("decision") == "REJECT":
         prev = qa_history[-2]
         prev_reqs = {str(x).strip().lower() for x in (prev.get("missing_requirements") or []) if str(x).strip()}
@@ -3650,7 +3919,7 @@ def run_continuous_repair(
             allowed = [
                 "read_file", "read_lines", "search_code", "cargo_workspace", "rust_symbols",
                 "inspect_rust_neighborhood", "edit_file", "write_file", "write_regression_test",
-                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
+                "revert_file", "checkpoint", "cargo_check", "cargo_test", "rust_error_explain",
             ]
             role_tools = _wrap_tools_for_role(
                 "fixer", tools_by_name, allowed, handoffs, holder, state, client,
@@ -3899,6 +4168,8 @@ def _init_orchestration_ctx(
         "shared_ckg_notes": {},
         "sibling_contracts": {"sibling_impls": [], "test_contracts": []},
         "sibling_contracts_text": "",
+        "localization_impact_text": "",
+        "dynamic_trace_report": "",
         "milestones": {k: False for k in _MILESTONE_KEYS},
         "milestone_credits": {},
         "milestone_history": [],
@@ -3950,8 +4221,8 @@ def _init_orchestration_ctx(
         role_callback_cls=role_callback_cls,
         blackboard=blackboard,
         qa_repair_loop_enabled=qa_repair_loop_enabled,
-        max_escalations=max(2, (max_api_calls or 70) // 25),
-        max_qa_rounds=max(2, (max_api_calls or 70) // 15),
+        max_escalations=min(3, max(2, (max_api_calls or 70) // 25)),
+        max_qa_rounds=min(4, max(2, (max_api_calls or 70) // 15)),
         escalations_used=0,
         qa_rounds=0,
         qa_escalation_sigs=set(),
@@ -4001,7 +4272,7 @@ def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, 
         f"Pre-extracted Issue Contract (verify exact names/crates):\n"
         f"{json.dumps(ctx.issue_contract, ensure_ascii=False, indent=2)}\n\n"
         "Locate root cause / candidate fault chains, reproduce the issue with write_regression_test(run_now=True), "
-        "run rust_trace once if it fails at runtime, then call submit_localization_bundle."
+        "then call submit_localization_bundle."
     )
     ctx.state._submit_hint_override = "Call submit_localization_bundle(...) now to hand off findings."
     nav_payload, nav_outcome = _run_role_agent(
@@ -4054,6 +4325,7 @@ def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, 
     nav_payload["repro_meta"] = repro_meta
     ctx.blackboard["localization"] = nav_payload
     _refresh_sibling_contracts(ctx)
+    _maybe_run_conditional_trace(ctx, on_escalation=False)
     _update_milestones_and_kpi(ctx, "navigator")
 
     ctx.state.save_checkpoint("pre_fix")
@@ -4171,21 +4443,41 @@ def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, di
     red_lock_txt = _build_red_lock_prompt_block(ctx.state)
     sibling_txt = (ctx.blackboard.get("sibling_contracts_text") or "").strip()
     sibling_block = f"{sibling_txt}\n\n" if sibling_txt else ""
+    loc_imp_txt = (ctx.blackboard.get("localization_impact_text") or "").strip()
+    loc_imp_block = f"{loc_imp_txt}\n\n" if loc_imp_txt else ""
+    dyn_trace_txt = (ctx.blackboard.get("dynamic_trace_report") or "").strip()
+    dyn_trace_block = f"{dyn_trace_txt}\n\n" if dyn_trace_txt else ""
     ledger_txt = _format_cognitive_ledger(ctx.blackboard)
     escalation_ctx = ""
     if ctx.blackboard["escalations"] or ledger_txt:
+        latest_esc_obj = ctx.blackboard["escalations"][-1] if ctx.blackboard["escalations"] else {}
+        latest_esc_reason = str(latest_esc_obj.get("reason") or "")
         latest_esc = (
             "\nLatest Escalation Detail:\n"
-            + json.dumps(ctx.blackboard["escalations"][-1], ensure_ascii=False, indent=2)
+            + json.dumps(latest_esc_obj, ensure_ascii=False, indent=2)
             if ctx.blackboard["escalations"] else ""
         )
+        esc_low = latest_esc_reason.lower()
+        extra_guidance = ""
+        if "only comments/blank lines" in esc_low:
+            extra_guidance += (
+                "\n- Comment/doc-only Rust diffs are deterministically rejected unless the issue only requests documentation. "
+                "Specify an executable code change or call request_relocalization if the localized files do not hold the code bug."
+            )
+        if red_lock_txt and any(tok in esc_low for tok in ("locked", "regression test", "test oracle")):
+            extra_guidance += (
+                "\n- Fixer flagged the locked Red-phase test oracle; verify the issue specification and call "
+                "release_locked_regression(name=..., reason=...) if the locked test asserts wrong behavior."
+            )
         escalation_ctx = (
             "\n\nPREVIOUS ATTEMPT FAILED & ESCALATED:\n"
             + (f"{ledger_txt}\n" if ledger_txt else "")
             + latest_esc
             + "\nDistinguish wrong implementation/test oracle/environment from evidence refuting the mechanism. "
+            "Keep unchanged verified units with stable IDs intact unless directly refuted. "
             "If a candidate comparison is pending, compare brief mechanisms first; keep the current mechanism unless contract/execution evidence warrants another. "
             "Otherwise, if failure_route is navigator, call request_relocalization and re-map the fault before planning; if failure_route is architect, revise the trait/type/API plan."
+            + extra_guidance
         )
     sug_issue_contract_json = json.dumps(ctx.issue_contract, ensure_ascii=False, indent=2)
     sug_loc_json = json.dumps(ctx.blackboard["localization"], ensure_ascii=False, indent=2)
@@ -4196,6 +4488,8 @@ def _exec_suggester_step(ctx: SimpleNamespace, *, attempt: int) -> tuple[str, di
         f"Current Temporary Regression Test(s):\n{repro_tests_txt}\n\n"
         f"{red_lock_txt}"
         f"{sibling_block}"
+        f"{loc_imp_block}"
+        f"{dyn_trace_block}"
         f"Pre-loaded Source Excerpts & CKG Context:\n{shared_ctx}"
         f"{escalation_ctx}\n\n"
         "Use the pre-loaded excerpts first (at most 1-3 extra read/search calls if needed), verify Rust contracts & Expected Result, and call submit_repair_plan."
@@ -4413,6 +4707,10 @@ def _exec_fixer_step(ctx: SimpleNamespace, *, attempt: int) -> dict[str, Any]:
     qa_block = f"PREVIOUS QA OBJECTIONS (MUST FIX):\n{ctx.last_qa_feedback}\n\n" if ctx.last_qa_feedback else ""
     sibling_fix = (ctx.blackboard.get("sibling_contracts_text") or "").strip()[:1000]
     sibling_fix_block = f"{sibling_fix}\n\n" if sibling_fix else ""
+    loc_imp_fix = (ctx.blackboard.get("localization_impact_text") or "").strip()[:700]
+    loc_imp_fix_block = f"{loc_imp_fix}\n\n" if loc_imp_fix else ""
+    dyn_trace_fix = (ctx.blackboard.get("dynamic_trace_report") or "").strip()[:1400]
+    dyn_trace_fix_block = f"{dyn_trace_fix}\n\n" if dyn_trace_fix else ""
     ledger_fix = _format_cognitive_ledger(ctx.blackboard, max_entries=3) if (ctx.blackboard.get("escalations") or ctx.last_qa_feedback) else ""
     ledger_fix_block = f"{ledger_fix[:700]}\n\n" if ledger_fix else ""
     unlocked = ctx.blackboard.get("unlocked_regressions") or []
@@ -4450,6 +4748,8 @@ def _exec_fixer_step(ctx: SimpleNamespace, *, attempt: int) -> dict[str, Any]:
         f"Targeted Source Excerpts:\n{shared_fix_ctx}\n\n"
         f"{impact_fix_txt}"
         f"{sibling_fix_block}"
+        f"{loc_imp_fix_block}"
+        f"{dyn_trace_fix_block}"
         f"{cur_diff_txt}"
         f"{downstream_note}"
         f"{unlock_block}"
@@ -4560,9 +4860,15 @@ def _exec_det_qa_step(
 ) -> dict[str, Any]:
     _prune_unreproduced_regression_targets(ctx.state, trace=ctx.trace)
     unreproduced_reason = (fix_payload or {}).get("unreproduced_reason", "")
+    has_paired_repro = bool(
+        hasattr(ctx.state, "reproduced_cleanly") and ctx.state.reproduced_cleanly()
+        and hasattr(ctx.state, "verified") and ctx.state.verified()
+    )
+    allow_legacy_audit = bool(ctx.qa_rounds >= 1 or ctx.escalations_used >= 1 or has_paired_repro)
     det_qa = run_deterministic_qa_checks(
         ctx.state, ctx.issue_contract, run_doctest_on_shift=True,
         unreproduced_reason=unreproduced_reason,
+        allow_legacy_regression_audit=allow_legacy_audit,
     )
     if not det_qa["ok"] and "Pending regression verification" in det_qa.get("reason", ""):
         rem_prune = _client_remaining_calls(ctx.client)
@@ -4571,6 +4877,7 @@ def _exec_det_qa_step(
                 det_qa = run_deterministic_qa_checks(
                     ctx.state, ctx.issue_contract, run_doctest_on_shift=True,
                     unreproduced_reason=unreproduced_reason,
+                    allow_legacy_regression_audit=allow_legacy_audit,
                 )
 
     if (
@@ -4663,9 +4970,9 @@ def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[s
         chat_model_factory=ctx.chat_model_factory, role_callback_cls=ctx.role_callback_cls,
         stage_cap=ctx.budgets["verifier_cap"], reserve_floor=0,
         attempt=ctx.qa_rounds + 1, max_continuations=1,
-        continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); include an issue/evidence explanation when reporting plan_consistency='conflict'.",
+        continuation_fn=lambda r, s: "Call submit_qa_decision('APPROVE' or 'REJECT', ...); when reporting plan_consistency='conflict', populate the `explanation` parameter with issue contract and test/compile/runtime/caller evidence.",
         handoff_only_tools=ver_handoff,
-        wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; include an issue/evidence explanation for any plan conflict.",
+        wrapup_prompt="Verification cap reached. Call submit_qa_decision('APPROVE' or 'REJECT', ...) IMMEDIATELY; if plan_consistency='conflict', set `explanation` to cite the issue contract and concrete test/compile/caller evidence.",
     )
     if not ver_payload:
         ver_payload = {
@@ -4682,6 +4989,7 @@ def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[s
         ver_payload["decision"] = decision
     if ver_payload:
         ctx.blackboard["qa_history"].append(dict(ver_payload))
+    ctx.blackboard["_last_ver_probes"] = list(ver_activity.get("probes_run") or [])
     if ctx.trace:
         ctx.trace.record(
             "qa_gate", deterministic_ok=True, llm_decision=decision, payload=ver_payload,
@@ -4822,6 +5130,8 @@ def run_graph_agent(
             return _transition(state_in, "suggester", "fallback", "budget_exhausted", "Model API call limit reached")
         if rem is not None and rem <= ctx.budgets["verifier_reserve"]:
             return _transition(state_in, "suggester", "fixer", "reserve_skip_plan", "Remaining budget reserved for verification")
+        if ctx.blackboard.get("escalations"):
+            _maybe_run_conditional_trace(ctx, on_escalation=True)
         outcome_kind, sug_payload, _sug_out, _bd = _exec_suggester_step(ctx, attempt=ctx.escalations_used + 1)
         if outcome_kind == "relocalize":
             reason = str((sug_payload or {}).get("reason", ""))
@@ -4902,11 +5212,11 @@ def run_graph_agent(
             not ctx.state.verified()
             and lock_report.get("violations")
             and lock_report.get("locked")
-            and ctx.blackboard.get("_red_lock_escalated_rev") != cur_rev
+            and not ctx.blackboard.get("_red_lock_escalated")
             and ctx.escalations_used < ctx.max_escalations
             and (rem_after_fix is None or rem_after_fix > ctx.budgets["verifier_reserve"] + 5)
         ):
-            ctx.blackboard["_red_lock_escalated_rev"] = cur_rev
+            ctx.blackboard["_red_lock_escalated"] = True
             v_summary = "; ".join(
                 f"{v.get('path')}({v.get('action')} x{v.get('count', 1)})"
                 for v in (lock_report.get("violations") or [])[:3]
@@ -4998,6 +5308,7 @@ def run_graph_agent(
             stuck_now = ctx.state.stuck_status()
             if _is_env_dependency_blocker(det_qa.get("reason", "")):
                 ctx.blackboard["environment_blocker"] = True
+            qa_streak = _record_det_qa_failure_streak(ctx, det_qa.get("reason", ""))
             should_escalate = (
                 not ctx.state.verified()
                 and not ctx.blackboard.get("environment_blocker")
@@ -5007,9 +5318,11 @@ def run_graph_agent(
                     fix_outcome == "stage_cap_reached"
                     or stuck_now["compile_repeats"] >= 2
                     or stuck_now["test_repeats"] >= 2
+                    or qa_streak >= 2
                 )
             )
             if should_escalate:
+                ctx.blackboard["_det_qa_sig_streak"] = 0
                 failure_route = _classify_failure_route(det_qa.get("reason", ""), stuck_now)
                 to_role = "navigator" if failure_route == "navigator" else "suggester"
                 reason = f"Fixer ended without passing verification ({fix_outcome}): {det_qa['reason']}"
@@ -5044,6 +5357,12 @@ def run_graph_agent(
             if ctx.qa_rounds < ctx.max_qa_rounds and (rem is None or rem > ctx.budgets["verifier_reserve"] + 2):
                 ctx.qa_rounds += 1
                 msg = f"Deterministic QA gate failed: {det_qa['reason']}"
+                if "New existing-test regression:" in det_qa["reason"]:
+                    msg += (
+                        " Inspect every listed failure cluster for missing sibling/consumer handling; if a failing existing test/snapshot "
+                        "directly asserts the pre-fix buggy behavior overridden by the issue, do NOT revert the contract-correct fix or "
+                        "edit tests/ — explain the mismatch in submit_for_qa and resubmit for Verifier audit."
+                    )
                 ctx.last_qa_feedback = msg
                 if ctx.trace:
                     ctx.trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=ctx.qa_rounds)
@@ -5106,6 +5425,48 @@ def run_graph_agent(
             update={"det_qa": det_qa},
         )
 
+    def _needs_integration_verification_gate(det_qa_info: dict[str, Any], sel: list[Path]) -> list[str]:
+        if ctx.blackboard.get("_integration_gate_enforced"):
+            return []
+        untested = list(det_qa_info.get("untested_integration_targets") or [])
+        if not untested:
+            return []
+        sel_text = " ".join(p.as_posix().lower() for p in sel)
+        root_dir = Path(getattr(ctx.state, "root", "."))
+        has_snapshots = any((root_dir / p).parent.joinpath("tests/snapshots").is_dir() or (root_dir / p).parent.parent.joinpath("tests/snapshots").is_dir() for p in sel)
+        if not has_snapshots and not any(tok in sel_text for tok in ("template", ".j2", "installer", "snapshot", "/cli", "main.rs")):
+            return []
+        if ctx.blackboard.get("_last_ver_probes"):
+            return []
+        smoke_covered = any(
+            str(item.get("target") or "").startswith("test:") and str(item.get("status") or "").lower() in ("passed", "failed")
+            for item in (det_qa_info.get("existing_test_smoke") or [])
+        )
+        return [] if smoke_covered else untested
+
+    def _needs_referenced_file_audit_gate(det_qa_info: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+        if ctx.blackboard.get("_ref_file_gate_enforced"):
+            return []
+        untouched = [
+            str(p) for p in (det_qa_info.get("untouched_referenced_files") or [])
+            if str(p).endswith(".rs") and "/tests/" not in str(p) and not str(p).startswith("tests/") and "/benches/" not in str(p)
+        ]
+        if not untouched:
+            return []
+        summary_low = (str(payload.get("summary") or "") + " " + str(payload.get("explanation") or "")).lower()
+        unaddressed: list[str] = []
+        for rf in untouched:
+            p = Path(rf)
+            # Check full path, parent dir + name (e.g. lexer/mod.rs), or non-generic stem
+            cands = {rf.lower(), f"{p.parent.name}/{p.name}".lower()}
+            if p.stem.lower() not in ("mod", "lib", "main"):
+                cands.add(p.stem.lower())
+            elif p.parent.name:
+                cands.add(p.parent.name.lower())
+            if not any(c in summary_low for c in cands):
+                unaddressed.append(rf)
+        return unaddressed
+
     def verifier_node(state_in: RepairGraphState) -> Command[Literal["fixer", "suggester", "navigator", "__end__"]]:
         det_qa = state_in.get("det_qa") or {}
         selected = det_qa["selected"]
@@ -5114,13 +5475,46 @@ def run_graph_agent(
         _update_milestones_and_kpi(ctx, "verifier", det_qa=det_qa, ver_payload=ver_payload)
 
         if decision == "APPROVE":
-            ctx.blackboard["_qa_repair_pending"] = False
-            ctx.blackboard.pop("_last_qa_payload", None)
-            ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
-            return _transition(
-                state_in, "verifier", END, "approve", ver_payload.get("summary", ""),
-                update={"final_patch": ctx.state.patch},
+            untested_needed = _needs_integration_verification_gate(det_qa, selected)
+            unaddressed_refs = _needs_referenced_file_audit_gate(det_qa, ver_payload) if not untested_needed else []
+            rem_gate = _client_remaining_calls(ctx.client)
+            can_retry_gate = (
+                ctx.qa_repair_loop_enabled
+                and ctx.qa_rounds < ctx.max_qa_rounds
+                and (rem_gate is None or rem_gate > ctx.budgets["verifier_reserve"] + 2)
             )
+            if untested_needed and can_retry_gate:
+                ctx.blackboard["_integration_gate_enforced"] = True
+                decision = "REJECT"
+                ver_payload = {
+                    **dict(ver_payload),
+                    "decision": "REJECT",
+                    "objections": [
+                        f"Integration/snapshot targets were not exercised after template/CLI edits: {', '.join(untested_needed[:4])}. "
+                        "Run cargo_test on the affected integration test target (with a targeted test_filter if large or networked) "
+                        "and inspect any tests/snapshots/ expectations before resubmitting."
+                    ],
+                }
+            elif unaddressed_refs and can_retry_gate:
+                ctx.blackboard["_ref_file_gate_enforced"] = True
+                decision = "REJECT"
+                ver_payload = {
+                    **dict(ver_payload),
+                    "decision": "REJECT",
+                    "objections": [
+                        f"Issue-referenced source file(s) left untouched without explicit audit justification: {', '.join(unaddressed_refs[:4])}. "
+                        "Verify whether the root-cause producer fix belongs in those referenced file(s) rather than only a downstream guard, "
+                        "and check any failing snapshot clusters before resubmitting."
+                    ],
+                }
+            else:
+                ctx.blackboard["_qa_repair_pending"] = False
+                ctx.blackboard.pop("_last_qa_payload", None)
+                ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
+                return _transition(
+                    state_in, "verifier", END, "approve", ver_payload.get("summary", ""),
+                    update={"final_patch": ctx.state.patch},
+                )
 
         ctx.blackboard["_qa_repair_pending"] = True
         ctx.blackboard["_last_qa_payload"] = dict(ver_payload)
@@ -5432,6 +5826,7 @@ def run_multi_agent(
                 stuck_now = state.stuck_status()
                 if _is_env_dependency_blocker(det_qa.get("reason", "")):
                     ctx.blackboard["environment_blocker"] = True
+                qa_streak = _record_det_qa_failure_streak(ctx, det_qa.get("reason", ""))
                 should_escalate_to_arch = (
                     not state.verified()
                     and not ctx.blackboard.get("environment_blocker")
@@ -5441,9 +5836,11 @@ def run_multi_agent(
                         fix_outcome == "stage_cap_reached"
                         or stuck_now["compile_repeats"] >= 2
                         or stuck_now["test_repeats"] >= 2
+                        or qa_streak >= 2
                     )
                 )
                 if should_escalate_to_arch:
+                    ctx.blackboard["_det_qa_sig_streak"] = 0
                     failure_route = _classify_failure_route(det_qa.get("reason", ""), stuck_now)
                     _record_escalation(
                         ctx,

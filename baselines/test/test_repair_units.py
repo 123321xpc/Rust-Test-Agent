@@ -415,3 +415,35 @@ def test_unit_refutation_signals_block_completion_and_trigger_escalation(setup, 
     assert coord._unit("a")["status"] == "active"
     assert coord._unit("b")["status"] == "pending"
     assert policy.data["pending"]["kind"] == "verification_counterevidence"
+
+
+def test_evomac_freezes_verified_units_preserves_across_empty_and_wording_replans_and_appends(setup):
+    _, state, tools, coord, _, board = setup
+    close_unit(tools, coord, "a")
+    assert board["repair_units"]["units"][0]["frozen"] is True
+    assert coord.select()["unit_id"] == "b"
+
+    # Freeze guard blocks reverting verified unit files while another unit is active.
+    blocked = coord.before_tool("revert_file", {"path": "src/a.rs"})
+    assert blocked and "verified repair unit 'a'" in blocked
+
+    # Empty replan must not wipe out an established unit DAG.
+    coord.configure({"ordered_edits": [], "repair_units": []}, [])
+    assert [u["unit_id"] for u in coord.units] == ["a", "b", "c", "d"]
+    assert coord._unit("a")["status"] == "verified"
+
+    # Wording tweaks on unit description/expected_outcome keep verified unit "a".
+    tweaked = plan()
+    tweaked["repair_units"][0]["description"] = "Reworded unit a"
+    tweaked["repair_units"][0]["expected_outcome"] = "a compiles"
+    coord.configure(tweaked, [])
+    assert coord._unit("a")["status"] == "verified"
+
+    # Incremental replan omitting verified unit "a" carries "a" forward cleanly.
+    inc = {
+        "ordered_edits": [{"file": "src/b.rs", "description": "Revised b"}],
+        "repair_units": [{"unit_id": "b", "description": "Unit b", "edit_indices": [0], "depends_on": []}],
+    }
+    coord.configure(inc, [])
+    assert [u["unit_id"] for u in coord.units] == ["a", "b"]
+    assert coord._unit("a")["status"] == "verified"

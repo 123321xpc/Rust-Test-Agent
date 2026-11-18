@@ -309,3 +309,45 @@ def test_enrich_diagnostic_symbol_lookup_respects_cache_and_deadline(tmp_path):
     diags_timeout = [{"level": "error", "code": "E0412", "message": "cannot find type `TargetStruct` in this scope"}]
     diagnostics.enrich_diagnostic_symbol_lookup(diags_timeout, root, mask_cache={}, time_budget_sec=-1.0)
     assert "auto_lookup" not in diags_timeout[0]
+
+
+def test_e0599_trait_import_lookup_and_machine_applicable_old_new_text(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    (root / "Cargo.toml").write_text('[package]\nname = "tr_demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "traits.rs").write_text("pub trait Helper {\n    fn assist(&self);\n}\n", encoding="utf-8")
+    (root / "src" / "lib.rs").write_text("pub mod traits;\nfn f(x: Box<i32>) { x.assist(); }\n", encoding="utf-8")
+
+    spec_ckg = importlib.util.spec_from_file_location("ckg_for_e0599_test", Path(__file__).with_name("rust_ckg.py"))
+    ckg_mod = importlib.util.module_from_spec(spec_ckg)
+    spec_ckg.loader.exec_module(ckg_mod)
+    ckg = ckg_mod.RustCodeGraph(root)
+
+    compiler_json = json.dumps({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "code": {"code": "E0599"},
+            "message": "no method named `assist` found for struct `Box<i32>` in the current scope",
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "line_start": 2,
+                "line_end": 2,
+                "column_start": 21,
+                "column_end": 22,
+                "is_primary": True,
+                "suggested_replacement": "(*x)",
+                "suggestion_applicability": "MachineApplicable",
+            }],
+            "children": [],
+        },
+    })
+    monkeypatch.setattr(diagnostics.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=compiler_json + "\n", stderr="", returncode=101))
+    check = diagnostics.make_cargo_check_tool(root, lambda path: (root / path).resolve(), ckg=ckg)
+    out = json.loads(check.invoke({}))
+    diag = out["diagnostics"][0]
+    assert "use tr_demo::traits::Helper;" in diag["auto_lookup"]
+    assert "unwrapping" in diag["auto_lookup"]
+    maf = diag["machine_applicable_fix"]
+    assert maf["old_text"] == "fn f(x: Box<i32>) { x.assist(); }"
+    assert maf["new_text"] == "fn f(x: Box<i32>) { (*x).assist(); }"

@@ -186,9 +186,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--value", help="Value for intervention")
     parser.add_argument("--intervention-file", help="JSON file specifying intervention")
     parser.add_argument("--rust-toolchain", default="1.72.0")
-    parser.add_argument("--max-api-calls", type=int, default=70)
+    parser.add_argument("--api-limit", type=int, default=None, help="Override API_LIMIT from .env (default: 70)")
+    parser.add_argument("--max-api-calls", type=int, default=None, help="Optional lower per-task limit for model HTTP calls")
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"), help="API interface from .env to use (default: yj)")
+    parser.add_argument("--model", help="Override the default MODEL value from the selected API interface")
     parser.add_argument("--dry-run", action="store_true", help="Print intervention plan and exit without calling model")
     args = parser.parse_args(argv)
+    if args.api_limit is not None and args.api_limit < 1:
+        parser.error("--api-limit must be a positive integer")
+    if args.max_api_calls is not None and args.max_api_calls < 1:
+        parser.error("--max-api-calls must be positive")
 
     ckpt_dir = Path(args.checkpoint).resolve()
     meta = _safe_load_json(ckpt_dir / "meta.json")
@@ -207,13 +214,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Intervention plan: {json.dumps(inv_spec, indent=2, ensure_ascii=False)}")
         return 0
 
+    import importlib.util
     from dotenv import load_dotenv
     load_dotenv(HERE.parent / ".env")
-    model = os.getenv("MODEL")
-    api_key = os.getenv("API_KEY")
-    base_url = os.getenv("BASE_URL")
-    if not model or not api_key:
-        parser.error("MODEL and API_KEY must be configured in .env")
+    spec = importlib.util.spec_from_file_location("validation_runner", HERE / "run.py")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    env = os.environ.copy()
+    try:
+        runner.resolve_api_env(env, api=args.api, model=args.model)
+        api_limit = runner.resolve_api_limit(env, api_limit=args.api_limit)
+    except ValueError as exc:
+        parser.error(str(exc))
+    max_api_calls = min(api_limit, args.max_api_calls) if args.max_api_calls is not None else api_limit
+    model = env["MODEL"]
+    api_key = env["API_KEY"]
+    base_url = env.get("BASE_URL") or None
 
     summary = run_intervention_task(
         repo=Path(args.repo).resolve(),
@@ -225,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         model=model,
         api_key=api_key,
         base_url=base_url,
-        max_api_calls=args.max_api_calls,
+        max_api_calls=max_api_calls,
         rust_toolchain=args.rust_toolchain,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))

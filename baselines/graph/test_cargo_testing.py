@@ -359,3 +359,22 @@ def test_cargo_test_passes_tests_started_on_aborted_process(project, monkeypatch
     assert res["status"] == "failed"
     assert res["tests_executed"] == 0
     assert seen_failure[0]["tests_started"] == 2
+
+
+def test_zero_tests_executed_emits_warning_except_no_run(project, monkeypatch):
+    _, tool = project
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", ""
+        ),
+    )
+    res = json.loads(tool.invoke({"test_filter": "nonexistent_case"}))
+    assert res["status"] == "passed"
+    assert res["tests_executed"] == 0
+    assert "Zero tests executed" in res["warning"]
+
+    no_run_res = json.loads(tool.invoke({"tests": True, "no_run": True}))
+    assert no_run_res["status"] == "passed"
+    assert "warning" not in no_run_res

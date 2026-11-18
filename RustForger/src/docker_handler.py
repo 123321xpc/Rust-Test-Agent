@@ -1,3 +1,4 @@
+import argparse
 import sys
 import json
 import docker
@@ -339,14 +340,49 @@ def load_instances(jsonl_path, filter_id=None, skip_existing_logs=False):
     return instances
 
 if __name__ == "__main__":
-    limit_value = os.environ.get("API_LIMIT", "70")
-    try:
-        if int(limit_value) < 1:
-            raise ValueError
-    except ValueError:
-        raise ValueError("API_LIMIT must be a positive integer") from None
-    if not os.environ.get("MODEL"):
-        raise ValueError("Set MODEL in the repository root .env file")
+    parser = argparse.ArgumentParser(description="RustForger Docker Runner")
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"),
+                        help="API interface from .env to use (default: yj)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Override the default model for the selected API interface")
+    parser.add_argument("--api-limit", type=int, default=None,
+                        help="Override API_LIMIT from .env (default: 70)")
+    args = parser.parse_args()
+    if args.model is not None and not args.model.strip():
+        parser.error("--model must not be empty")
+    model_override = args.model.strip() if args.model is not None else None
+    if args.api_limit is not None:
+        if args.api_limit < 1:
+            parser.error("--api-limit must be a positive integer")
+        os.environ["API_LIMIT"] = str(args.api_limit)
+    else:
+        limit_value = os.environ.get("API_LIMIT", "70")
+        try:
+            if int(limit_value) < 1:
+                raise ValueError
+        except ValueError:
+            parser.error("API_LIMIT must be a positive integer")
+    if args.api is not None:
+        prefix = args.api.upper()
+        base_url = os.environ.get(f"{prefix}_BASE_URL")
+        api_key = os.environ.get(f"{prefix}_API_KEY")
+        model_name = model_override or os.environ.get(f"{prefix}_MODEL")
+        if not base_url or not api_key or not model_name:
+            parser.error(f"Set {prefix}_BASE_URL, {prefix}_API_KEY, and {prefix}_MODEL (or --model) in .env")
+        os.environ["BASE_URL"] = base_url
+        os.environ["API_KEY"] = api_key
+        os.environ["MODEL"] = model_name
+    elif os.environ.get("API_KEY") and (model_override or os.environ.get("MODEL")):
+        os.environ["MODEL"] = model_override or os.environ["MODEL"]
+    else:
+        base_url = os.environ.get("YJ_BASE_URL")
+        api_key = os.environ.get("YJ_API_KEY")
+        model_name = model_override or os.environ.get("YJ_MODEL")
+        if not base_url or not api_key or not model_name:
+            parser.error("Set YJ_*/DS_* (or MODEL and API_KEY) in the repository root .env file")
+        os.environ["BASE_URL"] = base_url
+        os.environ["API_KEY"] = api_key
+        os.environ["MODEL"] = model_name
     worker = 1
 
     instances = load_instances('./data/rustbench-all.jsonl', ['tokio-rs__bytes-253'])

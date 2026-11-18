@@ -122,3 +122,77 @@ def test_consumer_scan_uses_a_single_repository_pass(tmp_path):
     consumers = impact._consumer_symbols(ckg, ["alpha", "beta"], exclude_paths=set(), limit=12)
     assert calls["count"] == 1, "one repository scan must cover every changed symbol"
     assert {c["path"] for c in consumers} == {"src/consumer.rs"}
+
+
+def test_impact_surface_detects_wildcard_matches_and_dead_enum_variants(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    (src / "token.rs").write_text("pub enum Kind {\n    Num,\n    Bogus,\n}\n", encoding="utf-8")
+    (src / "parser.rs").write_text(
+        "pub fn parse(k: crate::token::Kind) -> i32 {\n"
+        "    match k {\n"
+        "        Kind::Num => 1,\n"
+        "        _ => -1,\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    impact = _load("impact_module")
+    ckg = _ckg(tmp_path)
+    surface = impact.build_impact_surface(ckg, ["src/token.rs"])
+    assert surface["wildcard_matches"]
+    assert surface["wildcard_matches"][0]["path"] == "src/parser.rs"
+    assert "Wildcard `_ =>`" in impact.format_impact_surface(surface)
+
+    diff = (
+        "diff --git a/src/token.rs b/src/token.rs\n"
+        "--- a/src/token.rs\n+++ b/src/token.rs\n"
+        "@@ -1,3 +1,4 @@\n pub enum Kind {\n     Num,\n+    Bogus,\n }\n"
+    )
+    dead = impact.find_dead_enum_variant_producers(ckg, diff, requested_symbols=[])
+    assert dead and dead[0]["variant"] == "Bogus"
+
+
+def test_collect_sibling_contracts_extracts_trait_docs_siblings_and_paired_methods(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    (src / "buf.rs").write_text(
+        "pub trait BufMut {\n"
+        "    /// # Panics\n"
+        "    /// Panics if cnt exceeds remaining.\n"
+        "    fn advance_mut(&mut self, cnt: usize);\n"
+        "}\n"
+        "impl BufMut for Vec<u8> {\n"
+        "    fn advance_mut(&mut self, cnt: usize) {\n"
+        "        assert!(cnt <= 8, \"cannot advance\");\n"
+        "    }\n"
+        "}\n"
+        "pub struct Time;\n"
+        "impl Time {\n"
+        "    pub fn timestamp_micros_opt(&self) -> Option<i64> { Some(0) }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    impact = _load("impact_module")
+    contracts = impact.collect_sibling_contracts(_ckg(tmp_path), ["advance_mut", "timestamp_micros"])
+    assert contracts["trait_docs"]
+    assert contracts["sibling_impls"]
+    assert contracts["paired_methods"] and contracts["paired_methods"][0]["symbol"] == "timestamp_micros_opt"
+    formatted = impact.format_sibling_contracts(contracts)
+    assert "cannot advance" in formatted
+    assert "timestamp_micros_opt" in formatted
+
+
+def test_collect_sibling_contracts_surfaces_std_wrapper_impls(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    (src / "ser.rs").write_text(
+        "pub trait Serialize { fn serialize(&self); }\n"
+        "impl<T: Serialize> Serialize for Wrapping<T> {\n"
+        "    fn serialize(&self) {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    impact = _load("impact_module")
+    contracts = impact.collect_sibling_contracts(_ckg(tmp_path), ["Saturating", "Serialize"])
+    assert any(s["symbol"] == "Serialize for Wrapping" for s in contracts["sibling_impls"])

@@ -3,12 +3,36 @@ set -euo pipefail
 ROOT="$HOME/xpc"
 export LD_LIBRARY_PATH="$ROOT/gcc-12/lib:$ROOT/gcc-12/x86_64-conda-linux-gnu/lib:${LD_LIBRARY_PATH:-}"
 cd "$ROOT"
-if [[ "${1:-}" == "--background" ]]; then
-  shift
-  mkdir -p "$ROOT/validation/launcher-logs"
-  log="$ROOT/validation/launcher-logs/$(date +%Y%m%d_%H%M%S)_$$.log"
-  setsid nohup "$ROOT/validation/validate" "$@" >"$log" 2>&1 < /dev/null &
-  printf 'Started PID %s\nLog: %s\n' "$!" "$log"
-  exit 0
+
+foreground=0
+dry_or_info=0
+args=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --foreground)
+      foreground=1
+      ;;
+    --background)
+      ;;
+    --list|--dry-run|-h|--help)
+      dry_or_info=1
+      args+=("$arg")
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+if [[ "$foreground" -eq 1 || "$dry_or_info" -eq 1 ]]; then
+  exec "$ROOT/envs/rustbench/bin/python" "$ROOT/validation/run.py" ${args[@]+"${args[@]}"}
 fi
-exec "$ROOT/envs/rustbench/bin/python" "$ROOT/validation/run.py" "$@"
+
+# Default to background: Fail synchronously when configuration or images are unavailable.
+"$ROOT/envs/rustbench/bin/python" "$ROOT/validation/run.py" ${args[@]+"${args[@]}"} --dry-run
+mkdir -p "$ROOT/validation/launcher-logs"
+log="$ROOT/validation/launcher-logs/$(date +%Y%m%d_%H%M%S)_$$.log"
+setsid nohup "$ROOT/envs/rustbench/bin/python" "$ROOT/validation/run.py" ${args[@]+"${args[@]}"} >"$log" 2>&1 < /dev/null &
+printf 'Started PID %s\nLog: %s\n' "$!" "$log"
+exit 0

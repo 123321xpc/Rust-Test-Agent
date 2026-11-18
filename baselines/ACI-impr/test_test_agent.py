@@ -229,6 +229,39 @@ def test_invalid_api_limit(agent_module, monkeypatch, tmp_path, value):
         agent_module.main()
 
 
+def test_cli_api_limit_and_default_yj_interface(agent_module, monkeypatch, tmp_path):
+    issue = tmp_path / "issue.txt"
+    issue.write_text("issue", encoding="utf-8")
+    for k in ("API_KEY", "MODEL", "BASE_URL", "API_LIMIT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("API_LIMIT", "10")
+    monkeypatch.setenv("YJ_BASE_URL", "https://yj.example/v1")
+    monkeypatch.setenv("YJ_API_KEY", "yj-key")
+    monkeypatch.setenv("YJ_MODEL", "yj-model")
+    monkeypatch.setenv("DS_BASE_URL", "https://ds.example/v1")
+    monkeypatch.setenv("DS_API_KEY", "ds-key")
+    monkeypatch.setenv("DS_MODEL", "ds-model")
+    monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
+    monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
+    run = Mock(return_value="diff --git a/a b/a\n")
+    monkeypatch.setattr(agent_module, "run_agent", run)
+
+    argv = ["agent.py", "--repo", str(tmp_path), "--instance-id", "id", "--issue-file", str(issue),
+            "--output", str(tmp_path / "out.jsonl"), "--rust-toolchain", "1.72.0", "--api-limit", "25"]
+    monkeypatch.setattr(sys, "argv", argv)
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "yj-model", "yj-key", "https://yj.example/v1")
+    assert run.call_args.kwargs["max_api_calls"] == 25
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds"])
+    agent_module.main()
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "ds-model", "ds-key", "https://ds.example/v1")
+
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds", "--api-limit", "0"])
+    with pytest.raises(SystemExit):
+        agent_module.main()
+
+
 def test_run_agent_auto_submits_verified_changes_when_api_limit_reached(agent_module, monkeypatch, tmp_path):
     (tmp_path / "lib.rs").write_text("before\n", encoding="utf-8")
     monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
@@ -485,3 +518,64 @@ def test_compress_history_messages_compacts_stale_file_reads(agent_module):
     compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=6, test_cutoff_steps=1)
     assert "subsequent step" in compressed[2].content
     assert "1: fn bar()" in compressed[6].content
+
+
+def test_compress_history_invalidates_on_revert_and_folds_old_errors_to_one_line(agent_module):
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    msgs = [
+        HumanMessage(content="start"),
+        AIMessage(content="", tool_calls=[{"id": "c0", "name": "read_lines", "args": {"path": "./src/lib.rs"}}]),
+        ToolMessage(content="1: fn a() {}\n" * 30, tool_call_id="c0"),
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "edit_file", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="Error editing src/lib.rs: old_text was not found.\n[Region hint: lines 1-5:\n1: a\n2: b\n3: c\n4: d\n5: e\n6: f\n7: g]", tool_call_id="c1"),
+        AIMessage(content="", tool_calls=[{"id": "c2", "name": "revert_file", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="Reverted src/lib.rs to its original state.", tool_call_id="c2"),
+        AIMessage(content="", tool_calls=[{"id": "c3", "name": "read_lines", "args": {"path": "src/other.rs"}}]),
+        ToolMessage(content="1: ok\n", tool_call_id="c3"),
+    ]
+    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=2, test_cutoff_steps=1)
+    assert "subsequent step" in compressed[2].content
+    assert "\n" not in compressed[4].content
+    assert "earlier edit_file error omitted" in compressed[4].content
+    assert "Example workflow (Demonstration):" in agent_module.SYSTEM_PROMPT
+
+
+def test_continuation_prompt_truncates_long_last_submit_error(agent_module):
+    long_err = "E" * 1200
+    state = SimpleNamespace(
+        _last_submit_error=long_err,
+        verified=lambda: False,
+        changed_paths=lambda: [],
+        missing_verification_steps=lambda: "",
+    )
+    client = SimpleNamespace(remaining_calls=50)
+    prompt = agent_module._continuation_prompt(state, client)
+    assert "E" * 500 in prompt
+    assert "E" * 501 not in prompt
+
+
+def test_run_agent_idle_uses_unverified_fallback_after_test_attempt(agent_module, monkeypatch, tmp_path):
+    (tmp_path / "lib.rs").write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(agent_module, "ChatOpenAI", Mock())
+    make_tools = agent_module.make_tools
+
+    def capture_state(repo):
+        return make_tools(repo)
+
+    monkeypatch.setattr(agent_module, "make_tools", capture_state)
+    calls = []
+
+    def invoke(inputs, config):
+        calls.append(len(inputs["messages"]))
+        if len(calls) == 1:
+            tools = {t.name: t for t in create.call_args.kwargs["tools"]}
+            tools["write_file"].invoke({"path": "lib.rs", "content": "after_idle\n"})
+            tools["write_regression_test"].invoke({"path": "tests/test_regression_idle.rs", "content": "#[test] fn t() {}\n"})
+        return {"messages": inputs["messages"] + [{"role": "assistant", "content": "Stopped."}]}
+
+    create = Mock(return_value=SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(agent_module, "create_agent", create)
+    trace = Mock()
+    patch = agent_module.run_agent(tmp_path, "issue", "model", "key", trace=trace)
+    assert "+after_idle" in patch and "test_regression_idle.rs" not in patch
+    trace.record.assert_called_once_with("auto_submit_on_idle", patch=patch)

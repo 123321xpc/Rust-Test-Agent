@@ -3,7 +3,7 @@
 Supports:
 - Rust lexical tokenization (comments, nested block comments, raw/byte/c strings, lifetimes vs chars)
 - Structural extraction (mod, pub use re-exports, struct/enum/trait/type/impl/fn/macro)
-- Accurate function body spans & #[test]/#[cfg(test)] separation (also used by rust_trace)
+- Accurate function body spans & #[test]/#[cfg(test)] separation
 - Incremental per-file cache keyed by (mtime_ns, size)
 - Neighborhood queries (definitions, public re-export paths, trait impls, callers, callees)
 - Multi-chain candidate fault propagation paths along call/trait/re-export edges

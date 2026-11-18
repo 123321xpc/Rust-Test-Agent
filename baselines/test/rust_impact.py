@@ -37,6 +37,8 @@ def _changed_symbols(ckg: Any, rel_path: str) -> list[dict[str, Any]]:
             "vis": item.get("vis", ""),
             "enclosing": item.get("enclosing", ""),
         })
+        if item.get("variants"):
+            out[-1]["variants"] = list(item["variants"])
     return out
 
 
@@ -61,13 +63,16 @@ def _changed_symbols_for_lines(ckg: Any, rel_path: str, line_numbers: list[int])
         start = int(item.get("line", 0) or 0)
         end = int(item.get("end_line", start) or start)
         if any(start <= number <= end for number in line_numbers):
-            out.append({
+            entry = {
                 "name": item.get("name", ""),
                 "kind": item.get("kind", ""),
                 "line": item.get("line", 0),
                 "vis": item.get("vis", ""),
                 "enclosing": item.get("enclosing", ""),
-            })
+            }
+            if item.get("variants"):
+                entry["variants"] = list(item["variants"])
+            out.append(entry)
     return out
 
 
@@ -197,6 +202,47 @@ def _trait_impl_surfaces_many(ckg: Any, symbols: list[str], limit: int = 10) -> 
     return out
 
 
+def _wildcard_match_surfaces(
+    ckg: Any,
+    enum_names: set[str],
+    variant_names: set[str],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Find non-test `match ... { ..., _ => ... }` sites referencing modified enums or variants."""
+    if not enum_names and not variant_names:
+        return []
+    try:
+        all_files = ckg._all_parsed(exclude_tests=True)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for parsed in all_files:
+        for wm in getattr(parsed, "wildcard_matches", ()):
+            if wm.get("is_test"):
+                continue
+            w_types = set(wm.get("types") or ())
+            w_vars = set(wm.get("variants") or ())
+            matched_types = sorted(w_types & enum_names)
+            matched_vars = sorted(w_vars & variant_names)
+            if not matched_types and not matched_vars:
+                continue
+            key = (parsed.rel_path, int(wm.get("line") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "path": parsed.rel_path,
+                "line": wm.get("line", 0),
+                "fn": wm.get("fn", ""),
+                "enclosing": wm.get("enclosing") or "",
+                "matched_types": matched_types or matched_vars[:3],
+            })
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def build_impact_surface(
     ckg: Any,
     changed_paths: list[str],
@@ -207,18 +253,32 @@ def build_impact_surface(
 ) -> dict[str, Any]:
     """Build the producer->consumer impact surface for a set of changed production files."""
     if ckg is None or not changed_paths:
-        return {"files": [], "consumers": [], "trait_impls": [], "cross_file": False}
+        return {"files": [], "consumers": [], "trait_impls": [], "wildcard_matches": [], "cfg_features": [], "cross_file": False}
     rels = [p for p in changed_paths if p and p.endswith(".rs")]
     files: list[dict[str, Any]] = []
     consumers: list[dict[str, Any]] = []
     impls: list[dict[str, Any]] = []
+    cfg_features: list[str] = []
+    enum_names: set[str] = set()
+    variant_names: set[str] = set()
     for rel in rels[:12]:
         line_numbers = (changed_lines or {}).get(rel) or []
         symbols = (
             _changed_symbols_for_lines(ckg, rel, line_numbers)
             if line_numbers else _changed_symbols(ckg, rel)
         )
+        if hasattr(ckg, "features_for_file_lines"):
+            for feat in ckg.features_for_file_lines(rel, line_numbers or None):
+                if feat not in cfg_features:
+                    cfg_features.append(feat)
         top = symbols[:max_symbols_per_file]
+        for sym in top:
+            if sym.get("kind") == "enum":
+                if sym.get("name"):
+                    enum_names.add(str(sym["name"]))
+                for v in sym.get("variants") or ():
+                    if len(str(v)) >= 3:
+                        variant_names.add(str(v))
         files.append({
             "path": rel,
             "symbols": top,
@@ -241,6 +301,7 @@ def build_impact_surface(
                 "",
             )
             impls.append(impl)
+    wildcard_matches = _wildcard_match_surfaces(ckg, enum_names, variant_names, limit=10)
     seen_c: set[tuple[str, int, str]] = set()
     unique_consumers = []
     for item in consumers:
@@ -257,11 +318,16 @@ def build_impact_surface(
             continue
         seen_i.add(key)
         unique_impls.append(item)
-    consumer_paths = sorted({c.get("path", "") for c in unique_consumers if c.get("path")})
+    consumer_paths = sorted(
+        {c.get("path", "") for c in unique_consumers if c.get("path")}
+        | {w.get("path", "") for w in wildcard_matches if w.get("path") and w.get("path") not in rels}
+    )
     return {
         "files": files,
         "consumers": unique_consumers[: max_consumers * 2],
         "trait_impls": unique_impls[: max_consumers],
+        "wildcard_matches": wildcard_matches,
+        "cfg_features": cfg_features,
         "consumer_paths": consumer_paths,
         "cross_file": bool(consumer_paths),
     }
@@ -296,6 +362,18 @@ def format_impact_surface(surface: dict[str, Any], *, max_chars: int = 4000) -> 
                 f"impl {item.get('trait') or '?'} for {item.get('for_type') or '?'} "
                 f"(references {item.get('producer_symbol')})"
             )
+    wildcards = surface.get("wildcard_matches") or []
+    if wildcards:
+        lines.append("Wildcard `_ =>` match sites on modified enums (rustc will NOT warn on new/changed variants):")
+        for wm in wildcards[:8]:
+            fn_label = f"{wm.get('fn')}()" if wm.get("fn") else "match"
+            lines.append(
+                f"  * {wm.get('path')}:{wm.get('line')} {fn_label} "
+                f"(wildcard match on {', '.join(wm.get('matched_types') or [])})"
+            )
+    cfgs = surface.get("cfg_features") or []
+    if cfgs:
+        lines.append(f"#[cfg(feature = ...)] gates enclosing modified items: {', '.join(cfgs)}")
     if surface.get("cross_file"):
         lines.append(
             "Cross-file impact detected: verify every listed consumer handles the new producer output "
@@ -330,6 +408,82 @@ _CONTRACT_PANIC_RE = re.compile(
 )
 
 
+_TRAIT_IMPL_HDR_RE = re.compile(r"\bimpl\b(?:<[^>]*>)?\s+([A-Za-z_][A-Za-z0-9_:<>]*)\s+for\s+([A-Za-z_][A-Za-z0-9_:<>]*)")
+
+
+def _extract_trait_from_enclosing(enclosing: str) -> str:
+    m = _TRAIT_IMPL_HDR_RE.search(enclosing or "")
+    if not m:
+        return ""
+    return m.group(1).split("<")[0].split("::")[-1].strip()
+
+
+def find_dead_enum_variant_producers(
+    ckg: Any,
+    patch_text: str,
+    *,
+    requested_symbols: list[str] | tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Detect newly added enum variants in `patch_text` that have zero non-test references while wildcard `_ =>` matches exist."""
+    if ckg is None or not patch_text:
+        return []
+    req_set = {str(s).split("::")[-1].removeprefix("r#") for s in requested_symbols if s}
+    try:
+        all_files = ckg._all_parsed(exclude_tests=True)
+    except Exception:
+        return []
+    variants_by_file: dict[str, dict[str, str]] = {}
+    for pf in all_files:
+        for it in pf.items:
+            if not it.get("is_test") and it.get("kind") == "enum":
+                vmap = variants_by_file.setdefault(pf.rel_path.replace("\\", "/"), {})
+                for v in it.get("variants") or ():
+                    vmap[str(v)] = str(it.get("name") or "")
+
+    added_variants: list[tuple[str, str, str]] = []
+    cur_file = ""
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            cur_file = line[6:].strip()
+            continue
+        if cur_file not in variants_by_file:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            body = line[1:].strip()
+            vm = re.match(r"^([A-Z][A-Za-z0-9_]*)\s*(?:\(|{|,|=|$)", body)
+            if vm:
+                vname = vm.group(1)
+                owner = variants_by_file[cur_file].get(vname)
+                if owner and vname not in req_set:
+                    added_variants.append((cur_file, vname, owner))
+    if not added_variants:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for prod_file, vname, owner in added_variants[:6]:
+        has_consumer_ref = False
+        for pf in all_files:
+            for it in pf.items:
+                if it.get("is_test"):
+                    continue
+                if vname in (it.get("type_refs") or ()):
+                    has_consumer_ref = True
+                    break
+            if has_consumer_ref:
+                break
+        if has_consumer_ref:
+            continue
+        wms = _wildcard_match_surfaces(ckg, {owner}, {vname}, limit=4)
+        if wms:
+            findings.append({
+                "file": prod_file,
+                "variant": vname,
+                "enums": [owner],
+                "wildcard_matches": [f"{w['path']}:{w['line']}" for w in wms],
+            })
+    return findings
+
+
 def collect_sibling_contracts(
     ckg: Any,
     target_symbols: list[str],
@@ -337,20 +491,20 @@ def collect_sibling_contracts(
     exclude_paths: set[str] | None = None,
     max_entries: int = 5,
 ) -> dict[str, Any]:
-    """Extract panic/assert contract patterns from sibling impls and existing tests."""
+    """Extract panic/assert contract patterns, trait siblings, and paired methods from CKG."""
     if ckg is None or not target_symbols:
-        return {"sibling_impls": [], "test_contracts": []}
+        return {"sibling_impls": [], "test_contracts": [], "trait_docs": [], "paired_methods": []}
     wanted = {
         str(s).split("::")[-1].removeprefix("r#")
         for s in target_symbols
         if str(s).strip() and len(str(s).split("::")[-1]) >= 3
     }
     if not wanted:
-        return {"sibling_impls": [], "test_contracts": []}
+        return {"sibling_impls": [], "test_contracts": [], "trait_docs": [], "paired_methods": []}
     try:
         all_files = ckg._all_parsed(exclude_tests=False)
     except Exception:
-        return {"sibling_impls": [], "test_contracts": []}
+        return {"sibling_impls": [], "test_contracts": [], "trait_docs": [], "paired_methods": []}
 
     excluded = {p.replace("\\", "/") for p in (exclude_paths or ())}
     file_lines_cache: dict[str, list[str]] = {}
@@ -364,10 +518,25 @@ def collect_sibling_contracts(
                 file_lines_cache[rel_path] = []
         return file_lines_cache[rel_path]
 
+    # Identify Trait names associated with wanted methods (e.g., impl BufMut for ...)
+    target_traits: set[str] = set()
+    for parsed in all_files:
+        for item in parsed.items:
+            if item.get("is_test") or item.get("kind") != "fn":
+                continue
+            if str(item.get("name") or "").removeprefix("r#") in wanted:
+                tr = _extract_trait_from_enclosing(str(item.get("enclosing") or ""))
+                if tr:
+                    target_traits.add(tr)
+
     sibling_impls: list[dict[str, Any]] = []
     test_contracts: list[dict[str, Any]] = []
+    trait_docs: list[dict[str, Any]] = []
+    paired_methods: list[dict[str, Any]] = []
     seen_sib: set[tuple[str, int]] = set()
     seen_tst: set[tuple[str, int]] = set()
+    seen_tdoc: set[tuple[str, int]] = set()
+    seen_pair: set[tuple[str, str]] = set()
 
     for parsed in all_files:
         rel = parsed.rel_path.replace("\\", "/")
@@ -382,6 +551,48 @@ def collect_sibling_contracts(
                 continue
 
             if not item.get("is_test") and not is_test_file:
+                enc = str(item.get("enclosing") or "")
+                enc_trait = _extract_trait_from_enclosing(enc)
+                # Extract trait definition doc/panics for wanted methods on target_traits
+                if (
+                    enc.startswith(("pub trait ", "trait "))
+                    and name in wanted
+                    and len(trait_docs) < max_entries
+                    and (rel, start) not in seen_tdoc
+                ):
+                    lines = _get_lines(rel)
+                    doc_lines = []
+                    for back in range(max(0, start - 20), start - 1):
+                        ln_s = lines[back].strip()
+                        if ln_s.startswith("///"):
+                            doc_lines.append(ln_s[3:].strip())
+                    if any(k in "\n".join(doc_lines).lower() for k in ("panic", "error", "safety")):
+                        seen_tdoc.add((rel, start))
+                        trait_docs.append({
+                            "path": rel,
+                            "line": start,
+                            "symbol": name,
+                            "enclosing": enc[:80],
+                            "doc": " ".join(doc_lines[-4:])[:240],
+                        })
+
+                # Detect companion methods in same impl/file (e.g. foo_opt <-> foo, len <-> is_empty)
+                for w in wanted:
+                    companion = None
+                    if name == f"{w}_opt" or (w.endswith("_opt") and name == w[:-4]):
+                        companion = name
+                    elif w == "len" and name == "is_empty":
+                        companion = name
+                    if companion and (rel, companion) not in seen_pair and len(paired_methods) < max_entries:
+                        seen_pair.add((rel, companion))
+                        paired_methods.append({
+                            "path": rel,
+                            "line": start,
+                            "symbol": companion,
+                            "enclosing": enc[:80],
+                            "context": str(item.get("context") or "")[:160],
+                        })
+
                 if name not in wanted or rel in excluded:
                     continue
                 key = (rel, start)
@@ -394,19 +605,23 @@ def collect_sibling_contracts(
                 clauses: list[str] = []
                 for idx, ln in enumerate(snippet_lines):
                     if _CONTRACT_PANIC_RE.search(ln):
-                        # Capture up to 2 lines if panic!/assert! wraps onto next line
                         block = " ".join(x.strip() for x in snippet_lines[idx:idx + 2])
                         if '"' in block:
                             clauses.append(block[:180])
                     if len(clauses) >= 2:
                         break
+                # Also capture compact body summary for trait siblings even without explicit panic string
+                if not clauses and enc_trait and enc_trait in target_traits and item.get("has_body"):
+                    body_summary = " ".join(x.strip() for x in snippet_lines[:5])[:180]
+                    if body_summary:
+                        clauses.append(body_summary)
                 if clauses:
                     seen_sib.add(key)
                     sibling_impls.append({
                         "path": rel,
                         "line": start,
                         "symbol": name,
-                        "enclosing": str(item.get("enclosing") or "")[:100],
+                        "enclosing": enc[:100],
                         "clauses": clauses,
                     })
             else:
@@ -441,21 +656,68 @@ def collect_sibling_contracts(
                         "hints": hints,
                     })
 
-    return {"sibling_impls": sibling_impls, "test_contracts": test_contracts}
+    # Surface sibling std-wrapper trait impls (e.g. impl Serialize/Deserialize for Wrapping<T>)
+    wrapper_types = {
+        "Wrapping", "Reverse", "ManuallyDrop", "Cell", "RefCell", "OnceCell", "Pin", "PhantomData",
+        "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64", "NonZeroU128", "NonZeroUsize",
+        "NonZeroI8", "NonZeroI16", "NonZeroI32", "NonZeroI64", "NonZeroI128", "NonZeroIsize",
+    }
+    trait_candidates = target_traits | {w for w in wanted if w[:1].isupper()}
+    if trait_candidates and len(sibling_impls) < max_entries:
+        for parsed in all_files:
+            rel = parsed.rel_path.replace("\\", "/")
+            if rel in excluded or rel.startswith("tests/") or "/tests/" in rel or rel.endswith(("_test.rs", "tests.rs")):
+                continue
+            for ib in parsed.impl_blocks:
+                if ib.get("is_test"):
+                    continue
+                tr = str(ib.get("trait") or "").split("::")[-1].removeprefix("r#")
+                ft = str(ib.get("for_type") or "").split("::")[-1].removeprefix("r#")
+                ib_line = int(ib.get("line") or 0)
+                if tr in trait_candidates and ft in wrapper_types and ib_line > 0 and (rel, ib_line) not in seen_sib:
+                    lines = _get_lines(rel)
+                    excerpt = " ".join(x.strip() for x in lines[max(0, ib_line - 3):min(len(lines), ib_line + 3)] if x.strip())[:180]
+                    if excerpt:
+                        seen_sib.add((rel, ib_line))
+                        sibling_impls.append({
+                            "path": rel,
+                            "line": ib_line,
+                            "symbol": f"{tr} for {ft}",
+                            "enclosing": str(ib.get("header") or "")[:100],
+                            "clauses": [excerpt],
+                        })
+                        if len(sibling_impls) >= max_entries:
+                            break
+            if len(sibling_impls) >= max_entries:
+                break
+
+    return {
+        "sibling_impls": sibling_impls,
+        "test_contracts": test_contracts,
+        "trait_docs": trait_docs,
+        "paired_methods": paired_methods,
+    }
 
 
 def format_sibling_contracts(contracts: dict[str, Any] | None, *, max_chars: int = 1600) -> str:
-    """Format sibling implementation panic/assert wording and existing test contracts."""
+    """Format sibling implementation panic/assert wording, trait docs, paired methods, and test contracts."""
     if not contracts:
         return ""
     sibs = contracts.get("sibling_impls") or []
     tests = contracts.get("test_contracts") or []
-    if not sibs and not tests:
+    tdocs = contracts.get("trait_docs") or []
+    paired = contracts.get("paired_methods") or []
+    if not sibs and not tests and not tdocs and not paired:
         return ""
     lines: list[str] = ["Sibling & Existing Test Contracts (match established error/panic wording and invariants):"]
+    for td in tdocs:
+        lines.append(f"- {td['path']}:{td['line']} trait `{td['symbol']}` ({td['enclosing']}): {td['doc']}")
     for s in sibs:
         enc = f" in `{s['enclosing']}`" if s.get("enclosing") else ""
         lines.append(f"- {s['path']}:{s['line']} `{s['symbol']}`{enc}: {' | '.join(s['clauses'])}")
+    for pm in paired:
+        enc = f" in `{pm['enclosing']}`" if pm.get("enclosing") else ""
+        lines.append(f"- Companion API {pm['path']}:{pm['line']} `{pm['symbol']}`{enc}: {pm['context']}")
     for t in tests:
         lines.append(f"- {t['path']}:{t['line']} test `{t['test_name']}`: {' | '.join(t['hints'])}")
     out = "\n".join(lines)

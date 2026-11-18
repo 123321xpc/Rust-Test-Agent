@@ -31,13 +31,65 @@ def _format_context_matches(rel_posix, file_lines, matched_numbers, context_line
     return "\n--\n".join(blocks)
 
 
+def _format_file_match_summary(
+    total_matches: int,
+    file_match_counts: dict[str, int],
+    *,
+    overflow: bool = False,
+    max_results: int = 50,
+    max_files: int = 50,
+) -> str:
+    if not file_match_counts:
+        return "(no matches)"
+    if overflow:
+        header = (
+            f"Search returned too many results ({total_matches} matches across {len(file_match_counts)} file(s), "
+            f"exceeding max_results={max_results}; results truncated). "
+            "Refine your query, narrow `path`, or set `exclude_tests=True`:"
+        )
+    else:
+        header = f"Found {total_matches} matches across {len(file_match_counts)} files:"
+    lines = [header]
+    items = list(file_match_counts.items())
+    for fpath, cnt in items[:max_files]:
+        lines.append(f"  {fpath}: {cnt} match(es)")
+    if len(items) > max_files:
+        lines.append(f"  ... ({len(items) - max_files} more files omitted; narrow `path` or `query`)")
+    return "\n".join(lines)
+
+
+def extract_common_test_imports(manifest_file: Path, import_name: str = "") -> list[str]:
+    """Extract common `use <crate>::...;` imports from existing `tests/*.rs` files in a crate."""
+    tests_dir = manifest_file.parent / "tests"
+    if not tests_dir.is_dir():
+        return []
+    seen: list[str] = []
+    prefix = f"use {import_name}::" if import_name else "use "
+    for tf in sorted(tests_dir.glob("*.rs"))[:4]:
+        if tf.name.startswith(("test_regression_", "normal_regression_")):
+            continue
+        try:
+            for line in tf.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+                s = line.strip()
+                if s.startswith(prefix) and s.endswith(";") and len(s) <= 140:
+                    if s not in seen:
+                        seen.append(s)
+                        if len(seen) >= 5:
+                            return seen
+        except OSError:
+            continue
+    return seen
+
+
 def make_rust_tools(root, resolve_path, env=None):
     @tool
-    def read_lines(path: str, start_line: int = 1, end_line: int = 200) -> str:
-        """Read a UTF-8 file with 1-based inclusive line numbers (at most 500 lines)."""
+    def read_lines(path: str, start_line: int = 1, end_line: int | None = None) -> str:
+        """Read a UTF-8 file with 1-based inclusive line numbers (defaults to a 100-line window; at most 500 lines)."""
         try:
             if start_line < 1:
                 raise ValueError("start_line must be at least 1")
+            if end_line is None:
+                end_line = start_line + 99
             if end_line < start_line:
                 raise ValueError("end_line must be greater than or equal to start_line")
             clamped_notice = ""
@@ -45,29 +97,44 @@ def make_rust_tools(root, resolve_path, env=None):
                 end_line = start_line + 499
                 clamped_notice = f"\n[Notice: requested range exceeded 500 lines; clamped to {start_line}-{end_line}]"
             target = resolve_path(path)
+            if target.is_dir():
+                return "\n".join(p.name + ("/" if p.is_dir() else "") for p in sorted(target.iterdir()) if p.name != ".git") or "(empty directory)"
+            rel_posix = target.relative_to(root).as_posix()
             lines = []
+            total_lines = 0
             with target.open(encoding="utf-8") as stream:
                 for number, line in enumerate(stream, 1):
-                    if number > end_line:
-                        break
-                    if number >= start_line:
+                    total_lines = number
+                    if start_line <= number <= end_line:
                         lines.append(f"{number}: {line.rstrip(chr(10)).rstrip(chr(13))}")
-            result = "\n".join(lines) if lines else "(no lines in range)"
-            return result + clamped_notice
+            parts = [f"[File: {rel_posix} ({total_lines} lines total)]"]
+            if total_lines == 0:
+                parts.append("(empty file)")
+            elif not lines:
+                parts.append("(no lines in range)")
+            else:
+                if start_line > 1:
+                    parts.append(f"({min(start_line - 1, total_lines)} lines above)")
+                parts.extend(lines)
+                actual_end = start_line + len(lines) - 1
+                if actual_end < total_lines:
+                    parts.append(f"({total_lines - actual_end} lines below)")
+            return "\n".join(parts) + clamped_notice
         except (OSError, UnicodeError, ValueError) as exc:
             return f"Error reading lines: {exc}"
 
     @tool
     def search_code(query: str = "", path: str = ".", file_glob: str = "*.rs", regex: bool = False,
-                    max_results: int = 100, context_lines: int = 0, multiline: bool = False,
+                    max_results: int = 50, context_lines: int = 0, multiline: bool = False,
                     exclude_tests: bool = False, summarize: bool = False) -> str:
         """Search UTF-8 code by literal text or regex, reporting repository-relative file and line; defaults to Rust files.
 
+        Defaults to max_results=50; when matches exceed max_results, returns a per-file match summary instead of truncated code lines to avoid misleading partial results.
         Set context_lines (0 to 20) to include surrounding lines for each match.
         Set multiline=True to match cross-line signatures or statements where whitespace may span multiple lines.
         Set exclude_tests=True to skip tests/ and benches/ directories.
         Set summarize=True to return match counts grouped by file instead of all lines.
-        Leave query empty with a specific file_glob to list matching files across the repository.
+        Leave query empty with file_glob (e.g. '*.rs' or 'Cargo.toml') to list matching files across the repository.
         """
         try:
             if not 1 <= max_results <= 500:
@@ -102,15 +169,15 @@ def make_rust_tools(root, resolve_path, env=None):
             files.sort(key=_sort_key)
 
             if not query:
-                if file_glob and file_glob != "*.rs":
+                if file_glob:
                     matching_names = [f.relative_to(root).as_posix() for f in files]
                     if not matching_names:
                         return f"(no files matching '{file_glob}')"
                     out = "\n".join(matching_names[:max_results])
                     if len(matching_names) > max_results:
-                        out += "\n(results truncated)"
+                        out += f"\n... ({len(matching_names) - max_results} more files; results truncated)"
                     return out
-                raise ValueError("Provide a query and max_results between 1 and 500")
+                raise ValueError("Provide a query or file_glob")
 
             if multiline:
                 if regex:
@@ -120,123 +187,60 @@ def make_rust_tools(root, resolve_path, env=None):
                     raw_pat = r"\s+".join(re.escape(t) for t in tokens)
                     raw_pat = raw_pat.replace(r"\(", r"\(\s*").replace(r"\)", r",?\s*\)").replace(",", r",\s*")
                     pattern = re.compile(raw_pat, re.MULTILINE)
+            else:
+                pattern = re.compile(query if regex else re.escape(query))
 
-                matches = []
-                file_match_counts = {}
-                total_matches = 0
-                for file in files:
-                    resolved = file.resolve()
-                    if not resolved.is_relative_to(root) or not resolved.is_file():
-                        continue
-                    try:
-                        text = resolved.read_text(encoding="utf-8")
-                    except (OSError, UnicodeError):
-                        continue
-                    file_lines = text.splitlines()
-                    matched_numbers = []
-                    for m in pattern.finditer(text):
-                        line_no = text.count("\n", 0, m.start()) + 1
-                        matched_numbers.append(line_no)
-                        total_matches += 1
-                        if not summarize and total_matches >= max_results:
-                            break
-                    if matched_numbers:
-                        rel_posix = file.relative_to(root).as_posix()
-                        file_match_counts[rel_posix] = len(matched_numbers)
-                        if not summarize:
-                            if context_lines == 0:
-                                for ln in matched_numbers:
-                                    line_content = file_lines[ln - 1] if ln <= len(file_lines) else ""
-                                    matches.append(f"{rel_posix}:{ln}: {line_content}")
-                            else:
-                                matches.append(_format_context_matches(rel_posix, file_lines, matched_numbers, context_lines))
-                    if not summarize and total_matches >= max_results:
-                        break
-
-                if summarize:
-                    if not file_match_counts:
-                        return "(no matches)"
-                    summary_lines = [f"Found {total_matches} matches across {len(file_match_counts)} files:"]
-                    for fpath, cnt in file_match_counts.items():
-                        summary_lines.append(f"  {fpath}: {cnt} match(es)")
-                    return "\n".join(summary_lines)
-
-                if not matches:
-                    return "(no matches)"
-                output = "\n".join(matches) if context_lines == 0 else "\n--\n".join(matches)
-                return output + ("\n(results truncated)" if total_matches >= max_results else "")
-
-            pattern = re.compile(query if regex else re.escape(query))
-            if summarize:
-                file_match_counts = {}
-                total_matches = 0
-                for file in files:
-                    resolved = file.resolve()
-                    if not resolved.is_relative_to(root) or not resolved.is_file():
-                        continue
-                    try:
-                        count = 0
-                        with resolved.open(encoding="utf-8") as stream:
-                            for line in stream:
-                                if pattern.search(line):
-                                    count += 1
-                        if count:
-                            file_match_counts[file.relative_to(root).as_posix()] = count
-                            total_matches += count
-                    except (OSError, UnicodeError):
-                        continue
-                if not file_match_counts:
-                    return "(no matches)"
-                summary_lines = [f"Found {total_matches} matches across {len(file_match_counts)} files:"]
-                for fpath, cnt in file_match_counts.items():
-                    summary_lines.append(f"  {fpath}: {cnt} match(es)")
-                return "\n".join(summary_lines)
-
-            if context_lines == 0:
-                matches = []
-                for file in files:
-                    resolved = file.resolve()
-                    if not resolved.is_relative_to(root) or not resolved.is_file():
-                        continue
-                    try:
-                        with resolved.open(encoding="utf-8") as stream:
-                            for number, line in enumerate(stream, 1):
-                                if pattern.search(line):
-                                    matches.append(f"{file.relative_to(root).as_posix()}:{number}: {line.rstrip()}")
-                                    if len(matches) > max_results:
-                                        return "\n".join(matches[:max_results]) + "\n(results truncated)"
-                    except (OSError, UnicodeError):
-                        continue
-                return "\n".join(matches) or "(no matches)"
-
+            matches = []
+            file_match_counts = {}
             total_matches = 0
-            truncated = False
-            file_blocks = []
+            overflow = False
+
             for file in files:
                 resolved = file.resolve()
                 if not resolved.is_relative_to(root) or not resolved.is_file():
                     continue
                 try:
-                    file_lines = [line.rstrip() for line in resolved.read_text(encoding="utf-8").splitlines()]
+                    if multiline:
+                        text = resolved.read_text(encoding="utf-8")
+                        file_lines = text.splitlines()
+                        matched_numbers = []
+                        for m in pattern.finditer(text):
+                            matched_numbers.append(text.count("\n", 0, m.start()) + 1)
+                    else:
+                        file_lines = [line.rstrip() for line in resolved.read_text(encoding="utf-8").splitlines()]
+                        matched_numbers = [number for number, line in enumerate(file_lines, 1) if pattern.search(line)]
                 except (OSError, UnicodeError):
                     continue
-                matched_numbers = []
-                for number, line in enumerate(file_lines, 1):
-                    if pattern.search(line):
-                        if total_matches >= max_results:
-                            truncated = True
-                            break
-                        matched_numbers.append(number)
-                        total_matches += 1
-                if matched_numbers:
-                    rel_posix = file.relative_to(root).as_posix()
-                    file_blocks.append(_format_context_matches(rel_posix, file_lines, matched_numbers, context_lines))
-                if truncated:
-                    break
-            if not file_blocks:
+
+                if not matched_numbers:
+                    continue
+
+                rel_posix = file.relative_to(root).as_posix()
+                file_match_counts[rel_posix] = len(matched_numbers)
+                total_matches += len(matched_numbers)
+
+                if not summarize and not overflow:
+                    if total_matches > max_results:
+                        overflow = True
+                        matches.clear()
+                    elif context_lines == 0:
+                        for ln in matched_numbers:
+                            line_content = file_lines[ln - 1] if ln <= len(file_lines) else ""
+                            matches.append(f"{rel_posix}:{ln}: {line_content}")
+                    else:
+                        matches.append(_format_context_matches(rel_posix, file_lines, matched_numbers, context_lines))
+
+            if summarize or overflow:
+                return _format_file_match_summary(
+                    total_matches,
+                    file_match_counts,
+                    overflow=overflow,
+                    max_results=max_results,
+                )
+
+            if not matches:
                 return "(no matches)"
-            output = "\n--\n".join(file_blocks)
-            return output + ("\n(results truncated)" if truncated else "")
+            return "\n".join(matches) if context_lines == 0 else "\n--\n".join(matches)
         except (OSError, ValueError, re.error) as exc:
             return f"Error searching code: {exc}"
 
@@ -263,14 +267,34 @@ def make_rust_tools(root, resolve_path, env=None):
             def display_path(path):
                 path = Path(path)
                 return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
-            packages = [{"name": p["name"], "import_name": p["name"].replace("-", "_"),
-                         "version": p["version"], "id": p["id"],
-                         "manifest_path": display_path(p["manifest_path"]),
-                         "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
-                         "features": list(p.get("features", {}).keys())[:25],
-                         "default_features": p.get("features", {}).get("default", []),
-                         "targets": [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in p["targets"]]}
-                        for p in metadata["packages"] if p["id"] in members]
+            packages = []
+            for p in metadata["packages"]:
+                if p["id"] not in members:
+                    continue
+                imp_name = p["name"].replace("-", "_")
+                m_path = Path(p["manifest_path"])
+                pkg_entry = {
+                    "name": p["name"], "import_name": imp_name,
+                    "version": p["version"], "id": p["id"],
+                    "manifest_path": display_path(p["manifest_path"]),
+                    "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
+                    "features": list(p.get("features", {}).keys())[:25],
+                    "default_features": p.get("features", {}).get("default", []),
+                    "targets": [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in p["targets"]],
+                }
+                common_imports = extract_common_test_imports(m_path, imp_name)
+                if common_imports:
+                    pkg_entry["common_test_imports"] = common_imports
+                build_rs = m_path.parent / "build.rs"
+                if build_rs.is_file():
+                    try:
+                        build_txt = build_rs.read_text(encoding="utf-8", errors="replace")[:65536]
+                        cfgs = list(dict.fromkeys(re.findall(r"cargo:rustc-cfg=([A-Za-z0-9_]+)", build_txt)))
+                        if cfgs:
+                            pkg_entry["build_script_cfgs"] = cfgs[:20]
+                    except OSError:
+                        pass
+                packages.append(pkg_entry)
             return json.dumps({"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages}, ensure_ascii=False, indent=2)
         except (OSError, ValueError, subprocess.TimeoutExpired, KeyError) as exc:
             return f"Error querying Cargo workspace: {exc}"

@@ -127,6 +127,14 @@ def _extract_test_failure_details(test_output: str) -> list[dict]:
             entry["actual_panic_message"] = actual.group(1).strip()[:2000]
         if expected:
             entry["expected_panic_substring"] = expected.group(1).strip()[:2000]
+        snap_m = re.search(r"(?ms)^(?:[-─]{3,}\s*Snapshot Summary|Snapshot Summary[:\s]).*?(?=^To update snapshots|^thread '|\Z)", block)
+        if snap_m:
+            diff_lines = [
+                ln.strip() for ln in snap_m.group(0).splitlines()
+                if ln.lstrip().startswith(("-", "+")) and not ln.lstrip().startswith(("---", "+++"))
+            ]
+            if diff_lines:
+                entry["snapshot_summary"] = "\n".join(diff_lines[:20])[:800]
         details.append(entry)
     return details
 
@@ -431,6 +439,11 @@ def make_cargo_test_tool(
             }
             if omitted_diagnostics:
                 payload["diagnostics_omitted"] = omitted_diagnostics
+            if result.returncode == 0 and not no_run and executed == 0:
+                payload["warning"] = (
+                    "Zero tests executed (exit_code=0). Your test_filter may have matched 0 tests, "
+                    "or only doc/unit tests exist under another target."
+                )
             if on_test_feedback and not no_run:
                 strategy_warning = on_test_feedback(
                     manifest_path, test_target, result.returncode, failures, executed, compile_errors,

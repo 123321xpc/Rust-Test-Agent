@@ -892,3 +892,343 @@ def test_generate_patch_submit_flag_one_step(normal):
     patch = tools["generate_patch"].invoke({"submit": True})
     assert state.patch == patch
     assert "+pub fn val() -> i32 { 42 }" in patch
+
+
+def test_guardrail_atomicity_unclosed_literals_and_recovery_context(normal):
+    _, tools, state = normal
+    tools["write_file"].invoke({"path": "src/lib.rs", "content": "pub fn ok() -> i32 { 1 }\n"})
+    tools["write_regression_test"].invoke({"path": "tests/test_regression_valid.rs", "content": "#[test] fn t() {}\n"})
+    state.pass_test(state.start_test(), test_target="test_regression_valid")
+    assert state.verified()
+
+    # Syntax rejection in write_regression_test must NOT pollute regression_tests or invalidate prior verification
+    bad_reg = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_broken.rs",
+        "content": '#[test] fn broken() { let s = "unclosed;\n}\n',
+    })
+    assert "Syntax guardrail error" in bad_reg
+    assert "unclosed string literal" in bad_reg
+    assert all("broken" not in p.as_posix() for p in state.regression_tests)
+    assert state.verified()
+
+    # edit_file rejection shows Proposed + Original code context and tracks consecutive edit failures
+    bad_edit = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "pub fn ok() -> i32 { 1 }",
+        "new_text": "pub fn ok() -> i32 { /* unclosed comment\n",
+    })
+    assert "Syntax guardrail error" in bad_edit
+    assert "Proposed code around line" in bad_edit
+    assert "Original code around line" in bad_edit
+    assert "Recovery notice" not in bad_edit
+
+    bad_edit_2 = tools["edit_file"].invoke({
+        "path": "src/lib.rs",
+        "old_text": "missing_symbol",
+        "new_text": "x",
+    })
+    assert "Recovery notice: 2 consecutive edit failures" in bad_edit_2
+
+
+def test_lockfile_protection_package_arrays_and_doctest_shift(normal):
+    _, tools, state = normal
+    # Cargo.lock cannot be modified
+    (state.root / "Cargo.lock").write_text("version = 3\n", encoding="utf-8")
+    lock_err = tools["write_file"].invoke({"path": "Cargo.lock", "content": "tampered\n"})
+    assert "Cargo.lock" in lock_err and "prohibited" in lock_err
+
+    # _scan_package_manifests handles arrays like authors = [...] before name
+    (state.root / "crates" / "pkg_a").mkdir(parents=True, exist_ok=True)
+    (state.root / "crates" / "pkg_a" / "Cargo.toml").write_text(
+        '[package]\nauthors = ["Alice"]\nname = "pkg_a"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    mapped = state._scan_package_manifests()
+    assert "pkg_a" in mapped
+
+    # Doctest line-shift notice on line count change above existing doctest
+    tools["write_file"].invoke({
+        "path": "src/doc_mod.rs",
+        "content": (
+            "pub fn top() -> i32 { 1 }\n\n"
+            "/// ```\n"
+            "/// assert_eq!(2, 2);\n"
+            "/// ```\n"
+            "pub fn documented() {}\n"
+        ),
+    })
+    edit_out = tools["edit_file"].invoke({
+        "path": "src/doc_mod.rs",
+        "old_text": "pub fn top() -> i32 { 1 }",
+        "new_text": "pub fn top() -> i32 {\n    1\n}",
+    })
+    assert "Doctest line-shift notice" in edit_out
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo is not installed")
+def test_in_module_regression_test_lifecycle_and_patch_stripping(tmp_path):
+    repo = tmp_path / "inmod_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "inmod"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("fn secret() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_inmod", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        mount_out = tools["write_regression_test"].invoke({
+            "path": "priv_check",
+            "target_src": "src/lib.rs",
+            "content": "#[test]\nfn checks_secret() { assert_eq!(secret(), 2); }\n",
+            "run_now": True,
+        })
+        assert "Mounted temporary in-module regression test" in mount_out
+        assert state.reproduced()
+        assert state.changed_paths() == []
+
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "fn secret() -> i32 { 1 }", "new_text": "fn secret() -> i32 { 2 }"})
+        res = json.loads(tools["cargo_test"].invoke({"lib": True, "test_filter": "__test_regression_priv_check"}))
+        assert res["status"] == "passed"
+        assert state.verified()
+
+        patch = tools["generate_patch"].invoke({"submit": True})
+        assert "+fn secret() -> i32 { 2 }" in patch
+        assert "__TEST_REGRESSION_START" not in patch
+    finally:
+        state.close()
+
+
+def test_syntax_guardrail_allows_nested_mod_inner_doc_and_multiline_attrs(tmp_path):
+    repo = tmp_path / "syntax_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    mod_doc_src = (
+        "pub struct Sender;\n"
+        "pub mod error {\n"
+        "    //! Broadcast error types\n"
+        "    pub struct SendError;\n"
+        "}\n"
+        "impl Sender {\n"
+        "    pub fn send(&self) {}\n"
+        "}\n"
+    )
+    multiline_attr_src = (
+        "#![allow(\n"
+        "    clippy::all,\n"
+        "    clippy::must_use_candidate,\n"
+        ")]\n"
+        "// Restrictions\n"
+        "#![deny(clippy::question_mark_used)]\n"
+        "pub use self::inner::Wrapping;\n"
+        "pub mod inner { pub struct Wrapping; }\n"
+    )
+    (repo / "src" / "broadcast.rs").write_text(mod_doc_src, encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(multiline_attr_src, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_syntax_fix", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    try:
+        res_mod = tools["edit_file"].invoke({
+            "path": "src/broadcast.rs",
+            "old_text": "    pub fn send(&self) {}",
+            "new_text": "    pub fn send(&self) {}\n    pub fn len(&self) -> usize { 0 }",
+        })
+        assert "Updated src/broadcast.rs" in res_mod
+
+        res_attr = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub use self::inner::Wrapping;",
+            "new_text": "pub use self::inner::{Saturating, Wrapping};",
+        })
+        assert "Updated src/lib.rs" in res_attr
+
+        # Newly inserted top-level inner doc comment after code must still be rejected
+        res_bad = tools["edit_file"].invoke({
+            "path": "src/broadcast.rs",
+            "old_text": "    pub fn len(&self) -> usize { 0 }",
+            "new_text": "    pub fn len(&self) -> usize { 0 }\n//! Invalid top-level doc after item",
+        })
+        assert "Syntax guardrail error" in res_bad and "E0753" in res_bad
+    finally:
+        state.close()
+
+
+def test_write_file_protects_multiline_rust_files_and_read_file_supports_ranges(tmp_path):
+    repo = tmp_path / "protect_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    big_rs = "\n".join(f"pub fn f_{i}() -> i32 {{ {i} }}" for i in range(1, 31)) + "\n"
+    (repo / "src" / "round.rs").write_text(big_rs, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_protect", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo)
+    tools = {t.name: t for t in tools_list}
+    try:
+        del_res = tools["write_file"].invoke({"path": "src/round.rs", "content": None})
+        assert "Refusing to delete existing Rust source file" in del_res
+        assert (state.root / "src" / "round.rs").is_file()
+
+        trunc_res = tools["write_file"].invoke({"path": "src/round.rs", "content": "pub fn only_one() {}\n"})
+        assert "Refusing to overwrite existing Rust source file" in trunc_res
+
+        edit_res = tools["edit_file"].invoke({
+            "path": "src/round.rs",
+            "old_text": "pub fn f_1() -> i32 { 1 }",
+            "new_text": "pub fn f_1() -> i32 { 100 }",
+        })
+        assert "Updated src/round.rs" in edit_res
+
+        ranged = tools["read_file"].invoke({"path": "src/round.rs", "start_line": 1, "end_line": 3})
+        assert "1: pub fn f_1() -> i32 { 100 }" in ranged
+        assert "3: pub fn f_3() -> i32 { 3 }" in ranged
+    finally:
+        state.close()
+
+
+def test_write_regression_test_prunes_compile_failed_standalone_on_switch(tmp_path):
+    repo = tmp_path / "prune_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "prune_pkg"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("fn priv_fn() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_prune", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_old.rs",
+            "content": "#[test] fn old() {}\n",
+        })
+        tok = state.start_test()
+        state.fail_test(tok, test_target="test_regression_old", executed=0, returncode=101, compile_errors=[{"code": None, "message": "winit unsupported"}])
+        assert (state.root / "tests" / "test_regression_old.rs").is_file()
+
+        tools["write_regression_test"].invoke({
+            "path": "priv_check",
+            "target_src": "src/lib.rs",
+            "content": "#[test] fn inner() { assert_eq!(priv_fn(), 2); }\n",
+        })
+        assert not (state.root / "tests" / "test_regression_old.rs").exists()
+        assert (Path("Cargo.toml"), "test_regression_old") not in {(m_p, n) for m_p, n, _, _ in state._regression_targets()}
+    finally:
+        state.close()
+
+
+def test_fail_test_macro_panic_and_lockfile_unlock_plus_post_strip_baseline(tmp_path, monkeypatch):
+    repo = tmp_path / "macro_lock_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "ml_pkg"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn v() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_ml", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_macro.rs",
+            "content": "#[test] fn m() {}\n",
+        })
+        tok1 = state.start_test()
+        state.fail_test(
+            tok1,
+            test_target="test_regression_macro",
+            executed=0,
+            returncode=101,
+            compile_errors=[{"code": None, "message": "proc macro panicked"}],
+        )
+        assert state.reproduced()
+
+        # Simulate lockfile v4 failure on cargo_test
+        tok2 = state.start_test()
+        state.fail_test(
+            tok2,
+            test_target="test_regression_macro",
+            executed=0,
+            returncode=101,
+            cargo_output="error: failed to parse lock file at: Cargo.lock\nCaused by: lock file version `4` was found",
+        )
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "1", "new_text": "2"})
+        assert state.verified()
+
+        # Verify run_post_strip_check excuses baseline-failing --tests when lib check passes
+        state._env_lockfile_blocked = False
+        state.pass_test(state.start_test(), test_target="test_regression_macro")
+        state._reproduced_regressions[(Path("Cargo.toml"), "test_regression_macro")] = {
+            "clean_red": True, "runtime_failure": True, "compile_reproduction": False, "executed": 1, "failures": ["m"], "returncode": 101,
+        }
+        state._verified_revision = state._revision
+
+        orig_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "cargo":
+                if "--tests" in cmd:
+                    return subprocess.CompletedProcess(cmd, 101, "", "error[E0433]: failed to resolve `uuid`")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return orig_run(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        patch = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "+pub fn v() -> i32 { 2 }" in patch
+    finally:
+        state.close()
+
+
+def test_paired_repro_soft_fallback_after_two_attempts_and_unverified_fallback(tmp_path, monkeypatch):
+    repo = tmp_path / "paired_cap_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "pc_pkg"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn v() -> i32 { 1 }\n", encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("tools_pc", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "1", "new_text": "2"})
+        tools["write_regression_test"].invoke({
+            "path": "tests/test_regression_always.rs",
+            "content": "#[test] fn ok() {}\n",
+        })
+        orig_run = subprocess.run
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: (
+                subprocess.CompletedProcess(cmd, 0, "test result: ok. 1 passed; 0 failed; 0 ignored;\n", "")
+                if cmd and cmd[0] == "cargo"
+                else orig_run(cmd, **kw)
+            ),
+        )
+        json.loads(tools["cargo_test"].invoke({"test_target": "test_regression_always"}))
+        # 1st attempt rejects
+        out1 = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "Paired reproduction check failed" in out1
+        # 2nd attempt degrades gracefully to soft_fallback
+        out2 = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "+pub fn v() -> i32 { 2 }" in out2
+
+        # Also check allow_unverified_fallback when edits + test attempt exist without passing gate
+        edit_res = tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "{ 2 }", "new_text": "{ 3 }"})
+        assert "Updated src/lib.rs" in edit_res
+        assert state.auto_submit_verified_patch(allow_unverified_fallback=False) == ""
+        fallback_patch = state.auto_submit_verified_patch(allow_unverified_fallback=True)
+        assert "+pub fn v() -> i32 { 3 }" in fallback_patch
+    finally:
+        state.close()

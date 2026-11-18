@@ -1,29 +1,28 @@
 # Jifang 五任务验证集
 
-固定清单为 `manifest.json`，服务器上的入口是 `~/xpc/validation/validate`，使用 rootful Docker。通过 `--network proxy`（默认）或 `--network direct` 选择网络模式。代理模式要求 Windows 端 11321 代理和 SSH 反向隧道，入口在启动及每次评测前检查代理；直连模式清空智能体、构建步骤及测试容器的代理环境变量，不检查反向隧道。
+固定清单为 `manifest.json`，服务器上的入口是 `~/xpc/validation/validate`，使用 rootful Docker。默认使用后台运行与直连网络模式（`--network direct`）；如需前台运行可指定 `--foreground`，如需走代理可指定 `--network proxy`。代理模式要求 Windows 端 11321 代理和 SSH 反向隧道，入口在启动及每次评测前检查代理；直连模式清空智能体、构建步骤及测试容器的代理环境变量，不检查反向隧道。
 
 该选项不修改 Docker 守护进程的全局代理配置；如需拉取镜像，守护进程仍使用自身配置的代理。此验证集会在运行前检查任务镜像已经缓存。直连模式下模型 API 和 GitHub 等目标仍需能从服务器直接访问。
 
 ```bash
-# 登录 Jifang 后运行。--list、--dry-run 不调用模型。
+# 登录 Jifang 后运行。--list、--dry-run 不调用模型，默认前台输出。
 ~/xpc/validation/validate --agent all --list
 ~/xpc/validation/validate --agent all --dry-run
-~/xpc/validation/validate --agent all --network direct --dry-run
+~/xpc/validation/validate --agent all --network proxy --dry-run
 
-# 运行一个智能体、生成补丁并评测全部 5 项
+# 默认在后台运行：输出 PID 和启动日志路径，直连网络
 ~/xpc/validation/validate --agent normal
 ~/xpc/validation/validate --agent swe-agent
 ~/xpc/validation/validate --agent RustForger
 ~/xpc/validation/validate --agent ACI-impr
-~/xpc/validation/validate --agent trace-impr
 ~/xpc/validation/validate --agent test
 
-# 顺序运行全部 6 个智能体（最多 30 次任务运行）
+# 顺序运行全部注册智能体（后台）
 ~/xpc/validation/validate --agent all
 
-# 后台运行：--background 必须放在第一个参数，命令会打印启动日志位置
-~/xpc/validation/validate --background --agent all
-~/xpc/validation/validate --background --agent normal --network direct
+# 前台执行：指定 --foreground
+~/xpc/validation/validate --foreground --agent normal
+~/xpc/validation/validate --foreground --agent all --network proxy
 
 # 指定模型；此值覆盖 .env 和 shell 环境中的 MODEL
 ~/xpc/validation/validate --agent normal --model deepseek-v4.1-flash
@@ -38,7 +37,7 @@
 
 模型、API 地址、密钥和调用上限读取 `~/xpc/.env`，同名 shell 环境变量优先；命令行 `--model` 可单次覆盖模型名。实际模型名记录在 `run_metadata.json` 中。运行会调用模型并可能产生费用。后台任务与 SSH 会话独立；代理模式下代理或反向隧道中断会影响后续操作。网络模式记录在 `run_metadata.json` 中。
 
-入口使用服务器上的代码：`~/xpc/baselines/{normal,ACI-impr,trace-impr,test}`、`~/xpc/RustForger` 和 `~/xpc/sweagent-run/SWE-agent`。如果在 Windows 工作区修改了智能体，须先将相应修改同步到这些服务器目录；验证命令不会自动同步代码。
+入口使用服务器上的代码：`~/xpc/baselines/{normal,ACI-impr,test}`、`~/xpc/RustForger` 和 `~/xpc/sweagent-run/SWE-agent`。如果在 Windows 工作区修改了智能体，须先将相应修改同步到这些服务器目录；验证命令不会自动同步代码。
 
 每次运行创建 `~/xpc/validation/runs/validation_<时间>_<随机数>/`：
 

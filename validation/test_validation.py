@@ -1,8 +1,11 @@
 import importlib.util
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +34,8 @@ class ValidationTests(unittest.TestCase):
                 args = runner.docker_base({}, env)
                 for key in (*runner.PROXY_NAMES, 'NETWORK_PROXY'):
                     self.assertIn(f'{key}={expected}', args)
+            default_env = runner.child_env()
+            self.assertEqual(default_env['NETWORK_PROXY'], '')
             self.assertEqual(env['DOCKER_CONFIG'], str(Path(tmp) / 'docker-direct-config'))
 
     def test_direct_evaluation_skips_proxy_check(self):
@@ -184,6 +189,142 @@ class ValidationTests(unittest.TestCase):
         self.assertIn('tokio-rs__bytes-377', md)
         self.assertIn('▲ WIN', md)
         self.assertIn('arbitration_rationale', md)
+
+    def test_resolve_api_env_profiles_and_model_defaults(self):
+        base = {
+            'YJ_BASE_URL': 'https://yj.example/v1',
+            'YJ_API_KEY': 'yj-key',
+            'YJ_MODEL': 'yj-default',
+            'DS_BASE_URL': 'https://ds.example/v1',
+            'DS_API_KEY': 'ds-key',
+            'DS_MODEL': 'ds-default',
+        }
+        env = dict(base)
+        self.assertEqual(runner.resolve_api_env(env), 'yj')
+        self.assertEqual((env['BASE_URL'], env['API_KEY'], env['MODEL']),
+                         ('https://yj.example/v1', 'yj-key', 'yj-default'))
+
+        env = dict(base, BASE_URL='https://stale', API_KEY='stale', MODEL='stale')
+        self.assertEqual(runner.resolve_api_env(env, api='DS'), 'ds')
+        self.assertEqual((env['BASE_URL'], env['API_KEY'], env['MODEL']),
+                         ('https://ds.example/v1', 'ds-key', 'ds-default'))
+
+        env = dict(base)
+        self.assertEqual(runner.resolve_api_env(env, api='ds', model='custom-ds'), 'ds')
+        self.assertEqual((env['BASE_URL'], env['API_KEY'], env['MODEL']),
+                         ('https://ds.example/v1', 'ds-key', 'custom-ds'))
+
+        env = dict(base)
+        self.assertEqual(runner.resolve_api_env(env, model='custom-default'), 'yj')
+        self.assertEqual((env['BASE_URL'], env['API_KEY'], env['MODEL']),
+                         ('https://yj.example/v1', 'yj-key', 'custom-default'))
+
+        with self.assertRaises(ValueError):
+            runner.resolve_api_env(dict(base), model='   ')
+        with self.assertRaises(ValueError):
+            runner.resolve_api_env({'DS_BASE_URL': 'https://ds.example/v1'}, api='ds')
+
+    def test_resolve_api_limit_defaults_and_overrides(self):
+        env = {}
+        self.assertEqual(runner.resolve_api_limit(env), 70)
+        self.assertEqual(env['API_LIMIT'], '70')
+
+        env = {'API_LIMIT': '200'}
+        self.assertEqual(runner.resolve_api_limit(env), 200)
+        self.assertEqual(env['API_LIMIT'], '200')
+
+        env = {'API_LIMIT': '200'}
+        self.assertEqual(runner.resolve_api_limit(env, api_limit=35), 35)
+        self.assertEqual(env['API_LIMIT'], '35')
+
+        for bad in (0, -5, True):
+            with self.assertRaises(ValueError):
+                runner.resolve_api_limit({}, api_limit=bad)
+        for bad_env in ('', '0', '-1', 'abc', '1.5'):
+            with self.assertRaises(ValueError):
+                runner.resolve_api_limit({'API_LIMIT': bad_env})
+
+    def test_cli_runners_accept_api_limit_and_default_to_yj(self):
+        base_env = {
+            'YJ_BASE_URL': 'https://yj.example/v1',
+            'YJ_API_KEY': 'yj-key',
+            'YJ_MODEL': 'yj-default',
+            'DS_BASE_URL': 'https://ds.example/v1',
+            'DS_API_KEY': 'ds-key',
+            'DS_MODEL': 'ds-default',
+            'API_LIMIT': '200',
+        }
+        # validation/run.py --dry-run defaults to yj and honors --api-limit
+        env = dict(base_env)
+        buf = io.StringIO()
+        with patch.object(runner, 'child_env', return_value=env), \
+                patch.object(runner, 'read_jsonl', return_value=[]), \
+                patch.object(runner, 'preflight'), \
+                patch.object(sys, 'argv', ['run.py', '--agent', 'normal', '--api-limit', '45', '--dry-run']), \
+                redirect_stdout(buf):
+            self.assertEqual(runner.main(), 0)
+        self.assertEqual(env['API_LIMIT'], '45')
+        self.assertEqual(env['MODEL'], 'yj-default')
+        self.assertIn('api: yj', buf.getvalue())
+        self.assertIn('api_limit: 45', buf.getvalue())
+        self.assertIn('network: direct', buf.getvalue())
+
+        # validation/run.py accepts --network proxy override and background/foreground flags
+        env = dict(base_env)
+        buf = io.StringIO()
+        with patch.object(runner, 'child_env', return_value=env), \
+                patch.object(runner, 'read_jsonl', return_value=[]), \
+                patch.object(runner, 'preflight'), \
+                patch.object(sys, 'argv', ['run.py', '--agent', 'normal', '--network', 'proxy', '--foreground', '--dry-run']), \
+                redirect_stdout(buf):
+            self.assertEqual(runner.main(), 0)
+        self.assertIn('network: proxy', buf.getvalue())
+
+        # testset/run.py delegates to validation/run.py with the same CLI flags
+        testset_runner = load('../testset/run')
+        env = dict(base_env)
+        buf = io.StringIO()
+        with patch.object(testset_runner.runner, 'child_env', return_value=env), \
+                patch.object(testset_runner.runner, 'read_jsonl', return_value=[]), \
+                patch.object(testset_runner.runner, 'preflight'), \
+                patch.object(sys, 'argv', ['run.py', '--agent', 'normal', '--api-limit', '55', '--background', '--dry-run']), \
+                redirect_stdout(buf):
+            self.assertEqual(testset_runner.runner.main(), 0)
+        self.assertEqual(env['API_LIMIT'], '55')
+        self.assertIn('api: yj', buf.getvalue())
+        self.assertIn('network: direct', buf.getvalue())
+
+        # run_intervention.py defaults to yj and passes --api-limit to run_intervention_task
+        intervener = load('run_intervention')
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            ckpt = tmp_dir / 'ckpt'
+            ckpt.mkdir()
+            (ckpt / 'meta.json').write_text(json.dumps({'instance_id': 'tokio-rs__bytes-377'}), encoding='utf-8')
+            issue = tmp_dir / 'issue.txt'
+            issue.write_text('issue', encoding='utf-8')
+            captured = {}
+
+            def fake_run_task(**kwargs):
+                captured.update(kwargs)
+                return {'ok': True}
+
+            env_with_home = dict(base_env, HOME=str(tmp_dir), USERPROFILE=str(tmp_dir))
+            with patch.dict(os.environ, env_with_home, clear=True), \
+                    patch('dotenv.load_dotenv'), \
+                    patch.object(intervener, 'run_intervention_task', side_effect=fake_run_task):
+                rc = intervener.main([
+                    '--checkpoint', str(ckpt),
+                    '--repo', str(tmp_dir),
+                    '--issue-file', str(issue),
+                    '--output-dir', str(tmp_dir / 'out'),
+                    '--api-limit', '33',
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured['max_api_calls'], 33)
+            self.assertEqual(captured['model'], 'yj-default')
+            self.assertEqual(captured['api_key'], 'yj-key')
+            self.assertEqual(captured['base_url'], 'https://yj.example/v1')
 
 
 if __name__ == '__main__':

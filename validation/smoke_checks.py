@@ -24,7 +24,7 @@ if sys.argv[1] == 'sizes':
         assert actual == item['patch_changed_lines'], (item['instance_id'], actual)
     print('All frozen patch sizes agree with dataset')
 elif sys.argv[1] == 'imports':
-    for name in ('normal', 'ACI-impr', 'trace-impr', 'test'):
+    for name in ('normal', 'ACI-impr', 'test'):
         source = run.ROOT / 'baselines' / name
         cmd = run.docker_base(task) + ['-v', f'{source}:{source}:ro', '--entrypoint', str(run.PYTHON),
                                       task['image'], str(source / 'agent.py'), '--help']

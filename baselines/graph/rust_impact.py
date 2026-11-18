@@ -323,3 +323,140 @@ def detect_impact_triggers(surface: dict[str, Any]) -> list[str]:
             + ", ".join(f"{i.get('path')}:{i.get('line')}" for i in impls[:6])
         )
     return triggers
+
+
+_CONTRACT_PANIC_RE = re.compile(
+    r'(?:panic!\s*\(|assert!\s*\(|assert_eq!\s*\(|assert_ne!\s*\(|\bexpect\s*\(|#\[should_panic[^]]*\])'
+)
+
+
+def collect_sibling_contracts(
+    ckg: Any,
+    target_symbols: list[str],
+    *,
+    exclude_paths: set[str] | None = None,
+    max_entries: int = 5,
+) -> dict[str, Any]:
+    """Extract panic/assert contract patterns from sibling impls and existing tests."""
+    if ckg is None or not target_symbols:
+        return {"sibling_impls": [], "test_contracts": []}
+    wanted = {
+        str(s).split("::")[-1].removeprefix("r#")
+        for s in target_symbols
+        if str(s).strip() and len(str(s).split("::")[-1]) >= 3
+    }
+    if not wanted:
+        return {"sibling_impls": [], "test_contracts": []}
+    try:
+        all_files = ckg._all_parsed(exclude_tests=False)
+    except Exception:
+        return {"sibling_impls": [], "test_contracts": []}
+
+    excluded = {p.replace("\\", "/") for p in (exclude_paths or ())}
+    file_lines_cache: dict[str, list[str]] = {}
+
+    def _get_lines(rel_path: str) -> list[str]:
+        if rel_path not in file_lines_cache:
+            try:
+                fpath = (ckg.root / rel_path).resolve()
+                file_lines_cache[rel_path] = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                file_lines_cache[rel_path] = []
+        return file_lines_cache[rel_path]
+
+    sibling_impls: list[dict[str, Any]] = []
+    test_contracts: list[dict[str, Any]] = []
+    seen_sib: set[tuple[str, int]] = set()
+    seen_tst: set[tuple[str, int]] = set()
+
+    for parsed in all_files:
+        rel = parsed.rel_path.replace("\\", "/")
+        is_test_file = rel.startswith("tests/") or "/tests/" in rel or rel.endswith(("_test.rs", "tests.rs"))
+        for item in parsed.items:
+            if item.get("kind") != "fn":
+                continue
+            name = str(item.get("name") or "").removeprefix("r#")
+            start = int(item.get("line") or 0)
+            end = min(int(item.get("end_line") or start), start + 80)
+            if start <= 0:
+                continue
+
+            if not item.get("is_test") and not is_test_file:
+                if name not in wanted or rel in excluded:
+                    continue
+                key = (rel, start)
+                if key in seen_sib or len(sibling_impls) >= max_entries:
+                    continue
+                lines = _get_lines(rel)
+                if not lines:
+                    continue
+                snippet_lines = lines[max(0, start - 1):min(len(lines), end)]
+                clauses: list[str] = []
+                for idx, ln in enumerate(snippet_lines):
+                    if _CONTRACT_PANIC_RE.search(ln):
+                        # Capture up to 2 lines if panic!/assert! wraps onto next line
+                        block = " ".join(x.strip() for x in snippet_lines[idx:idx + 2])
+                        if '"' in block:
+                            clauses.append(block[:180])
+                    if len(clauses) >= 2:
+                        break
+                if clauses:
+                    seen_sib.add(key)
+                    sibling_impls.append({
+                        "path": rel,
+                        "line": start,
+                        "symbol": name,
+                        "enclosing": str(item.get("enclosing") or "")[:100],
+                        "clauses": clauses,
+                    })
+            else:
+                if len(test_contracts) >= max_entries:
+                    continue
+                callees = {str(c).split("::")[-1].removeprefix("r#") for c in (item.get("callees") or ())}
+                lines = _get_lines(rel)
+                if not lines:
+                    continue
+                attr_start = max(0, start - 4)
+                body_text = "\n".join(lines[attr_start:min(len(lines), end)])
+                if not (callees & wanted) and not any(re.search(rf"\b{re.escape(w)}\s*\(", body_text) for w in wanted):
+                    continue
+                key = (rel, start)
+                if key in seen_tst:
+                    continue
+                hints: list[str] = []
+                for ln in lines[attr_start:min(len(lines), end)]:
+                    st = ln.strip()
+                    if "should_panic" in st or (any(w in st for w in wanted) and ("assert" in st or "panic" in st)):
+                        hints.append(st[:180])
+                    elif "should_panic" in body_text and '"' in st and ("panic!" in st or "expected" in st or "assert" in st):
+                        hints.append(st[:180])
+                    if len(hints) >= 2:
+                        break
+                if hints:
+                    seen_tst.add(key)
+                    test_contracts.append({
+                        "path": rel,
+                        "line": start,
+                        "test_name": name,
+                        "hints": hints,
+                    })
+
+    return {"sibling_impls": sibling_impls, "test_contracts": test_contracts}
+
+
+def format_sibling_contracts(contracts: dict[str, Any] | None, *, max_chars: int = 1600) -> str:
+    """Format sibling implementation panic/assert wording and existing test contracts."""
+    if not contracts:
+        return ""
+    sibs = contracts.get("sibling_impls") or []
+    tests = contracts.get("test_contracts") or []
+    if not sibs and not tests:
+        return ""
+    lines: list[str] = ["Sibling & Existing Test Contracts (match established error/panic wording and invariants):"]
+    for s in sibs:
+        enc = f" in `{s['enclosing']}`" if s.get("enclosing") else ""
+        lines.append(f"- {s['path']}:{s['line']} `{s['symbol']}`{enc}: {' | '.join(s['clauses'])}")
+    for t in tests:
+        lines.append(f"- {t['path']}:{t['line']} test `{t['test_name']}`: {' | '.join(t['hints'])}")
+    out = "\n".join(lines)
+    return out[:max_chars] + ("\n... (truncated)" if len(out) > max_chars else "")

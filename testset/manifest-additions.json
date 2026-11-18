@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "selection": "Three additional small-patch tasks outside manifest-100, each with Rust 1.40 or newer and a newly built local task image.",
+  "tasks": [
+    {
+      "instance_id": "async-graphql__async-graphql-1491",
+      "repo": "async-graphql/async-graphql",
+      "base_commit": "759fb0e594606aecf4a239b00d6f3f8aeb22d885",
+      "image": "rustbench/async-graphql__async-graphql:pr-1491-rust-1.76.0-759fb0e59460-8ef9f1190f",
+      "rust_toolchain": "1.76.0",
+      "patch_changed_lines": 7,
+      "size": "small"
+    },
+    {
+      "instance_id": "axodotdev__cargo-dist-1024",
+      "repo": "axodotdev/cargo-dist",
+      "base_commit": "19a6a16993acdc577c91955f1963c2838e9d1f42",
+      "image": "rustbench/axodotdev__cargo-dist:pr-1024-rust-1.78.0-19a6a16993ac-d2de994b95",
+      "rust_toolchain": "1.78.0",
+      "patch_changed_lines": 2,
+      "size": "small"
+    },
+    {
+      "instance_id": "bevyengine__bevy-15398",
+      "repo": "bevyengine/bevy",
+      "base_commit": "1a41c736b39a01f4dbef75c4282edf3ced5f01e9",
+      "image": "rustbench/bevyengine__bevy:pr-15398-rust-1.81.0-1a41c736b39a-cb8d16c4b2",
+      "rust_toolchain": "1.81.0",
+      "patch_changed_lines": 5,
+      "size": "small"
+    }
+  ]
+}

@@ -117,3 +117,30 @@ def test_visibility_and_enclosing(symbols):
     assert entries["COUNTER"]["vis"] == "private"
     draw_impl = next(e for e in res["results"] if e["name"] == "draw" and e.get("enclosing") == "impl<'a> Draw for Widget")
     assert draw_impl["enclosing"] == "impl<'a> Draw for Widget"
+
+
+def test_lookup_details_attrs_trait_impls_and_reexports(tmp_path):
+    root = tmp_path.resolve()
+    (root / "src").mkdir()
+    (root / "src" / "types.rs").write_text(
+        '#[derive(Debug, Clone)]\n'
+        'pub(crate) struct InternalConfig { pub x: i32 }\n'
+        'pub trait Render { fn render(&self); }\n'
+        'impl Render for InternalConfig { fn render(&self) {} }\n',
+        encoding="utf-8",
+    )
+    (root / "src" / "lib.rs").write_text('pub mod types;\npub use crate::types::Render;\n', encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("rust_symbols_helpers", Path(__file__).with_name("rust_symbols.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    details = mod.lookup_symbol_details(root, "InternalConfig", exact=True)
+    assert details and details[0]["vis"] == "pub(crate)"
+    assert "derive(Debug, Clone)" in details[0].get("attrs", [])
+
+    impls = mod.find_trait_implementations(root, "Render")
+    assert impls and impls[0]["path"] == "src/types.rs"
+    assert "Render for InternalConfig" in impls[0]["header"]
+
+    reexports = mod.find_reexports(root, "Render")
+    assert reexports and reexports[0]["path"] == "src/lib.rs"

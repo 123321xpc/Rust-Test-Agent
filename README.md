@@ -83,7 +83,6 @@ Rust-SWE-Bench/
 │   ├── SWE-agent/               # SWE-agent adapted for Rust projects
 │   ├── normal/                  # LangChain ReAct baseline with cargo tools & diagnostics
 │   ├── ACI-impr/                # Experimental ACI improvements (Round 1 baseline)
-│   ├── trace-impr/              # Single-agent tracing & diagnostic baseline (pre-multi-agent)
 │   └── test/                    # Multi-agent Rust repair system
 │
 ├── validation/                  # Frozen 10-task Jifang development set and runner
@@ -342,7 +341,7 @@ Run the following commands **on Jifang**. The entry point depends on the existin
 ~/xpc/validation/validate --agent test --instance chronotope__chrono-991
 ```
 
-`--agent` accepts `swe-agent`, `RustForger`, `normal`, `ACI-impr`, `trace-impr`, `test`, or `all`. `--background` must be the first argument and prints the launcher log path. Use `--max-workers` and `--timeout` to control evaluation concurrency and the per-task test timeout. Runs call the configured model and can incur API costs.
+`--agent` accepts `swe-agent`, `RustForger`, `normal`, `ACI-impr`, `test`, `stage`, `graph`, or `all`. Runs default to background execution with direct network access; pass `--foreground` to run interactively, or `--network proxy` to route through the local SSH proxy tunnel. Use `--max-workers` and `--timeout` to control evaluation concurrency and the per-task test timeout. Runs call the configured model and can incur API costs.
 
 Results are written under `~/xpc/validation/runs/<run_id>/`, including predictions, agent logs, source and image metadata, and `summary.json`. The summary distinguishes resolved, unresolved, no-patch, agent-error, and evaluation-error outcomes. Per-instance harness reports and test output are under `~/xpc/Rust-bench/logs/run_evaluation/`. Updates made in the Windows workspace must first be synchronized to the corresponding server-side agent directories; this runner does not synchronize source code automatically.
 
