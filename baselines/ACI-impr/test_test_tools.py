@@ -1232,3 +1232,81 @@ def test_paired_repro_soft_fallback_after_two_attempts_and_unverified_fallback(t
         assert "+pub fn v() -> i32 { 3 }" in fallback_patch
     finally:
         state.close()
+
+
+def test_aci_inline_test_blocking_and_all_features_and_compiling_fallback(tmp_path, monkeypatch):
+    repo = tmp_path / "aci_opt_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text(
+        '[package]\nname = "aci_opt"\nversion = "0.1.0"\nedition = "2021"\n[features]\nextra = []\n',
+        encoding="utf-8",
+    )
+    (repo / "src" / "lib.rs").write_text(
+        "pub fn v() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() { assert_eq!(super::v(), 1); }\n}\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("tools_aci_opt", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=False, post_strip_check=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        orig_run = subprocess.run
+        seen_cmds = []
+
+        def fake_cargo(cmd, **kw):
+            if cmd and cmd[0] == "cargo":
+                seen_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "test result: ok. 1 passed; 0 failed; 0 ignored;\n", "")
+            return orig_run(cmd, **kw)
+
+        monkeypatch.setattr(subprocess, "run", fake_cargo)
+
+        # 1. Editing pre-existing inline #[cfg(test)] warns and generate_patch blocks submission
+        edit_test = tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "assert_eq!(super::v(), 1);",
+            "new_text": "assert_eq!(super::v(), 2);",
+        })
+        assert "Inline-Test Isolation Warning" in edit_test
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_x.rs", "content": "#[test] fn x() {}\n"})
+        state.pass_test(state.start_test(), test_target="test_regression_x")
+        blocked = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "Refusing to submit patch modifying pre-existing inline" in blocked
+
+        # 2. Reverting inline test edit and modifying production code passes --all-features workspace check
+        tools["revert_file"].invoke({"path": "src/lib.rs"})
+        tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub fn v() -> i32 { 1 }",
+            "new_text": "pub fn v() -> i32 { 2 }",
+        })
+        state.record_check_result(0, [])
+        assert state._last_compiling_snapshot is not None
+        seen_cmds.clear()
+        state.pass_test(state.start_test(), test_target="test_regression_x")
+        ok_patch = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "+pub fn v() -> i32 { 2 }" in ok_patch
+        assert any("--all-features" in c for c in seen_cmds)
+        assert any("--all-targets" in c for c in seen_cmds)
+
+        # 3. Unverified fallback prefers last compiling snapshot over broken current edits
+        tools["edit_file"].invoke({
+            "path": "src/lib.rs",
+            "old_text": "pub fn v() -> i32 { 2 }",
+            "new_text": "pub fn v() -> i32 { broken }",
+        })
+        def fake_cargo_fail_current(cmd, **kw):
+            if cmd and cmd[0] == "cargo":
+                cur_src = (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
+                if "broken" in cur_src:
+                    return subprocess.CompletedProcess(cmd, 101, "", "error[E0425]: cannot find value `broken`")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return orig_run(cmd, **kw)
+        monkeypatch.setattr(subprocess, "run", fake_cargo_fail_current)
+        snap_patch = state.auto_submit_verified_patch(allow_unverified_fallback=True)
+        assert "+pub fn v() -> i32 { 2 }" in snap_patch
+        assert "broken" not in snap_patch
+    finally:
+        state.close()

@@ -135,3 +135,20 @@ def test_find_repo_crate_names(tmp_path):
     (repo / "crates" / "sub" / "Cargo.toml").write_text('[package]\nname = "sub_pkg"\nversion = "0.1.0"\n', encoding="utf-8")
     names = environment.find_repo_crate_names(repo)
     assert set(names) == {"root_pkg", "sub_pkg"}
+
+
+def test_eval_toolchain_override_sets_rustup_toolchain(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "rust-toolchain").write_text("1.47.0\n", encoding="utf-8")
+    monkeypatch.setenv("RUSTBENCH_EVAL_TOOLCHAIN_OVERRIDE", "1.72.0")
+    calls = []
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(stdout=f"{command[0]} 1.72.0\n")
+    monkeypatch.setattr(environment.subprocess, "run", run)
+    env, info = environment.prepare_rust_environment(root, "1.47.0")
+    assert env["RUSTUP_TOOLCHAIN"] == "1.72.0"
+    assert info["source"] == "evaluation_override"
+    assert info["selected"] == "1.72.0"
+    assert [call[0] for call in calls] == [["rustc", "--version"], ["cargo", "--version"]]

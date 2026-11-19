@@ -1,13 +1,10 @@
 # test: Rust-oriented repair agent
 
-The default `staged` mode runs the adaptive multi-agent controller described
+The `staged` mode runs the adaptive multi-agent controller described
 below (`Navigator -> Architect -> Fixer -> Verifier`), routing localized issues
 along the Fast Path and complex issues through dependency-aware repair units.
-Set `RUSTBENCH_REPAIR_MODE=continuous` to use the single-conversation continuous
-repair mode instead (with on-demand read-only Architect consultation and final
-Verifier review).
 
-Both modes retain existing edits across replanning and allow explicit checkpoint
+Existing edits are retained across replanning and allow explicit checkpoint
 restores. Final QA checks affected crates and the workspace with the evaluation
 feature selection after removing temporary regression tests, then attempts bounded
 existing library and integration tests. Failed compile checks are compared with

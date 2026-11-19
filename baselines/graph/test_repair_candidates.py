@@ -10,11 +10,6 @@ from unittest.mock import Mock
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def staged_repair_mode(monkeypatch):
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
-
-
 def load(name):
     spec = importlib.util.spec_from_file_location(name + "_candidate_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)

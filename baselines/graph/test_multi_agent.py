@@ -10,11 +10,6 @@ from unittest.mock import Mock
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def staged_repair_mode(monkeypatch):
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
-
-
 def _load(name):
     spec = importlib.util.spec_from_file_location(name + "_ma_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -1318,7 +1313,6 @@ def test_graph_agent_direct_fixer_to_navigator_skips_suggester(monkeypatch, tmp_
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
     (repo / "src" / "other.rs").write_text("pub fn real_bug() -> i32 { 0 }\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1389,7 +1383,6 @@ def test_graph_agent_direct_fixer_to_navigator_skips_suggester(monkeypatch, tmp_
 def test_graph_agent_unlocks_by_test_fn_name_and_preserves_plan(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1478,7 +1471,6 @@ def test_graph_agent_verifier_escalates_directly_to_navigator(monkeypatch, tmp_p
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
     (repo / "src" / "other.rs").write_text("pub fn target() -> i32 { 0 }\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1674,7 +1666,6 @@ def test_scheduled_fixer_omits_duplicate_user_prompt_on_subsequent_slices(tmp_pa
 def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1794,7 +1785,6 @@ def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypat
 def test_graph_agent_prunes_zero_progress_replan_and_emits_coordination_metrics(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1884,7 +1874,6 @@ def test_graph_agent_relocalize_fast_keeps_history_clean_and_injects_sibling_con
         "pub mod other;\npub fn bug() -> i32 { 0 }\npub fn advance_mut(_cnt: usize) {}\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     fixer_histories_seen = []
@@ -2171,6 +2160,58 @@ def test_verifier_blocks_false_approve_and_replan_prune_allows_zero_edit_retry(t
         ver_tools2, ver_holder2 = ma._make_handoff_tools("verifier", state, {"_last_det_qa": {"unreproduced_reason": ""}}, {})
         blocked_lock = ver_tools2[0].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "not_applicable"})
         assert "locked Red-phase regression test" in blocked_lock and not ver_holder2["done"]
+    finally:
+        state.close()
+
+
+def test_graph_budget_200_and_fallback_strips_inline_tests_and_uses_compiling_snapshot(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+
+    # 1. allocate_stage_budgets(200) scales up caps above 150 while preserving <=150 tests
+    b200 = ma.allocate_stage_budgets(200)
+    assert b200["navigator_cap"] == 44
+    assert b200["suggester_cap"] == 12
+    assert b200["verifier_cap"] == 12
+
+    # 2. Fallback strips overlapping inline #[cfg(test)] edits while keeping production fix
+    repo = tmp_path / "graph_inline_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "gi"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(
+        "pub fn val() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { assert_eq!(super::val(), 1); }\n}\n",
+        encoding="utf-8",
+    )
+    tool_list, state = tools_mod.make_tools(repo, post_strip_check=False)
+    tmap = {t.name: t for t in tool_list}
+    try:
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 1 }", "new_text": "pub fn val() -> i32 { 2 }"})
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "assert_eq!(super::val(), 1);", "new_text": "assert_eq!(super::val(), 2);"})
+        state._last_compiling_prod_snapshot = state._capture_snapshot()
+        recovered = ma._try_degraded_patch_fallback(
+            state, allow_unverified_compiling=True, issue_contract={"signals": {}}, blackboard={},
+        )
+        assert "+pub fn val() -> i32 { 2 }" in recovered
+        assert "assert_eq!(super::val(), 2);" not in recovered
+
+        # 3. Degraded fallback prefers _last_compiling_prod_snapshot when current working copy fails compile
+        state.post_strip_check = True
+        monkeypatch.setattr(ma.shutil, "which", lambda cmd: "/usr/bin/cargo" if cmd == "cargo" else None)
+        state._last_compiling_prod_snapshot = state._capture_snapshot()
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 2 }", "new_text": "pub fn val() -> i32 { broken }"})
+
+        def fake_post_strip(sel):
+            if "broken" in (state.root / "src" / "lib.rs").read_text(encoding="utf-8"):
+                raise ValueError("compile failed")
+            return {"status": "passed", "warnings": []}
+
+        monkeypatch.setattr(state, "run_post_strip_check", fake_post_strip)
+        snap_patch = ma._try_degraded_patch_fallback(
+            state, allow_unverified_compiling=True, issue_contract={"signals": {}}, blackboard={},
+        )
+        assert "+pub fn val() -> i32 { 2 }" in snap_patch
+        assert "broken" not in snap_patch
     finally:
         state.close()
 

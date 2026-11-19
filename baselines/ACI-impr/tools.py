@@ -30,6 +30,163 @@ def _manifest_has_targets(manifest_file: Path) -> bool:
     return False
 
 
+def _append_cargo_feature_flags(command: list[str], config: dict | None = None) -> None:
+    config = config or {}
+    if config.get("features"):
+        command.append("--features=" + ",".join(config["features"]))
+    use_all_features = os.getenv("RUSTBENCH_ALL_FEATURES", "1").lower() not in {"0", "false", "off"}
+    if config.get("all_features") or (use_all_features and not config.get("no_default_features")):
+        command.append("--all-features")
+    if config.get("no_default_features"):
+        command.append("--no-default-features")
+    if config.get("target"):
+        command.append(f"--target={config['target']}")
+
+
+def inline_test_line_ranges(orig_code: str) -> list[tuple[int, int]]:
+    """Return 1-based (start, end) line ranges of #[cfg(test)] or mod tests blocks in orig_code."""
+    lines = orig_code.splitlines()
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        is_cfg_test = stripped.startswith("#[cfg(test)]")
+        is_mod_tests = bool(re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests?|[a-z0-9_]*_tests)\b", stripped))
+        if is_cfg_test or is_mod_tests:
+            start_ln = i + 1
+            depth = 0
+            opened = False
+            j = i
+            while j < n:
+                ln_txt = lines[j]
+                if "{" in ln_txt:
+                    depth += ln_txt.count("{")
+                    opened = True
+                if "}" in ln_txt:
+                    depth -= ln_txt.count("}")
+                if opened and depth <= 0:
+                    ranges.append((start_ln, j + 1))
+                    i = j
+                    break
+                if not opened and ";" in ln_txt and j > i:
+                    break
+                j += 1
+            else:
+                if opened:
+                    ranges.append((start_ln, n))
+        i += 1
+    return ranges
+
+
+def touched_line_hits_inline_tests(touched: tuple[tuple[str, int], ...], ranges: list[tuple[int, int]]) -> bool:
+    """Return True when a hunk's real edits touch an inline #[cfg(test)]/mod tests region."""
+    for kind, number in touched:
+        for start, end in ranges:
+            if kind == "line":
+                if start <= number <= end:
+                    return True
+            elif start <= number <= end - 1:
+                return True
+    return False
+
+
+def _is_non_test_rs_path(path_str: str) -> bool:
+    norm = path_str.replace("\\", "/").lower()
+    if not norm.endswith(".rs"):
+        return False
+    if norm.startswith(("tests/", "benches/", "examples/")):
+        return False
+    if "/tests/" in norm or "/benches/" in norm or "/examples/" in norm:
+        return False
+    return not norm.endswith(("_test.rs", "tests.rs"))
+
+
+def _edited_inline_test_warning(orig_code: str, updated_code: str, path_str: str) -> str:
+    """Warn immediately when an edit touches a pre-existing inline #[cfg(test)]/mod tests region."""
+    if not _is_non_test_rs_path(path_str):
+        return ""
+    ranges = inline_test_line_ranges(orig_code)
+    if not ranges:
+        return ""
+    import difflib
+    clean_updated = _strip_in_module_tests(updated_code)
+    touched: list[tuple[str, int]] = []
+    matcher = difflib.SequenceMatcher(None, orig_code.splitlines(), clean_updated.splitlines(), autojunk=False)
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            touched.append(("gap", i1))
+        else:
+            for ln in range(i1 + 1, i2 + 1):
+                touched.append(("line", ln))
+    if touched and touched_line_hits_inline_tests(tuple(touched), ranges):
+        span_str = ", ".join(f"{s}-{e}" for s, e in ranges[:3])
+        return (
+            f"\n[Inline-Test Isolation Warning in {path_str}]: edit touches pre-existing #[cfg(test)]/mod tests lines ({span_str}). "
+            "Patch submission blocks edits to pre-existing inline tests; leave existing inline tests untouched "
+            "and put regression tests in write_regression_test."
+        )
+    return ""
+
+
+def _detect_inline_test_patch_conflicts(patch_text: str, originals: dict) -> list[str]:
+    """Flag hunks in production .rs files that overlap pre-existing inline #[cfg(test)]/mod tests regions."""
+    if not patch_text:
+        return []
+    findings: list[str] = []
+    current = ""
+    old_path = ""
+    old_line = 0
+    touched: list[tuple[str, int]] = []
+    has_change = False
+
+    def _flush():
+        if not current or not has_change or not touched or not _is_non_test_rs_path(current):
+            return
+        orig = originals.get(Path(current))
+        if not orig or orig[0] is None:
+            return
+        ranges = inline_test_line_ranges(orig[0].decode("utf-8", errors="replace"))
+        if ranges and touched_line_hits_inline_tests(tuple(touched), ranges):
+            tag = f"{current}: hunk overlaps a pre-existing inline #[cfg(test)]/mod tests region"
+            if tag not in findings:
+                findings.append(tag)
+
+    for line in patch_text.splitlines():
+        if line.startswith("--- "):
+            old_path = line[4:].split("\t", 1)[0].strip()
+        elif line.startswith("+++ "):
+            _flush()
+            touched = []
+            has_change = False
+            new_path = line[4:].split("\t", 1)[0].strip()
+            raw = new_path if new_path != "/dev/null" else old_path
+            if raw.startswith(("a/", "b/")):
+                raw = raw[2:]
+            current = raw
+        elif line.startswith("@@ "):
+            _flush()
+            touched = []
+            has_change = False
+            m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+", line)
+            old_line = int(m.group(1)) if m else 0
+        elif line.startswith("-") and not line.startswith("---"):
+            has_change = True
+            touched.append(("line", old_line))
+            old_line += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            has_change = True
+            gap = old_line - 1
+            if ("gap", gap) not in touched:
+                touched.append(("gap", gap))
+        elif line.startswith(" "):
+            old_line += 1
+    _flush()
+    return findings[:6]
+
+
 def _format_line_window(text: str, center_line: int, radius: int = 3) -> str:
     lines = text.splitlines()
     if not lines:
@@ -555,6 +712,8 @@ class PatchState:
         self._consecutive_edit_failures = {}
         self._checkpoints = {}
         self._best_verified_snapshot = None
+        self._last_compiling_snapshot = None
+        self._consecutive_compile_failures = 0
         self._workspace_deps_cache = None
         self.require_reproduction = require_reproduction
         self.post_strip_check = post_strip_check
@@ -818,6 +977,7 @@ class PatchState:
         with self._lock:
             errors = [d for d in diagnostics if d.get("level") == "error"]
             if exit_code != 0 and errors:
+                self._consecutive_compile_failures += 1
                 sig = tuple(sorted(
                     (
                         d.get("code") or "",
@@ -845,9 +1005,19 @@ class PatchState:
                         f"Strategy warning: the same compiler error persisted across {self._consecutive_same_check_errors} edit revisions. "
                         "Re-examine your root cause hypothesis or restore a checkpoint before making further edits."
                     )
+                if self._consecutive_compile_failures >= 3 and (
+                    self._checkpoints or self._last_compiling_snapshot is not None
+                ):
+                    return (
+                        f"Strategy warning: {self._consecutive_compile_failures} consecutive cargo checks failed to compile. "
+                        "Consider calling checkpoint(action='restore') or reverting recent edits before trying a different approach."
+                    )
             elif exit_code == 0:
                 self._consecutive_same_check_errors = 0
+                self._consecutive_compile_failures = 0
                 self._last_check_sig = None
+                if any(p not in self.regression_tests for p in self.changed_paths()):
+                    self._last_compiling_snapshot = self._capture_snapshot()
             return None
 
     def record_test_result(self, manifest_path: str, test_target: str, exit_code: int, failures: list[str], executed: int, compile_errors: list[dict]) -> str | None:
@@ -1268,14 +1438,9 @@ class PatchState:
                     first_cfg = matching_cfgs[0]
                     if first_cfg.get("package"):
                         cmd.append(f"--package={first_cfg['package']}")
-                    if first_cfg.get("features"):
-                        cmd.append("--features=" + ",".join(first_cfg["features"]))
-                    if first_cfg.get("all_features"):
-                        cmd.append("--all-features")
-                    if first_cfg.get("no_default_features"):
-                        cmd.append("--no-default-features")
-                    if first_cfg.get("target"):
-                        cmd.append(f"--target={first_cfg['target']}")
+                    _append_cargo_feature_flags(cmd, first_cfg)
+                else:
+                    _append_cargo_feature_flags(cmd)
                 res_tests = subprocess.run(
                     cmd,
                     cwd=root,
@@ -1324,6 +1489,7 @@ class PatchState:
             ws_manifest = root / "Cargo.toml"
             for dep_pkg in downstream_pkgs:
                 dep_cmd = ["cargo", "check", "--tests", "--manifest-path", str(ws_manifest), f"--package={dep_pkg}"]
+                _append_cargo_feature_flags(dep_cmd)
                 dep_res = subprocess.run(
                     dep_cmd,
                     cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -1338,6 +1504,30 @@ class PatchState:
                         f"Post-strip downstream workspace check failed for dependent package '{dep_pkg}'. "
                         f"Your changes broke downstream crate compilation:\n{err_snippet}"
                     )
+            if ws_manifest.is_file():
+                ws_text = ws_manifest.read_text(encoding="utf-8", errors="replace")
+                ws_cmd = ["cargo", "check", "--all-targets", "--manifest-path", str(ws_manifest)]
+                _append_cargo_feature_flags(ws_cmd)
+                if "[workspace]" in ws_text:
+                    ws_cmd.append("--workspace")
+                if (root / "Cargo.lock").is_file():
+                    ws_cmd.append("--locked")
+                try:
+                    ws_res = subprocess.run(
+                        ws_cmd,
+                        cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=300, env=self.rust_env,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    ws_res = None
+                if ws_res is not None and ws_res.returncode != 0:
+                    err_snippet = (ws_res.stderr.strip() or ws_res.stdout.strip())[-3000:]
+                    low_err = err_snippet.lower()
+                    if not (any(marker in low_err for marker in env_error_markers) or self._compile_fails_on_baseline(ws_cmd, ws_manifest)):
+                        raise ValueError(
+                            "Workspace compilation regressed against the unpatched checkout:\n"
+                            f"{err_snippet}"
+                        )
         finally:
             for reg_rel, data in backup.items():
                 _restore_file_entry(root / reg_rel, data, preserve_mtime=True)
@@ -1401,6 +1591,27 @@ class PatchState:
                     or self._last_check_rev >= 0
                 )
                 if selected and has_test_attempt:
+                    if self._last_compiling_snapshot is not None and self.post_strip_check and shutil.which("cargo"):
+                        current_compiles = True
+                        try:
+                            self.run_post_strip_check(selected)
+                        except Exception:
+                            current_compiles = False
+                        if not current_compiles:
+                            cur_snap = self._capture_snapshot()
+                            try:
+                                self._restore_snapshot(self._last_compiling_snapshot)
+                                snap_selected = [p for p in self.changed_paths() if p not in self.regression_tests]
+                                if snap_selected:
+                                    self.run_post_strip_check(snap_selected)
+                                    self.patch = self.build_patch(snap_selected)
+                                    if self.patch:
+                                        return self.patch
+                            except Exception:
+                                pass
+                            finally:
+                                if not self.patch:
+                                    self._restore_snapshot(cur_snap)
                     try:
                         self.patch = self.build_patch(selected)
                         return self.patch
@@ -1467,6 +1678,9 @@ class PatchState:
                 is_suite = (not test_target and not test_filter and not lib and not bin_target)
                 if is_suite:
                     self._passed_suites.add(effective_manifest)
+                self._consecutive_compile_failures = 0
+                if any(p not in self.regression_tests for p in self.changed_paths()):
+                    self._last_compiling_snapshot = self._capture_snapshot()
                 reproduction_ok = (not self.require_reproduction) or all(self._is_target_reproduced(t) for t in targets)
                 if targets and targets <= self._passed_regressions and reproduction_ok:
                     self._verified_revision = self._revision
@@ -1934,6 +2148,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             snippet = _format_edit_snippet(updated, line_ranges, context=6)
             out_text = f"{write_result}\n{snippet}" if snippet else write_result
             if target.suffix == ".rs" and relative not in state.regression_tests:
+                inline_warn = _edited_inline_test_warning(content, updated, rel_key)
+                if inline_warn:
+                    out_text += inline_warn
                 shift_notice = _detect_doctest_line_shift(content, updated, rel_key)
                 if shift_notice:
                     out_text += shift_notice
@@ -2090,6 +2307,13 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             if state.post_strip_check:
                 state.run_post_strip_check(selected)
             patch = build_patch(selected)
+            inline_conflicts = _detect_inline_test_patch_conflicts(patch, state.originals)
+            if inline_conflicts:
+                raise ValueError(
+                    "Refusing to submit patch modifying pre-existing inline #[cfg(test)]/mod tests region(s): "
+                    + "; ".join(inline_conflicts)
+                    + ". Revert inline test edits and use write_regression_test instead."
+                )
             state.patch = patch
             return patch or "No changes to submit."
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:

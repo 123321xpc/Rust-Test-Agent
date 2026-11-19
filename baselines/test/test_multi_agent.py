@@ -10,11 +10,6 @@ from unittest.mock import Mock
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def staged_repair_mode(monkeypatch):
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "staged")
-
-
 def _load(name):
     spec = importlib.util.spec_from_file_location(name + "_ma_test", Path(__file__).with_name(name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -1567,7 +1562,6 @@ def test_graph_agent_direct_fixer_to_navigator_skips_suggester(monkeypatch, tmp_
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
     (repo / "src" / "other.rs").write_text("pub fn real_bug() -> i32 { 0 }\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1638,7 +1632,6 @@ def test_graph_agent_direct_fixer_to_navigator_skips_suggester(monkeypatch, tmp_
 def test_graph_agent_unlocks_by_test_fn_name_and_preserves_plan(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1727,7 +1720,6 @@ def test_graph_agent_verifier_escalates_directly_to_navigator(monkeypatch, tmp_p
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
     (repo / "src" / "other.rs").write_text("pub fn target() -> i32 { 0 }\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -1923,7 +1915,6 @@ def test_scheduled_fixer_omits_duplicate_user_prompt_on_subsequent_slices(tmp_pa
 def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -2043,7 +2034,6 @@ def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypat
 def test_graph_agent_prunes_zero_progress_replan_and_emits_coordination_metrics(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     states = []
@@ -2133,7 +2123,6 @@ def test_graph_agent_relocalize_fast_keeps_history_clean_and_injects_sibling_con
         "pub mod other;\npub fn bug() -> i32 { 0 }\npub fn advance_mut(_cnt: usize) {}\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     fixer_histories_seen = []
@@ -2596,7 +2585,6 @@ def test_graph_agent_enforces_integration_gate_once_on_template_edit(monkeypatch
     (repo / "templates" / "install.sh.j2").write_text("echo old\n", encoding="utf-8")
     (repo / "tests").mkdir(exist_ok=True)
     (repo / "tests" / "integration.rs").write_text("#[test] fn snap() {}\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     orig_make_tools = agent_mod.make_tools
@@ -2660,7 +2648,6 @@ def test_graph_agent_allows_paired_repro_legacy_smoke_audit_and_checks_untouched
     repo = _setup_fake_repo(tmp_path)
     (repo / "src" / "lexer").mkdir(parents=True)
     (repo / "src" / "lexer" / "mod.rs").write_text("pub fn lex() {}\n", encoding="utf-8")
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "graph")
 
     roles = []
     orig_make_tools = agent_mod.make_tools

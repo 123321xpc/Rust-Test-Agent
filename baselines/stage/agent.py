@@ -320,11 +320,7 @@ def run_agent(repo, issue, model, api_key, base_url=None, trace=None, max_api_ca
         try:
             import functools
             compress_fn = functools.partial(_compress_history_messages, keep_recent_steps=6, test_cutoff_steps=2, block_size=2)
-            repair_runner = (
-                _multi_agent.run_continuous_repair
-                if os.getenv("RUSTBENCH_REPAIR_MODE", "staged").strip().lower() == "continuous"
-                else _multi_agent.run_multi_agent
-            )
+            repair_runner = _multi_agent.run_multi_agent
             patch = repair_runner(
                 Path(repo),
                 issue,

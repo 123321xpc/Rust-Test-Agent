@@ -199,7 +199,7 @@ def run_logged(args, log_path, cwd, env):
 def run_baseline(agent, task, row, folder, env):
     (folder / 'issue.txt').write_text(row['problem_statement'], encoding='utf-8')
     args = docker_base(task, env)
-    if agent in ('test', 'stage', 'graph'):
+    if agent in ('ACI-impr', 'test', 'stage', 'graph'):
         from swebench.harness.test_spec import evaluation_toolchain_override
         override = evaluation_toolchain_override(row)
         if override:

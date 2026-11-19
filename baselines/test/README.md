@@ -1,15 +1,13 @@
 # test: Rust-oriented repair agent
 
-The default `graph` mode orchestrates the four roles (`Navigator`, `Architect`,
+The `graph` mode orchestrates the four roles (`Navigator`, `Architect`,
 `Fixer`, `Verifier`) plus deterministic QA as a constrained directed Agent Graph
 (`langgraph.graph.StateGraph` + `Command`), routing localized issues along the
 Fast Path, allowing direct `Fixer -> Navigator` and `Verifier -> Navigator`
 relocalization edges without Architect detours, and combining Red-phase lock
-releases with RepairPlans. Set `RUSTBENCH_REPAIR_MODE=staged` for the legacy
-linear staged controller or `RUSTBENCH_REPAIR_MODE=continuous` for the
-single-conversation continuous repair mode.
+releases with RepairPlans.
 
-Both modes retain existing edits across replanning and allow explicit checkpoint
+Existing edits are retained across replanning and allow explicit checkpoint
 restores. Final QA checks affected crates and the workspace with the evaluation
 feature selection after removing temporary regression tests, then attempts bounded
 existing library and integration tests. Failed compile checks are compared with

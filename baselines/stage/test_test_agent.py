@@ -45,26 +45,18 @@ def test_run_agent_defaults_to_staged_multi_agent_and_reports_toolchain(agent_mo
     state = SimpleNamespace(patch="", close=Mock(), rust_info={"source": "benchmark", "rustc": "rustc 1.72.0", "cargo": "cargo 1.72.0"})
     make_tools = Mock(return_value=([], state))
     monkeypatch.setattr(agent_module, "make_tools", make_tools)
-    monkeypatch.delenv("RUSTBENCH_REPAIR_MODE", raising=False)
     trace = Mock()
     staged_mock = Mock(return_value="diff --git a/lib.rs b/lib.rs\n")
-    continuous_mock = Mock(return_value="continuous-patch")
     monkeypatch.setattr(agent_module._multi_agent, "run_multi_agent", staged_mock)
-    monkeypatch.setattr(agent_module._multi_agent, "run_continuous_repair", continuous_mock)
 
     patch = agent_module.run_agent(tmp_path, "issue", "model", "key", "https://example.com", trace=trace, max_api_calls=12, rust_version="1.72.0")
     assert patch == "diff --git a/lib.rs b/lib.rs\n"
     make_tools.assert_called_once_with(tmp_path, "1.72.0")
     trace.record.assert_called_once_with("rust_environment", **state.rust_info)
     staged_mock.assert_called_once()
-    continuous_mock.assert_not_called()
     assert "rustc 1.72.0" in staged_mock.call_args.args[1]
     assert staged_mock.call_args.args[4] == "https://example.com"
     state.close.assert_called_once()
-
-    monkeypatch.setenv("RUSTBENCH_REPAIR_MODE", "continuous")
-    assert agent_module.run_agent(tmp_path, "issue", "model", "key") == "continuous-patch"
-    continuous_mock.assert_called_once()
 
 
 def test_run_agent_rejects_missing_patch(agent_module, monkeypatch, tmp_path):
