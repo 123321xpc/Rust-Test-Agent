@@ -142,7 +142,7 @@ def test_attrs_and_symbol_details_helpers(tmp_path):
         encoding="utf-8"
     )
     import importlib.util
-    spec = importlib.util.spec_from_file_location("rust_symbols_mod", Path('baselines/test/rust_symbols.py'))
+    spec = importlib.util.spec_from_file_location("rust_symbols_mod", Path(__file__).with_name("rust_symbols.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 

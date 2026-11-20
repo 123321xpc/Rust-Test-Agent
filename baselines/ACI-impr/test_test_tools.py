@@ -1308,5 +1308,50 @@ def test_aci_inline_test_blocking_and_all_features_and_compiling_fallback(tmp_pa
         snap_patch = state.auto_submit_verified_patch(allow_unverified_fallback=True)
         assert "+pub fn v() -> i32 { 2 }" in snap_patch
         assert "broken" not in snap_patch
+
+        # 4. Unverified fallback also recovers _last_compiling_snapshot after revert_file clears edits
+        state.patch = ""
+        tools["revert_file"].invoke({"path": "src/lib.rs"})
+        assert [p for p in state.changed_paths() if p not in state.regression_tests] == []
+        recovered_after_revert = state.auto_submit_verified_patch(allow_unverified_fallback=True)
+        assert "+pub fn v() -> i32 { 2 }" in recovered_after_revert
+    finally:
+        state.close()
+
+
+def test_aci_generate_patch_catches_existing_test_regression_once_per_revision(tmp_path, monkeypatch):
+    repo = tmp_path / "aci_reg_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "aci_reg"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text("pub fn v() -> i32 { 1 }\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("tools_aci_reg", Path(__file__).with_name("tools.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tools_list, state = m.make_tools(repo, require_reproduction=False, post_strip_check=True)
+    tools = {t.name: t for t in tools_list}
+    try:
+        orig_run = subprocess.run
+        tools["write_regression_test"].invoke({"path": "tests/test_regression_x.rs", "content": "#[test] fn x() {}\n"})
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "1", "new_text": "2"})
+
+        def fake_cargo(cmd, **kw):
+            if cmd and cmd[0] == "cargo":
+                if "test" in cmd and "--lib" in cmd:
+                    cur = (state.root / "src" / "lib.rs").read_text(encoding="utf-8")
+                    if "{ 2 }" in cur:
+                        return subprocess.CompletedProcess(cmd, 101, "test existing_case ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored;\n", "")
+                    return subprocess.CompletedProcess(cmd, 0, "test result: ok. 1 passed; 0 failed; 0 ignored;\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "test result: ok. 1 passed; 0 failed; 0 ignored;\n", "")
+            return orig_run(cmd, **kw)
+
+        monkeypatch.setattr(subprocess, "run", fake_cargo)
+        state.pass_test(state.start_test(), test_target="test_regression_x")
+        first = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "Existing crate tests regressed" in first
+        assert "existing_case" in first
+        # Resubmitting at the same revision proceeds without deadlocking
+        second = tools["generate_patch"].invoke({"paths": ["src/lib.rs"]})
+        assert "+pub fn v() -> i32 { 2 }" in second
     finally:
         state.close()

@@ -152,3 +152,26 @@ def test_eval_toolchain_override_sets_rustup_toolchain(tmp_path, monkeypatch):
     assert info["source"] == "evaluation_override"
     assert info["selected"] == "1.72.0"
     assert [call[0] for call in calls] == [["rustc", "--version"], ["cargo", "--version"]]
+
+
+def test_prepare_rust_environment_retries_transient_rustup_download(tmp_path, monkeypatch):
+    import subprocess
+    root = tmp_path / "checkout"
+    root.mkdir()
+    attempts = {"rustc": 0}
+    monkeypatch.setattr(environment.time, "sleep", lambda _s: None)
+
+    def run(command, **kwargs):
+        if command[0] == "rustc":
+            attempts["rustc"] += 1
+            if attempts["rustc"] == 1:
+                raise subprocess.CalledProcessError(
+                    1, command,
+                    stderr="error: could not download file from 'https://rsproxy.cn/...': status code: 504",
+                )
+        return SimpleNamespace(stdout=f"{command[0]} 1.47.0\n")
+
+    monkeypatch.setattr(environment.subprocess, "run", run)
+    _env, info = environment.prepare_rust_environment(root, "1.47.0")
+    assert attempts["rustc"] == 2
+    assert info["rustc"] == "rustc 1.47.0"

@@ -240,6 +240,15 @@ def allocate_stage_budgets(max_api_calls: int | None) -> dict[str, int | None]:
             "verifier_reserve": reserve,
         }
     reserve = max(3, min(5, max_api_calls // 25))
+    if max_api_calls > 150:
+        return {
+            "total": max_api_calls,
+            "navigator_cap": max(32, min(44, int(max_api_calls * 0.22))),
+            "suggester_cap": max(8, min(12, int(max_api_calls * 0.06))),
+            "fixer_attempt_cap": max(14, int(max_api_calls * 0.38)),
+            "verifier_cap": max(8, min(12, max_api_calls // 16)),
+            "verifier_reserve": reserve,
+        }
     return {
         "total": max_api_calls,
         "navigator_cap": max(8, min(32, int(max_api_calls * 0.22))),
@@ -302,14 +311,13 @@ def route_after_navigation(blackboard: dict[str, Any], state: Any) -> tuple[str,
         reasons.append("navigator could not distinguish root-cause chains")
     if len(effective_files) > 2:
         reasons.append(f"repair spans {len(effective_files)} candidate files")
-    if signals.get("mentions_new_api"):
-        reasons.append("issue requests a new public API")
 
-    # Keep localized single-file bugs on Fast Path; CLI/trait/macro signals and CKG
+    # Keep localized single-file bugs on Fast Path; API/CLI/trait/macro signals and CKG
     # consumer fan-out escalate to architecture planning only when multiple files or chains are involved.
     multi_target = len(effective_files) > 1 or len(chains) > 1
     if multi_target:
         for sig_key, sig_label in (
+            ("mentions_new_api", "issue requests a new public API"),
             ("mentions_cli_or_additive_flag", "issue adds or modifies CLI/additive options"),
             ("mentions_trait_or_lifetime", "issue involves trait/lifetime/generic bounds"),
             ("mentions_macro", "issue involves macros"),
@@ -1645,6 +1653,85 @@ def _synthesize_ordered_edits_from_chains(chains: list[dict[str, Any]], max_step
     return edits
 
 
+def _restore_inline_test_regions(orig_text: str, cur_text: str) -> str:
+    """Restore pre-existing inline #[cfg(test)]/mod tests blocks from orig_text while keeping production edits."""
+    import difflib
+    ranges = _inline_test_line_ranges(orig_text)
+    if not ranges:
+        return cur_text
+    orig_lines = orig_text.splitlines(keepends=True)
+    cur_lines = cur_text.splitlines(keepends=True)
+
+    def _in_ranges(idx1: int, idx2: int, is_insert: bool) -> bool:
+        if is_insert:
+            return any(s <= idx1 <= e - 1 for s, e in ranges)
+        return any(not (idx2 < s or (idx1 + 1) > e) for s, e in ranges)
+
+    out: list[str] = []
+    matcher = difflib.SequenceMatcher(None, orig_lines, cur_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            out.extend(cur_lines[j1:j2])
+        elif _in_ranges(i1, i2, tag == "insert"):
+            out.extend(orig_lines[i1:i2])
+        else:
+            out.extend(cur_lines[j1:j2])
+    return "".join(out)
+
+
+def _strip_inline_test_edits_for_fallback(
+    state: Any,
+    issue_contract: dict[str, Any],
+    selected: list[Path],
+    trace: Any = None,
+) -> tuple[list[Path], str]:
+    """Strip conflicting test-file or inline #[cfg(test)] edits in fallback while preserving production changes."""
+    allows_tests, _ = _issue_allows_test_or_doc_changes(issue_contract)
+    if allows_tests or not selected:
+        return selected, ""
+    root = state.root.resolve()
+    snap = state._capture_snapshot() if hasattr(state, "_capture_snapshot") else None
+    changed_any = False
+    kept: list[Path] = []
+    for rel in selected:
+        rel_str = rel.as_posix()
+        if _is_benchmark_test_path(rel_str):
+            changed_any = True
+            continue
+        kept.append(rel)
+        if not rel_str.lower().endswith(".rs") or _is_non_prod_path(rel_str):
+            continue
+        orig = getattr(state, "originals", {}).get(rel)
+        fpath = root / rel
+        if not orig or orig[0] is None or not fpath.is_file():
+            continue
+        orig_text = orig[0].decode("utf-8", errors="replace")
+        cur_text = fpath.read_bytes().decode("utf-8", errors="replace")
+        restored = _restore_inline_test_regions(orig_text, cur_text)
+        if restored != cur_text:
+            fpath.write_bytes(restored.encode("utf-8"))
+            changed_any = True
+    if not changed_any or not kept:
+        if snap is not None and changed_any and hasattr(state, "_restore_snapshot"):
+            state._restore_snapshot(snap)
+        return selected, ""
+    try:
+        if getattr(state, "post_strip_check", False):
+            state.run_post_strip_check(kept)
+        new_patch = state.build_patch(kept)
+    except Exception:
+        if snap is not None and hasattr(state, "_restore_snapshot"):
+            state._restore_snapshot(snap)
+        return selected, ""
+    if not new_patch:
+        if snap is not None and hasattr(state, "_restore_snapshot"):
+            state._restore_snapshot(snap)
+        return selected, ""
+    if trace:
+        trace.record("stripped_inline_test_conflicts_in_fallback", files=[p.as_posix() for p in kept])
+    return kept, new_patch
+
+
 def _clean_and_audit_fallback_patch(state: Any, issue_contract: dict[str, Any], patch_text: str, trace: Any = None) -> str:
     """Strip leftover scratch helper scripts and enforce hygiene/inline-test/doctest checks on fallback patches."""
     if not patch_text:
@@ -1689,6 +1776,11 @@ def _clean_and_audit_fallback_patch(state: Any, issue_contract: dict[str, Any], 
         state.patch = ""
         return ""
     gate = _submission_gate_report(state, issue_contract, patch_text, selected)
+    if gate["blocking"] and _detect_benchmark_test_conflicts(patch_text, state, issue_contract):
+        selected, stripped_patch = _strip_inline_test_edits_for_fallback(state, issue_contract, selected, trace=trace)
+        if stripped_patch:
+            patch_text = stripped_patch
+            gate = _submission_gate_report(state, issue_contract, patch_text, selected)
     if gate["blocking"]:
         state.patch = ""
         return ""
@@ -1769,6 +1861,9 @@ def _is_env_dependency_blocker(text: str) -> bool:
         "modifying cargo.lock is prohibited" in low
         or "failed to select a version" in low
         or "perhaps a crate was updated and forgotten to be re-vendored" in low
+        or "lock file version" in low
+        or "lockfile version" in low
+        or "requires a newer cargo" in low
     )
 
 
@@ -1922,6 +2017,19 @@ def _try_degraded_patch_fallback(
     from_compiling_snapshot = False
     patch_text = _relaxed_source_patch(state)
     if (
+        patch_text
+        and allow_unverified_compiling
+        and getattr(state, "post_strip_check", False)
+        and getattr(state, "_last_compiling_prod_snapshot", None) is not None
+        and shutil.which("cargo")
+    ):
+        cur_sel = _extract_selected_source_paths(state)
+        if cur_sel:
+            try:
+                state.run_post_strip_check(cur_sel)
+            except Exception:
+                patch_text = ""
+    if (
         not patch_text
         and allow_unverified_compiling
         and getattr(state, "_last_compiling_prod_snapshot", None) is not None
@@ -1967,6 +2075,12 @@ def _try_degraded_patch_fallback(
             state.patch = ""
             return ""
         hygiene = state.diff_hygiene_report(selected)
+
+    if _detect_benchmark_test_conflicts(patch_text, state, issue_contract):
+        selected, stripped_patch = _strip_inline_test_edits_for_fallback(state, issue_contract or {}, selected, trace=trace)
+        if stripped_patch:
+            patch_text = stripped_patch
+            hygiene = state.diff_hygiene_report(selected) if selected and hasattr(state, "diff_hygiene_report") else {}
 
     if (
         hygiene.get("added_dbg_lines")
@@ -2157,7 +2271,19 @@ def run_deterministic_qa_checks(
     untested_integration_targets = _find_untested_integration_targets(state, selected)
 
     doctest_status = "not_run"
-    if run_doctest_on_shift and hygiene.get("doctest_shifts"):
+    has_doc_code_blocks = False
+    if run_doctest_on_shift and not hygiene.get("doctest_shifts"):
+        root_res_doc = state.root.resolve()
+        for rel_p in selected:
+            fpath = root_res_doc / rel_p
+            if fpath.suffix == ".rs" and fpath.is_file():
+                try:
+                    if re.search(r"^\s*//[/!].*```", fpath.read_text(encoding="utf-8", errors="replace"), re.MULTILINE):
+                        has_doc_code_blocks = True
+                        break
+                except OSError:
+                    continue
+    if run_doctest_on_shift and (hygiene.get("doctest_shifts") or has_doc_code_blocks):
         import subprocess
         import shutil
         if shutil.which("cargo"):
@@ -2179,7 +2305,11 @@ def run_deterministic_qa_checks(
                         doc_cmd, cwd=root, capture_output=True, text=True,
                         encoding="utf-8", errors="replace", timeout=90, env=state.rust_env,
                     )
-                    doctest_status = "passed" if doc_res.returncode == 0 else f"failed (exit={doc_res.returncode}): {(doc_res.stdout + doc_res.stderr)[-800:]}"
+                    if doc_res.returncode == 0:
+                        doctest_status = "passed"
+                    else:
+                        doctest_status = f"failed (exit={doc_res.returncode}): {(doc_res.stdout + doc_res.stderr)[-800:]}"
+                        warnings.append(f"Doctest check failed: {doctest_status[:240]}")
                 except subprocess.TimeoutExpired:
                     doctest_status = "timeout_skipped"
                 except Exception as exc:
@@ -2556,6 +2686,35 @@ def _make_handoff_tools(
                 return "Error: no Architect plan exists; select not_applicable or not_checked."
             if norm == "REJECT" and not (objections or missing_requirements):
                 return "Error: provide concrete objections or missing_requirements when rejecting."
+            if norm == "APPROVE" and state is not None:
+                probes = activity.get("probe_results") or []
+                failing_reg_probes = [
+                    p for p in probes
+                    if p.get("status") == "failed" and int(p.get("tests_failed") or 0) > 0
+                    and any("__test_regression_" in str(ft) or "test_regression_" in str(ft) for ft in (p.get("failed_tests") or []))
+                ]
+                if failing_reg_probes:
+                    return (
+                        "Error: cannot APPROVE while a temporary regression test is failing in verifier_probe "
+                        f"({failing_reg_probes[-1].get('failed_tests')}). Call submit_qa_decision('REJECT', ...) "
+                        "so Fixer fixes the bug or Architect releases/corrects the locked test."
+                    )
+                assertion_probes = [p for p in probes if p.get("probe_type") == "assertion"]
+                if assertion_probes and assertion_probes[-1].get("status") == "failed" and int(assertion_probes[-1].get("tests_failed") or 0) > 0:
+                    return (
+                        "Error: cannot APPROVE when your latest assertion probe failed "
+                        f"({assertion_probes[-1].get('failed_tests')}). Call submit_qa_decision('REJECT', ...) "
+                        "with the failing assertion evidence, or rerun a corrected assertion probe if the probe itself was flawed."
+                    )
+                locked_regs = getattr(state, "_locked_regressions", None) or {}
+                reg_targets = set(state.get_regression_targets().keys()) if hasattr(state, "get_regression_targets") else set()
+                passed_regs = getattr(state, "_passed_regressions", set()) or set()
+                unrepro_reason = str(((blackboard.get("_last_det_qa") or {}).get("unreproduced_reason")) or "")
+                if locked_regs and reg_targets and not (reg_targets <= passed_regs) and not _is_env_dependency_blocker(unrepro_reason):
+                    return (
+                        "Error: cannot APPROVE while a locked Red-phase regression test has not passed. "
+                        "Call submit_qa_decision('REJECT', ...) so Fixer resolves the failure or Architect calls release_locked_regression."
+                    )
             holder["done"] = True
             holder["payload"] = {
                 "decision": norm,
@@ -2653,7 +2812,29 @@ def _wrap_tools_for_role(
             elif __tname == "verifier_probe":
                 activity.setdefault("probes_run", []).append(str(kwargs.get("probe_type") or "existing_test"))
 
-            out = __fn(*args, **kwargs)
+            session_cache = activity.setdefault("_session_read_cache", {})
+            seq_now = activity.get("_session_tool_seq", 0) + 1
+            activity["_session_tool_seq"] = seq_now
+            cache_hit = False
+            cache_key = None
+            if __tname in ("read_lines", "read_file", "cargo_workspace", "inspect_rust_neighborhood"):
+                cache_key = (
+                    revision_before,
+                    __tname,
+                    json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str),
+                )
+                prev_entry = session_cache.get(cache_key)
+                if prev_entry is not None and (seq_now - prev_entry[0]) <= 4:
+                    cache_hit = True
+                    out = (
+                        f"[Duplicate call skipped — identical {__tname} output from {seq_now - prev_entry[0]} "
+                        f"step(s) ago at revision {revision_before} is already in your recent messages.]"
+                    )
+
+            if not cache_hit:
+                out = __fn(*args, **kwargs)
+                if cache_key is not None and isinstance(out, str) and not out.startswith("Error") and '"error"' not in out[:60]:
+                    session_cache[cache_key] = (seq_now, True)
             if coordinator:
                 evidence_id = coordinator.observe(__tname, arguments, out, revision_before)
                 if evidence_id and isinstance(out, str):
@@ -2667,7 +2848,7 @@ def _wrap_tools_for_role(
             if isinstance(out, str):
                 if __tname in ("read_lines", "read_file"):
                     p = str(kwargs.get("path") or (args[0] if args else ""))
-                    if p and not p.startswith("tests/") and "/tests/" not in p and not out.startswith("Error") and ("1: " in out[:40] or (":" in out[:12] and "\n" in out)):
+                    if not cache_hit and p and not p.startswith("tests/") and "/tests/" not in p and not out.startswith("Error") and ("1: " in out[:40] or (":" in out[:12] and "\n" in out)):
                         s_l = kwargs.get("start_line")
                         e_l = kwargs.get("end_line")
                         key = f"{p}:{s_l}-{e_l}" if (s_l is not None or e_l is not None) else p
@@ -2680,12 +2861,21 @@ def _wrap_tools_for_role(
                         )
                 elif __tname == "inspect_rust_neighborhood":
                     tgt = str(kwargs.get("target") or (args[0] if args else ""))
-                    if tgt and '"error"' not in out[:60]:
+                    if not cache_hit and tgt and '"error"' not in out[:60]:
                         activity["ckg_notes"][tgt] = out[:1200]
-                elif __tname in ("edit_file", "write_file", "revert_file"):
-                    p = str(kwargs.get("path") or (args[0] if args else ""))
-                    if p and blackboard is not None:
-                        _invalidate_cached_path(blackboard, activity, p)
+                elif __tname in ("edit_file", "write_file", "revert_file", "write_regression_test"):
+                    session_cache.clear()
+                    if __tname in ("edit_file", "write_file", "revert_file"):
+                        p = str(kwargs.get("path") or (args[0] if args else ""))
+                        if p and blackboard is not None:
+                            _invalidate_cached_path(blackboard, activity, p)
+                elif role == "verifier" and __tname == "verifier_probe" and out.lstrip().startswith("{"):
+                    try:
+                        probe_obj = json.loads(out)
+                        if isinstance(probe_obj, dict):
+                            activity.setdefault("probe_results", []).append(probe_obj)
+                    except Exception:
+                        pass
 
             if isinstance(out, str) and __tname in ("cargo_check", "cargo_test", "edit_file", "write_file") and _is_env_dependency_blocker(out):
                 hits = activity.get("env_blocker_hits", 0) + 1
@@ -3722,6 +3912,8 @@ def _build_verifier_prompt(
         "Compare the plan's arbitration_rationale, ordered_edits, and forbidden_edits with each other and the diff; "
         "report concrete conflicts with field names and evidence. If plan_consistency='conflict', include an explanation "
         "grounded in the issue contract plus concrete test, caller, API, compile, or runtime evidence. "
+        "If the issue contract is satisfied and deterministic/probe tests pass, APPROVE even if the implementation "
+        "deviates from the advisory RepairPlan (set plan_consistency='conflict' with explanation rather than REJECT). "
         "Audit the issue and tests (using search_code/read_file/read_lines as needed to check sibling impls and consumer match arms), then call submit_qa_decision."
     )
 
@@ -3757,7 +3949,7 @@ from types import SimpleNamespace
 _NAV_ALLOWED = [
     "read_file", "read_lines", "search_code", "cargo_workspace",
     "rust_symbols", "inspect_rust_neighborhood", "write_regression_test",
-    "revert_file", "cargo_test", "cargo_check", "rust_trace", "rust_error_explain",
+    "revert_file", "cargo_test", "cargo_check",
 ]
 _SUG_ALLOWED = [
     "read_file", "read_lines", "search_code",
@@ -3766,8 +3958,8 @@ _SUG_ALLOWED = [
 _FIX_ALLOWED = [
     "read_file", "read_lines", "search_code", "cargo_workspace",
     "rust_symbols", "inspect_rust_neighborhood", "edit_file", "write_file",
-    "write_regression_test", "revert_file", "checkpoint",
-    "cargo_check", "cargo_test", "rust_trace", "rust_error_explain",
+    "write_regression_test", "revert_file",
+    "cargo_check", "cargo_test",
 ]
 
 AGENT_GRAPH_EDGES: dict[str, tuple[str, ...]] = {
@@ -3888,7 +4080,7 @@ def _init_orchestration_ctx(
         blackboard=blackboard,
         qa_repair_loop_enabled=qa_repair_loop_enabled,
         max_escalations=min(3, max(2, (max_api_calls or 70) // 25)),
-        max_qa_rounds=min(4, max(2, (max_api_calls or 70) // 15)),
+        max_qa_rounds=min(2, max(1, (max_api_calls or 70) // 35)),
         escalations_used=0,
         qa_rounds=0,
         qa_escalation_sigs=set(),
@@ -4581,17 +4773,12 @@ def _handle_low_budget_det_qa_bypass(ctx: SimpleNamespace, det_qa: dict[str, Any
     ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
     if ctx.trace:
         consistency_pending = bool(ctx.blackboard.get("_qa_repair_pending"))
-        consistency_unchecked = bool(ctx.blackboard.get("repair_plan")) and not consistency_pending
-        if consistency_pending or consistency_unchecked:
+        if consistency_pending:
             _record_consistency_blocked(
                 ctx.trace, ctx.blackboard, ctx.state.patch, ctx.blackboard.get("_last_qa_payload"),
-                reason=(
-                    "Verifier rejection was followed by budget exhaustion before a repair could be re-verified."
-                    if consistency_pending else
-                    "Verifier consistency audit was bypassed because the remaining API budget was exhausted."
-                ),
+                reason="Verifier rejection was followed by budget exhaustion before a repair could be re-verified.",
                 attempt=ctx.qa_rounds + 1,
-                decision="REJECT" if consistency_pending else "BYPASS_LOW_BUDGET",
+                decision="REJECT",
             )
             ctx.trace.record("qa_gate", deterministic_ok=True, llm_decision="CONSISTENCY_BLOCKED", missing_apis=missing_apis)
         else:
@@ -4608,8 +4795,8 @@ def _handle_low_budget_det_qa_bypass(ctx: SimpleNamespace, det_qa: dict[str, Any
             attempt=ctx.qa_rounds + 1,
             features=_build_verifier_handoff_features(ctx.blackboard.get("_last_qa_payload") if consistency_pending else None),
             extra={
-                "decision": "CONSISTENCY_BLOCKED" if (consistency_pending or consistency_unchecked) else "BYPASS_LOW_BUDGET",
-                "outcome": "blocked" if (consistency_pending or consistency_unchecked) else "bypassed",
+                "decision": "CONSISTENCY_BLOCKED" if consistency_pending else "BYPASS_LOW_BUDGET",
+                "outcome": "blocked" if consistency_pending else "bypassed",
                 "ver_prompt_chars": 0,
             },
         )
@@ -4620,6 +4807,7 @@ def _exec_verifier_step(ctx: SimpleNamespace, det_qa: dict[str, Any]) -> tuple[s
     selected = det_qa["selected"]
     hygiene = det_qa["hygiene"]
     ver_activity: dict[str, Any] = {"files_read": [], "symbols_queried": []}
+    ctx.blackboard["_last_det_qa"] = det_qa
     ver_handoff, ver_holder = _make_handoff_tools("verifier", ctx.state, ctx.blackboard, ver_activity)
     ver_tools = _wrap_tools_for_role(
         "verifier", ctx.tools_by_name, list(_VERIFIER_TOOLS),
@@ -5211,6 +5399,21 @@ def run_graph_agent(
                 state_in, "verifier", END, "qa_loop_disabled", "RUSTBENCH_QA_REPAIR_LOOP disabled",
                 update={"final_patch": ctx.state.patch},
             )
+        cur_sig = _repair_progress_signature(ctx.state)
+        escalate_qa, esc_reason = _should_escalate_qa_to_architect(det_qa, ctx.blackboard["qa_history"], ctx.qa_rounds)
+        if escalate_qa and cur_sig in ctx.qa_escalation_sigs:
+            best_raw = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
+            best_clean = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, best_raw, trace=ctx.trace) if best_raw else ""
+            ctx.state.patch = best_clean or hygiene["patch"] or ctx.state.build_patch(selected)
+            _record_consistency_blocked(
+                ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
+                reason=f"QA escalation halted after zero progress since previous escalation: {esc_reason}",
+                attempt=ctx.qa_rounds + 1,
+            )
+            return _transition(
+                state_in, "verifier", END, "qa_stall_stop", esc_reason,
+                update={"final_patch": ctx.state.patch},
+            )
         if ctx.qa_rounds >= ctx.max_qa_rounds or (rem_after_qa is not None and rem_after_qa <= 4):
             ctx.state.patch = hygiene["patch"] or ctx.state.build_patch(selected)
             _record_consistency_blocked(
@@ -5228,26 +5431,11 @@ def run_graph_agent(
 
         ctx.qa_rounds += 1
         ctx.last_qa_feedback = repair_feedback
-        escalate_qa, esc_reason = _should_escalate_qa_to_architect(det_qa, ctx.blackboard["qa_history"], ctx.qa_rounds - 1)
         if (
             escalate_qa
             and ctx.escalations_used < ctx.max_escalations
             and (rem_after_qa is None or rem_after_qa > ctx.budgets["verifier_reserve"] + 6)
         ):
-            cur_sig = _repair_progress_signature(ctx.state)
-            if cur_sig in ctx.qa_escalation_sigs:
-                best_raw = ctx.state.auto_submit_verified_patch(allow_snapshot_fallback=True)
-                best_clean = _clean_and_audit_fallback_patch(ctx.state, ctx.issue_contract, best_raw, trace=ctx.trace) if best_raw else ""
-                ctx.state.patch = best_clean or hygiene["patch"] or ctx.state.build_patch(selected)
-                _record_consistency_blocked(
-                    ctx.trace, ctx.blackboard, ctx.state.patch, ver_payload,
-                    reason=f"QA escalation halted after zero progress since previous escalation: {esc_reason}",
-                    attempt=ctx.qa_rounds + 1,
-                )
-                return _transition(
-                    state_in, "verifier", END, "qa_stall_stop", esc_reason,
-                    update={"final_patch": ctx.state.patch},
-                )
             ctx.qa_escalation_sigs.add(cur_sig)
             failure_route = _classify_failure_route(esc_reason + " " + repair_feedback, ctx.state.stuck_status())
             to_role = "navigator" if failure_route == "navigator" else "suggester"
@@ -5306,7 +5494,12 @@ def run_graph_agent(
             )
         if ctx.fix_session_history and callable(ctx.compress_fn):
             try:
-                ctx.fix_session_history = ctx.compress_fn(ctx.fix_session_history)
+                try:
+                    ctx.fix_session_history = ctx.compress_fn(
+                        ctx.fix_session_history, keep_recent_steps=2, test_cutoff_steps=1,
+                    )
+                except TypeError:
+                    ctx.fix_session_history = ctx.compress_fn(ctx.fix_session_history)
             except Exception:
                 pass
         return _transition(
@@ -5352,6 +5545,8 @@ def run_graph_agent(
         final_state = compiled.invoke(initial_state, config={"recursion_limit": max(64, (max_api_calls or 70) * 2)})
         return str((final_state or {}).get("final_patch") or "")
     except Exception as exc:
+        if getattr(exc, "is_api_server_error", False):
+            raise
         fallback = _try_degraded_patch_fallback(
             state, trace=trace, allow_unverified_compiling=True,
             issue_contract=ctx.issue_contract, blackboard=ctx.blackboard,

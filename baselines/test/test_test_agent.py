@@ -396,3 +396,19 @@ def test_compress_history_invalidates_on_revert_and_folds_old_errors_to_one_line
     assert "subsequent step" in compressed[2].content
     assert "\n" not in compressed[4].content
     assert "earlier edit_file error omitted" in compressed[4].content
+
+
+def test_compress_history_keeps_read_after_failed_edit_file(agent_module):
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    msgs = [
+        HumanMessage(content="start"),
+        AIMessage(content="", tool_calls=[{"id": "c0", "name": "read_lines", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="1: fn target() {}\n" * 5, tool_call_id="c0"),
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "edit_file", "args": {"path": "src/lib.rs"}}]),
+        ToolMessage(content="Error editing src/lib.rs: old_text was not found.", tool_call_id="c1"),
+        AIMessage(content="", tool_calls=[{"id": "c2", "name": "read_lines", "args": {"path": "src/other.rs"}}]),
+        ToolMessage(content="1: other\n", tool_call_id="c2"),
+    ]
+    compressed = agent_module._compress_history_messages(msgs, keep_recent_steps=6, test_cutoff_steps=1)
+    assert "1: fn target()" in compressed[2].content
+    assert "subsequent step" not in compressed[2].content

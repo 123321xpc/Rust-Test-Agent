@@ -63,6 +63,7 @@ def test_extract_issue_contract_and_adaptive_routing(tmp_path):
         state.close()
 
 
+
 def test_allocate_stage_budgets_scales_cleanly():
     ma = _load("multi_agent")
     b150 = ma.allocate_stage_budgets(150)
@@ -336,6 +337,7 @@ def test_deterministic_qa_and_verified_fallback_cannot_bypass_smoke_gate(tmp_pat
         assert ma._clean_and_audit_fallback_patch(state, ma.extract_issue_contract("Fix bug()"), raw) == ""
     finally:
         state.close()
+
 
 
 def test_multi_agent_fast_path_skips_suggester_and_submits(monkeypatch, tmp_path):
@@ -743,6 +745,7 @@ def test_issue_contract_avoids_false_trait_flag_and_captures_expected_result(tmp
         state.close()
 
 
+
 def test_forced_handoff_wrapup_captures_repair_plan_on_stage_cap(tmp_path):
     ma = _load("multi_agent")
     trace_mod = _load("agent_trace")
@@ -844,6 +847,7 @@ def test_single_quoted_prose_not_treated_as_lifetime_and_fast_path_ignores_test_
         state.close()
 
 
+
 def test_mixed_code_doctest_shift_is_nonblocking_and_secondary_prune_works(tmp_path):
     ma = _load("multi_agent")
     tools_mod = _load("tools")
@@ -899,6 +903,7 @@ def test_mixed_code_doctest_shift_is_nonblocking_and_secondary_prune_works(tmp_p
         assert "+pub fn bug() -> i32 { 1 }" in patch
     finally:
         state.close()
+
 def test_wrapup_retry_recovers_after_malformed_handoff_and_synthesizes_edits(tmp_path):
     ma = _load("multi_agent")
     trace_mod = _load("agent_trace")
@@ -1019,6 +1024,7 @@ def test_prune_invalid_regression_targets_and_env_blocker_auto_escalation(tmp_pa
 
 
 
+
 def test_degraded_compiling_snapshot_fallback_and_issue_audit_signals(tmp_path):
     ma = _load("multi_agent")
     tools_mod = _load("tools")
@@ -1063,6 +1069,7 @@ def test_degraded_compiling_snapshot_fallback_and_issue_audit_signals(tmp_path):
         assert "+pub fn bug() -> i32 { 1 }" in recovered
     finally:
         state.close()
+
 
 def test_p0_handoff_feature_snapshots_recorded_on_fast_and_planned_paths(monkeypatch, tmp_path):
     agent_mod = _load("agent")
@@ -1228,6 +1235,7 @@ def test_fixer_read_only_streak_warns_and_auto_escalates(tmp_path):
         state.close()
 
 
+
 def test_unreproduced_reason_requires_evidence_and_degraded_guards_hygiene(tmp_path):
     ma = _load("multi_agent")
     tools_mod = _load("tools")
@@ -1269,6 +1277,7 @@ def test_unreproduced_reason_requires_evidence_and_degraded_guards_hygiene(tmp_p
         assert ev["last_qa_decision"] == "REJECT"
     finally:
         state.close()
+
 
 
 def test_handoff_card_unit_scoped_and_shared_memory_prioritizes_root_files():
@@ -1576,12 +1585,12 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
         }, state)
         assert route_cli_single == "fast"
 
-        # mentions_new_api still routes to Planned Path even for 1 file
-        route_api, api_reasons = ma.route_after_navigation({
+        # Single-file mentions_new_api stays on Fast Path; multi-file mentions_new_api routes to Planned Path
+        route_api_single, _ = ma.route_after_navigation({
             "issue_contract": {"signals": {"mentions_new_api": True}},
             "localization": base_loc,
         }, state)
-        assert route_api == "planned" and any("new public API" in r for r in api_reasons)
+        assert route_api_single == "fast"
 
         multi_loc = {
             "candidate_chains": [{
@@ -1594,6 +1603,11 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
             "reproduction_status": "runtime_failure",
             "needs_architecture_planning": False,
         }
+        route_api, api_reasons = ma.route_after_navigation({
+            "issue_contract": {"signals": {"mentions_new_api": True}},
+            "localization": multi_loc,
+        }, state)
+        assert route_api == "planned" and any("new public API" in r for r in api_reasons)
 
         # Multi-file CKG impact surface forces planned, while 1-file CKG consumer fan-out stays fast
         orig_builder = ma._rust_impact.build_impact_surface
@@ -1617,6 +1631,7 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
             ma._rust_impact.build_impact_surface = orig_builder
     finally:
         state.close()
+
 
 
 def test_scheduled_fixer_omits_duplicate_user_prompt_on_subsequent_slices(tmp_path, monkeypatch):
@@ -1661,6 +1676,7 @@ def test_scheduled_fixer_omits_duplicate_user_prompt_on_subsequent_slices(tmp_pa
         assert "Continue" in prompts_seen[1]
     finally:
         state.close()
+
 
 
 def test_graph_agent_red_lock_routes_unlock_followup_and_stall_breaker(monkeypatch, tmp_path):
@@ -2009,6 +2025,7 @@ def test_scheduled_fixer_omits_unchanged_file_excerpts_across_slices(tmp_path, m
         state.close()
 
 
+
 def test_extract_issue_contract_adds_is_empty_companion_hint_and_verifier_conflict_basis():
     ma = _load("multi_agent")
     contract = ma.extract_issue_contract("Add `len` method to `broadcast::Sender`")
@@ -2119,6 +2136,7 @@ def test_localization_plan_and_fixer_zero_edit_circuit_breakers(tmp_path):
         state.close()
 
 
+
 def test_verifier_blocks_false_approve_and_replan_prune_allows_zero_edit_retry(tmp_path):
     ma = _load("multi_agent")
     tools_mod = _load("tools")
@@ -2162,6 +2180,7 @@ def test_verifier_blocks_false_approve_and_replan_prune_allows_zero_edit_retry(t
         assert "locked Red-phase regression test" in blocked_lock and not ver_holder2["done"]
     finally:
         state.close()
+
 
 
 def test_graph_budget_200_and_fallback_strips_inline_tests_and_uses_compiling_snapshot(tmp_path, monkeypatch):
@@ -2214,4 +2233,106 @@ def test_graph_budget_200_and_fallback_strips_inline_tests_and_uses_compiling_sn
         assert "broken" not in snap_patch
     finally:
         state.close()
+
+
+def test_graph_qa_cap_tool_allowlist_session_dedup_and_doctest_trigger(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    trace_mod = _load("agent_trace")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "lib.rs").write_text(
+        "/// Example:\n/// ```\n/// assert_eq!(demo::val(), 2);\n/// ```\npub fn val() -> i32 { 1 }\n",
+        encoding="utf-8",
+    )
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        assert "checkpoint" not in ma._NAV_ALLOWED and "checkpoint" not in ma._FIX_ALLOWED
+        assert "rust_error_explain" not in ma._NAV_ALLOWED and "rust_error_explain" not in ma._FIX_ALLOWED
+
+        ctx = ma._init_orchestration_ctx(
+            repo, "Fix val", "m", "k", None,
+            tools=tools_list, state=state, client=SimpleNamespace(calls_made=0),
+            trace=None, max_api_calls=70, compress_fn=lambda m: m,
+            create_agent_fn=Mock(), chat_model_factory=Mock(),
+            prompts_mod=SimpleNamespace(), role_callback_cls=None,
+        )
+        assert ctx.max_qa_rounds == 2
+
+        activity = {"files_read": [], "symbols_queried": []}
+        wrapped = {
+            t.name: t
+            for t in ma._wrap_tools_for_role(
+                "fixer", tools, ["read_lines", "edit_file"], [], {}, state,
+                SimpleNamespace(calls_made=0), 0, 50, activity,
+                auto_escalate_on_stuck=False, blackboard={},
+            )
+        }
+        first = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        second = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        assert "pub fn val" in first
+        assert "Duplicate call skipped" in second
+
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 1 }", "new_text": "pub fn val() -> i32 { 2 }"})
+        after_edit = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        assert "pub fn val() -> i32 { 2 }" in after_edit
+
+        doc_cmds = []
+        monkeypatch.setattr(ma.shutil, "which", lambda cmd: "/usr/bin/cargo" if cmd == "cargo" else None)
+        import subprocess as sp_mod
+        orig_sp_run = sp_mod.run
+        monkeypatch.setattr(
+            sp_mod, "run",
+            lambda cmd, **kw: (
+                (doc_cmds.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+                if cmd and cmd[0] == "cargo"
+                else orig_sp_run(cmd, **kw)
+            ),
+        )
+        state.run_existing_test_smoke = lambda sel: []
+        qa = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix val"), run_doctest_on_shift=True)
+        assert qa["ok"] is True and qa["doctest_status"] == "passed"
+        assert doc_cmds and "--doc" in doc_cmds[0]
+
+        trace = trace_mod.TraceRecorder(tmp_path / "bypass.jsonl")
+        ctx_bypass = SimpleNamespace(
+            state=state,
+            blackboard={"repair_plan": {"selected_chain_id": "C1"}, "_qa_repair_pending": False},
+            trace=trace,
+            qa_rounds=0,
+        )
+        ma._handle_low_budget_det_qa_bypass(ctx_bypass, {"selected": [Path("src/lib.rs")], "hygiene": {"patch": "+x"}, "missing_contract_apis": []})
+        assert not ctx_bypass.blackboard.get("consistency_blocked")
+    finally:
+        state.close()
+
+
+def test_graph_agent_reraises_api_server_error_without_degraded_fallback(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+
+        def invoke(inputs, config):
+            if "edit_file" in tmap:
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+            raise agent_mod._trace.APIServerError(503, 3)
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    with pytest.raises(agent_mod._trace.APIServerError):
+        agent_mod.run_agent(repo, "Fix `bug`", "m", "k", max_api_calls=70)
+
 

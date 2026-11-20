@@ -419,11 +419,13 @@ def _format_line_window(text: str, center_line: int, radius: int = 3) -> str:
     )
 
 
-def _find_unclosed_noncode(source: str) -> tuple[str, int] | None:
+def _find_unclosed_noncode(source: str, inner_doc_lines: set[int] | None = None) -> tuple[str, int] | None:
     """Return (description, 1-based line) if a comment or string/raw-string literal is unclosed at EOF."""
     n, i = len(source), 0
     while i < n:
         if source.startswith("//", i):
+            if inner_doc_lines is not None and source.startswith("//!", i):
+                inner_doc_lines.add(source.count("\n", 0, i) + 1)
             end = source.find("\n", i)
             i = n if end < 0 else end + 1
         elif source.startswith("/*", i):
@@ -492,7 +494,8 @@ def _check_rust_syntax(path_str: str, content: str, original_content: str | None
     """Validate delimiter balance, unclosed comments/strings, and E0753 before writing .rs files."""
     if not path_str.endswith(".rs") or not content.strip():
         return
-    unclosed = _find_unclosed_noncode(content)
+    inner_doc_lines: set[int] = set()
+    unclosed = _find_unclosed_noncode(content, inner_doc_lines=inner_doc_lines)
     if unclosed is not None:
         desc, err_line = unclosed
         raise _syntax_rejection_error(
@@ -537,31 +540,40 @@ def _check_rust_syntax(path_str: str, content: str, original_content: str | None
             content, original_content,
         )
 
-    has_item = False
-    first_item_line = None
-    for lineno, line in enumerate(lines, 1):
-        s = line.strip()
-        if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*"):
-            if (s.startswith("//!") or s.startswith("#![")) and has_item:
+    masked_lines = masked.splitlines()
+    scope_first_item: list[int | None] = [None]
+    attr_depth = 0
+    for lineno, raw_line in enumerate(lines, 1):
+        code_line = masked_lines[lineno - 1] if lineno - 1 < len(masked_lines) else ""
+        ms = code_line.strip()
+        if attr_depth > 0:
+            attr_depth = max(0, attr_depth + ms.count("[") - ms.count("]"))
+        elif ms.startswith("#!["):
+            if scope_first_item[-1] is not None:
                 raise _syntax_rejection_error(
                     path_str, lineno,
-                    f"inner attribute or doc comment ('{s[:25]}') found after code declarations at line {first_item_line} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
+                    f"inner attribute ('{ms[:25]}') found after code declarations at line {scope_first_item[-1]} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
                     content, original_content,
                 )
-            continue
-        if s.startswith("#!["):
-            if has_item:
-                raise _syntax_rejection_error(
-                    path_str, lineno,
-                    f"inner attribute ('{s[:25]}') found after code declarations at line {first_item_line} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
-                    content, original_content,
-                )
-            continue
-        if s.startswith("#["):
-            continue
-        if not has_item:
-            has_item = True
-            first_item_line = lineno
+            attr_depth = max(0, ms.count("[") - ms.count("]"))
+        elif ms.startswith("#["):
+            attr_depth = max(0, ms.count("[") - ms.count("]"))
+        elif ms:
+            for ch in code_line:
+                if ch == "{":
+                    scope_first_item.append(None)
+                elif ch == "}":
+                    if len(scope_first_item) > 1:
+                        scope_first_item.pop()
+                elif not ch.isspace() and scope_first_item[-1] is None:
+                    scope_first_item[-1] = lineno
+        if lineno in inner_doc_lines and scope_first_item[-1] is not None:
+            s = raw_line.strip()
+            raise _syntax_rejection_error(
+                path_str, lineno,
+                f"inner attribute or doc comment ('{s[:25]}') found after code declarations at line {scope_first_item[-1]} (Rust compiler error E0753); inner attributes/docs must be at the top of the file/module",
+                content, original_content,
+            )
 
 
 def _format_edit_snippet(content: str, line_ranges: list[tuple[int, int]], context: int = 6) -> str:
@@ -639,7 +651,16 @@ def _apply_one_replacement(
 
     if position >= 0:
         if target_region.find(actual_old, position + 1) >= 0:
-            raise ValueError("old_text matches more than once; provide more context or start_line/end_line")
+            match_lines = []
+            pos = position
+            while pos >= 0 and len(match_lines) < 5:
+                match_lines.append(line_offset + target_region.count("\n", 0, pos) + 1)
+                pos = target_region.find(actual_old, pos + 1)
+            locs = ", ".join(str(ln) for ln in match_lines)
+            raise ValueError(
+                f"old_text matches more than once (starting at line(s): {locs}); "
+                "provide more context or start_line/end_line"
+            )
         start_line_out = line_offset + target_region.count("\n", 0, position) + 1
         end_line_out = start_line_out + actual_new.count("\n")
         updated_region = target_region[:position] + actual_new + target_region[position + len(actual_old):]
@@ -656,7 +677,11 @@ def _apply_one_replacement(
             if stripped_win == stripped_old:
                 matches.append(i)
         if len(matches) > 1:
-            raise ValueError("old_text matches more than once (whitespace-fuzzy match); provide more context or start_line/end_line")
+            locs = ", ".join(str(line_offset + idx + 1) for idx in matches[:5])
+            raise ValueError(
+                f"old_text matches more than once (whitespace-fuzzy match at line(s): {locs}); "
+                "provide more context or start_line/end_line"
+            )
         if len(matches) == 1:
             idx = matches[0]
             matched_slice = target_lines[idx:idx + len(old_lines)]
@@ -1118,6 +1143,7 @@ class PatchState:
         self._red_lock_violations: list[dict[str, Any]] = []
         self._slow_smoke_targets: set[str] = set()
         self._unlocked_regressions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._compile_failed_regressions: set[tuple[str, str]] = set()
         self._consecutive_edit_failures: dict[str, int] = {}
 
     def record_edit_outcome(self, path_key: str, success: bool) -> str:
@@ -2271,9 +2297,11 @@ class PatchState:
                 targets = discover_integration_test_targets(manifest)
                 if targets:
                     stems = {p.stem.lower() for p in selected_paths}
+                    stem_tokens = {tok for s in stems for tok in re.split(r"[_/.-]+", s) if len(tok) >= 3}
                     related = {
                         name for name in targets
                         if any(stem in name.lower() or name.lower() in stem for stem in stems if len(stem) >= 3)
+                        or bool(stem_tokens & {t for t in re.split(r"[_-]+", name.lower()) if len(t) >= 3})
                     }
                     integration_targets = {name for name in targets if "integration" in name.lower()}
                     related.update(integration_targets)
@@ -2935,6 +2963,7 @@ class PatchState:
                             self._verified_revision = None
                         else:
                             self._passed_regressions.add(key)
+                            self._compile_failed_regressions.discard((str(key[0]), key[1]))
                             self._passed_regression_configs[key] = {
                                 "package": package,
                                 "features": list(features) if features else None,
@@ -3020,9 +3049,12 @@ class PatchState:
                         runtime_failure = (executed > 0 or aborted_after_start) and (returncode != 0 or returncode is None or bool(failures))
                         compile_repro = False
                         if executed == 0 and not aborted_after_start and returncode is not None and returncode != 0:
+                            self._compile_failed_regressions.add((str(key[0]), key[1]))
                             err_codes = {d.get("code") for d in (compile_errors or []) if d.get("code")}
                             if clean_red and bool(err_codes & self._API_COMPILE_ERROR_CODES):
                                 compile_repro = True
+                        else:
+                            self._compile_failed_regressions.discard((str(key[0]), key[1]))
                         if runtime_failure or compile_repro:
                             suspect_setup = False
                             if runtime_failure and failure_details and all(
@@ -3362,9 +3394,58 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
         """
         return _write_file_impl(path, content, force=force, from_edit=False)
 
+    def _try_unlock_broken_oracle(
+        locked_meta: dict[str, Any],
+        locked_key: tuple[Any, ...],
+        reason: str,
+    ) -> str | None:
+        clean_reason = str(reason or "").strip()
+        if len(clean_reason) < 20:
+            return (
+                "Error: replace_broken_lock_reason must be at least 20 characters explaining "
+                "why the locked oracle failed to compile, panicked in setup, or was static-only."
+            )
+        repro_info = next(
+            (
+                v for k, v in state._reproduced_regressions.items()
+                if str(k[0]) == str(locked_key[0]) and str(k[1]) == str(locked_key[1])
+            ),
+            {},
+        )
+        is_compile_broken = (str(locked_key[0]), str(locked_key[1])) in getattr(state, "_compile_failed_regressions", set())
+        is_setup_panic = bool(repro_info.get("suspect_setup_panic"))
+        existing_src = ""
+        rel_path = locked_meta.get("path", "")
+        if locked_meta.get("is_in_module") and rel_path:
+            existing_src = str((state.in_module_regressions.get(Path(rel_path)) or {}).get("content") or "")
+        elif rel_path:
+            fpath = root / rel_path
+            if fpath.is_file():
+                try:
+                    existing_src = fpath.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    existing_src = ""
+        is_static_only = bool(existing_src and _is_static_manifest_only_test(existing_src))
+        if not (is_compile_broken or is_setup_panic or is_static_only):
+            return (
+                f"Error: locked regression '{locked_meta.get('name')}' failed with an assertion failure "
+                "(not compile error, setup panic, or static-only check); cannot self-unlock via "
+                "replace_broken_lock_reason. Fix production code or call escalate_for_replan."
+            )
+        res = state.unlock_regression(locked_meta.get("name", ""), clean_reason, approved_by="fixer_broken_oracle")
+        if not res.get("ok"):
+            return f"Error unlocking broken oracle: {res.get('error', 'unknown')}"
+        return None
+
     @tool
     @synchronized
-    def write_regression_test(path: str, content: str, target_src: str | None = None, run_now: bool = False) -> str:
+    def write_regression_test(
+        path: str,
+        content: str,
+        target_src: str | None = None,
+        run_now: bool = False,
+        replace_broken_lock_reason: str = "",
+    ) -> str:
         """Create or replace a temporary Cargo integration test or in-module unit test.
 
         Modes:
@@ -3373,6 +3454,8 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
            `#[cfg(test)] mod __test_regression_<name> { use super::*; ... }` block at the end of the
            target source file. Useful for testing internal logic, pub(crate), or private functions.
            Automatically stripped from final patches and post-strip checks.
+        If replacing a locked test that failed to compile, panicked in setup, or only checked Cargo.toml
+        statically, pass replace_broken_lock_reason (>= 20 chars) to unlock and rewrite it in place.
         """
         try:
             if _contains_compression_placeholder(content):
@@ -3432,43 +3515,57 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 _check_rust_syntax(relative.as_posix(), updated_text, original_content=orig_text)
 
                 locked_meta = None
+                locked_key = None
                 for prev_key, prev_lock in list(state._locked_regressions.items()):
                     if prev_lock.get("is_in_module") and prev_lock.get("path") == relative.as_posix():
                         locked_meta = prev_lock
+                        locked_key = prev_key
                         break
                 if locked_meta and locked_meta.get("name") != clean_name:
-                    state._record_red_lock_violation(
-                        "rewrite_locked_regression", relative.as_posix(),
-                        f"Locked regression '{locked_meta.get('name')}' may not be replaced by '{clean_name}'.",
-                    )
-                    return (
-                        f"Error: the Red-phase regression test '{locked_meta.get('name')}' in {relative.as_posix()} is locked "
-                        "as the issue's contract oracle and cannot be replaced or renamed. "
-                        "Fix the production code so the locked test passes instead of rewriting the test. "
-                        "If the locked test is factually wrong, call escalate_for_replan with the concrete reason."
-                    )
-                if locked_meta and locked_meta.get("name") == clean_name:
-                    proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    if proposed_sha != locked_meta.get("sha256"):
+                    if replace_broken_lock_reason:
+                        unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
+                        if unlock_err:
+                            return unlock_err
+                    else:
                         state._record_red_lock_violation(
                             "rewrite_locked_regression", relative.as_posix(),
-                            f"Locked regression '{clean_name}' content was modified.",
+                            f"Locked regression '{locked_meta.get('name')}' may not be replaced by '{clean_name}'.",
                         )
-                        for reg_key_now in [
-                            k for k in list(state._reproduced_regressions)
-                            if str(k[1]) == clean_name
-                        ]:
-                            state._reproduced_regressions.pop(reg_key_now, None)
-                            state._passed_regressions.discard(reg_key_now)
-                            state._passed_regression_configs.pop(reg_key_now, None)
-                            state._reproduction_notes.pop(reg_key_now, None)
-                            state._regression_test_names.pop(reg_key_now, None)
-                        state._verified_revision = None
                         return (
-                            f"Error: the Red-phase regression test '{clean_name}' in {relative.as_posix()} is locked "
-                            "and its assertions cannot be changed. Fix the production code so the locked test passes "
-                            "instead of editing the test, or call escalate_for_replan with the concrete reason."
+                            f"Error: the Red-phase regression test '{locked_meta.get('name')}' in {relative.as_posix()} is locked "
+                            "as the issue's contract oracle and cannot be replaced or renamed. "
+                            "Fix the production code so the locked test passes instead of rewriting the test. "
+                            "If the locked test fails to compile, panics in setup, or is static-only, pass "
+                            "replace_broken_lock_reason (>=20 chars) to replace it; otherwise call escalate_for_replan."
                         )
+                elif locked_meta and locked_meta.get("name") == clean_name:
+                    proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    if proposed_sha != locked_meta.get("sha256"):
+                        if replace_broken_lock_reason:
+                            unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
+                            if unlock_err:
+                                return unlock_err
+                        else:
+                            state._record_red_lock_violation(
+                                "rewrite_locked_regression", relative.as_posix(),
+                                f"Locked regression '{clean_name}' content was modified.",
+                            )
+                            for reg_key_now in [
+                                k for k in list(state._reproduced_regressions)
+                                if str(k[1]) == clean_name
+                            ]:
+                                state._reproduced_regressions.pop(reg_key_now, None)
+                                state._passed_regressions.discard(reg_key_now)
+                                state._passed_regression_configs.pop(reg_key_now, None)
+                                state._reproduction_notes.pop(reg_key_now, None)
+                                state._regression_test_names.pop(reg_key_now, None)
+                            state._verified_revision = None
+                            return (
+                                f"Error: the Red-phase regression test '{clean_name}' in {relative.as_posix()} is locked "
+                                "and its assertions cannot be changed. Fix the production code so the locked test passes "
+                                "instead of editing the test, pass replace_broken_lock_reason if the test is broken, "
+                                "or call escalate_for_replan with the concrete reason."
+                            )
 
                 for prev_rel, prev_info in list(state.in_module_regressions.items()):
                     if prev_rel != relative and prev_info.get("name") == clean_name:
@@ -3559,32 +3656,39 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             if relative not in state.regression_tests and target.exists():
                 raise ValueError("Regression test must be a new file")
             locked_meta = None
+            locked_key = None
             for prev_key, prev_lock in list(state._locked_regressions.items()):
                 if not prev_lock.get("is_in_module") and prev_lock.get("path") == relative.as_posix():
                     locked_meta = prev_lock
+                    locked_key = prev_key
                     break
             if locked_meta:
                 proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 if proposed_sha != locked_meta.get("sha256"):
-                    state._record_red_lock_violation(
-                        "rewrite_locked_regression", relative.as_posix(),
-                        f"Locked regression '{locked_meta.get('name')}' was rewritten.",
-                    )
-                    for reg_key_now in [
-                        k for k in list(state._reproduced_regressions)
-                        if str(k[1]) == locked_meta.get("name", "")
-                    ]:
-                        state._reproduced_regressions.pop(reg_key_now, None)
-                        state._passed_regressions.discard(reg_key_now)
-                        state._passed_regression_configs.pop(reg_key_now, None)
-                        state._reproduction_notes.pop(reg_key_now, None)
-                        state._regression_test_names.pop(reg_key_now, None)
-                    state._verified_revision = None
-                    return (
-                        f"Error: '{relative.as_posix()}' is the locked Red-phase regression test for this issue "
-                        "and cannot be rewritten. Fix the production code so the locked test passes instead of "
-                        "changing the test, or call escalate_for_replan with the concrete reason the locked test is wrong."
-                    )
+                    if replace_broken_lock_reason:
+                        unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
+                        if unlock_err:
+                            return unlock_err
+                    else:
+                        state._record_red_lock_violation(
+                            "rewrite_locked_regression", relative.as_posix(),
+                            f"Locked regression '{locked_meta.get('name')}' was rewritten.",
+                        )
+                        for reg_key_now in [
+                            k for k in list(state._reproduced_regressions)
+                            if str(k[1]) == locked_meta.get("name", "")
+                        ]:
+                            state._reproduced_regressions.pop(reg_key_now, None)
+                            state._passed_regressions.discard(reg_key_now)
+                            state._passed_regression_configs.pop(reg_key_now, None)
+                            state._reproduction_notes.pop(reg_key_now, None)
+                            state._regression_test_names.pop(reg_key_now, None)
+                        state._verified_revision = None
+                        return (
+                            f"Error: '{relative.as_posix()}' is the locked Red-phase regression test for this issue "
+                            "and cannot be rewritten. Fix the production code so the locked test passes instead of "
+                            "changing the test, pass replace_broken_lock_reason if the test is broken, or call escalate_for_replan."
+                        )
             existing_text = target.read_bytes().decode("utf-8", errors="replace") if target.is_file() else None
             _check_rust_syntax(relative.as_posix(), content, original_content=existing_text)
             was_registered = relative in state.regression_tests

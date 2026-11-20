@@ -11,7 +11,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
-from agent_trace import TraceHTTPClient, TraceRecorder
+from agent_trace import APIServerError, TraceHTTPClient, TraceRecorder
 
 
 def entries(path):
@@ -194,7 +194,7 @@ def test_api_limit_stops_additional_http_attempts(tmp_path):
 
 def test_metrics_count_retries_and_provider_usage(tmp_path):
     recorder = TraceRecorder(tmp_path / 'metrics.jsonl')
-    client = TraceHTTPClient(recorder)
+    client = TraceHTTPClient(recorder, server_error_retries=0)
     responses = iter([
         httpx.Response(500, json={'error': 'retry'}),
         httpx.Response(200, json={'usage': {'prompt_tokens': 12, 'completion_tokens': 5, 'total_tokens': 17}}),
@@ -212,3 +212,59 @@ def test_metrics_count_retries_and_provider_usage(tmp_path):
     assert recorder.metrics() == {'api_calls': 5, 'input_tokens': 18, 'output_tokens': 14,
                                   'total_tokens': 32, 'responses_without_usage': 1,
                                   'transient_failures': 1}
+
+
+def test_5xx_retries_every_two_minutes_and_recovers(tmp_path, monkeypatch):
+    path = tmp_path / 'retry_5xx.jsonl'
+    recorder = TraceRecorder(path)
+    client = TraceHTTPClient(recorder)
+    sleeps = []
+    monkeypatch.setattr('time.sleep', sleeps.append)
+    responses = iter([
+        httpx.Response(502, json={'error': 'bad gateway'}),
+        httpx.Response(503, json={'error': 'unavailable'}),
+        httpx.Response(504, json={'error': 'gateway timeout'}),
+        httpx.Response(200, json={'choices': [{'message': {'content': 'recovered'}}]}),
+    ])
+    client._transport = httpx.MockTransport(lambda request: next(responses))
+    client._mounts = {}
+    try:
+        res = client.post('https://example.test/v1/chat/completions', json={'messages': []})
+        assert res.status_code == 200
+        assert res.json()['choices'][0]['message']['content'] == 'recovered'
+    finally:
+        client.close()
+    assert sleeps == [120.0, 120.0, 120.0]
+    events = entries(path)
+    assert [e['event'] for e in events].count('api_request') == 4
+    assert [e['status'] for e in events if e['event'] == 'api_retry'] == [502, 503, 504]
+
+
+def test_5xx_aborts_after_three_retries_without_sdk_double_retry(tmp_path, monkeypatch):
+    path = tmp_path / 'abort_5xx.jsonl'
+    recorder = TraceRecorder(path)
+    client = TraceHTTPClient(recorder)
+    sleeps = []
+    monkeypatch.setattr('time.sleep', sleeps.append)
+    attempts = []
+
+    def respond(request):
+        attempts.append(request)
+        return httpx.Response(503, request=request, json={'error': {'message': 'down'}})
+
+    client._transport = httpx.MockTransport(respond)
+    client._mounts = {}
+    model = ChatOpenAI(model='sample', api_key='key', base_url='https://example.test/v1',
+                       http_client=client, max_retries=3)
+    try:
+        with pytest.raises(APIServerError) as exc_info:
+            model.invoke('issue', config={'callbacks': [recorder]})
+        assert exc_info.value.is_api_server_error is True
+        assert exc_info.value.status_code == 503
+    finally:
+        client.close()
+    assert sleeps == [120.0, 120.0, 120.0]
+    assert len(attempts) == 4
+    events = entries(path)
+    assert [e['event'] for e in events].count('api_request') == 4
+    assert any(e['event'] == 'api_server_abort' and e['status'] == 503 and e['retries'] == 3 for e in events)

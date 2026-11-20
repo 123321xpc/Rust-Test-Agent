@@ -244,15 +244,37 @@ def make_rust_tools(root, resolve_path, env=None):
             def display_path(path):
                 path = Path(path)
                 return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
-            packages = [{"name": p["name"], "import_name": p["name"].replace("-", "_"),
-                         "version": p["version"], "id": p["id"],
-                         "manifest_path": display_path(p["manifest_path"]),
-                         "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
-                         "features": list(p.get("features", {}).keys())[:25],
-                         "default_features": p.get("features", {}).get("default", []),
-                         "targets": [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in p["targets"]]}
-                        for p in metadata["packages"] if p["id"] in members]
-            return json.dumps({"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages}, ensure_ascii=False, indent=2)
+            def _compact_targets(targets):
+                kept = [
+                    {"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])}
+                    for t in targets
+                    if set(t.get("kind", [])) & {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin", "test"}
+                ]
+                if not kept:
+                    kept = [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in targets[:8]]
+                return kept[:15]
+
+            packages = []
+            for p in metadata["packages"]:
+                if p["id"] not in members:
+                    continue
+                pkg_entry = {
+                    "name": p["name"],
+                    "import_name": p["name"].replace("-", "_"),
+                    "version": p["version"],
+                    "manifest_path": display_path(p["manifest_path"]),
+                    "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
+                    "features": list(p.get("features", {}).keys())[:15],
+                    "targets": _compact_targets(p.get("targets", [])),
+                }
+                if p.get("features", {}).get("default"):
+                    pkg_entry["default_features"] = p["features"]["default"]
+                packages.append(pkg_entry)
+            return json.dumps(
+                {"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         except (OSError, ValueError, subprocess.TimeoutExpired, KeyError) as exc:
             return f"Error querying Cargo workspace: {exc}"
 

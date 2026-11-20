@@ -725,6 +725,7 @@ class PatchState:
         self._compile_failed_regressions = set()
         self._paired_repro_counts = {}
         self._env_lockfile_blocked = False
+        self._existing_suite_checked_rev = None
 
     _API_COMPILE_ERROR_CODES = {
         "E0599", "E0308", "E0061", "E0425", "E0432", "E0433",
@@ -1227,6 +1228,128 @@ class PatchState:
             "Check whether your edits unintentionally broke existing callers:\n" + "\n".join(warnings) + "\n"
         )
 
+    def check_existing_tests_regression(self, selected: list[Path]) -> None:
+        """Run targeted existing crate tests once per revision to catch regressions before patch submission."""
+        if (
+            not self.post_strip_check
+            or not selected
+            or self._passed_suites
+            or self._env_lockfile_blocked
+            or self._existing_suite_checked_rev == self._revision
+            or not shutil.which("cargo")
+        ):
+            return
+        remaining = self.remaining_api_calls()
+        if remaining is not None and remaining <= 15:
+            return
+        self._existing_suite_checked_rev = self._revision
+        root = self.root.resolve()
+        manifests = set()
+        for rel in selected:
+            cur = (root / rel).parent
+            while cur != root.parent:
+                if (cur / "Cargo.toml").is_file():
+                    manifests.add((cur / "Cargo.toml").resolve())
+                    break
+                cur = cur.parent
+        valid_manifests = sorted(m for m in manifests if _manifest_has_targets(m))[:2]
+        if not valid_manifests:
+            return
+
+        backup = {}
+        for reg_rel in self.regression_tests:
+            reg_file = root / reg_rel
+            if reg_file.is_file():
+                backup[reg_rel] = _capture_file_entry(reg_file)
+                reg_file.unlink()
+        for src_rel in self.in_module_regressions:
+            src_file = root / src_rel
+            if src_file.is_file():
+                entry = _capture_file_entry(src_file)
+                backup[src_rel] = entry
+                src_file.write_text(_strip_in_module_tests(entry[0].decode("utf-8", errors="replace")), encoding="utf-8")
+
+        tokens = {
+            tok for p in selected
+            for tok in re.split(r"[_/.-]+", p.as_posix().lower())
+            if len(tok) >= 3 and tok not in ("src", "lib", "mod", "main", "tests", "rs")
+        }
+        new_failures: list[str] = []
+        try:
+            for manifest in valid_manifests:
+                cfgs = [
+                    cfg for (m, _name), cfg in self._passed_regression_configs.items()
+                    if (root / m).resolve() == manifest.resolve()
+                ]
+                cfg = cfgs[0] if cfgs else {}
+                base_cmd = ["cargo", "test", "--manifest-path", str(manifest)]
+                if cfg.get("package"):
+                    base_cmd.append(f"--package={cfg['package']}")
+                _append_cargo_feature_flags(base_cmd, cfg)
+
+                cmds: list[tuple[list[str], str]] = []
+                if (manifest.parent / "src" / "lib.rs").is_file():
+                    cmds.append((base_cmd + ["--lib"], "lib"))
+                tests_dir = manifest.parent / "tests"
+                if tests_dir.is_dir():
+                    t_stems = sorted(p.stem for p in tests_dir.glob("*.rs") if not p.stem.startswith(("test_regression_", "normal_regression_")))
+                    matched_t = [t for t in t_stems if any(tok in t.lower() for tok in tokens) or "integration" in t.lower()]
+                    for t_name in (matched_t or t_stems)[:2]:
+                        cmds.append((base_cmd + ["--test", t_name], f"test:{t_name}"))
+
+                for cmd, label in cmds:
+                    try:
+                        res = subprocess.run(
+                            cmd, cwd=root, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=60, env=self.rust_env,
+                        )
+                    except (OSError, subprocess.TimeoutExpired):
+                        continue
+                    counts = re.findall(r"test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", res.stdout)
+                    executed = sum(int(p) + int(f) for p, f in counts)
+                    if res.returncode == 0 or executed == 0:
+                        continue
+                    failed_names = sorted(set(re.findall(r"^test (.+?) \.\.\. FAILED\s*$", res.stdout, re.MULTILINE)))
+                    # Check whether those failing tests passed on unpatched baseline
+                    prod_paths = [p for p in self.originals if p not in self.regression_tests]
+                    if not prod_paths:
+                        continue
+                    prod_backup = {rel: _capture_file_entry(root / rel) for rel in prod_paths}
+                    baseline_failed = set()
+                    baseline_ok = False
+                    try:
+                        for rel in prod_paths:
+                            _restore_file_entry(root / rel, self.originals[rel])
+                        base_res = subprocess.run(
+                            cmd, cwd=root, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=60, env=self.rust_env,
+                        )
+                        baseline_ok = base_res.returncode == 0
+                        base_counts = re.findall(r"test result: (?:ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", base_res.stdout)
+                        base_executed = sum(int(p) + int(f) for p, f in base_counts)
+                        if not baseline_ok and base_executed == 0:
+                            continue
+                        baseline_failed = set(re.findall(r"^test (.+?) \.\.\. FAILED\s*$", base_res.stdout, re.MULTILINE))
+                    except (OSError, subprocess.TimeoutExpired):
+                        continue
+                    finally:
+                        for rel, data in prod_backup.items():
+                            _restore_file_entry(root / rel, data)
+                    introduced = failed_names if baseline_ok else [n for n in failed_names if n not in baseline_failed]
+                    if introduced:
+                        rel_m = manifest.relative_to(root).as_posix() if manifest.is_relative_to(root) else str(manifest)
+                        new_failures.append(f"{rel_m} ({label}): {', '.join(introduced[:5])}")
+        finally:
+            for reg_rel, data in backup.items():
+                _restore_file_entry(root / reg_rel, data, preserve_mtime=True)
+
+        if new_failures:
+            raise ValueError(
+                "Existing crate tests regressed after your edits (did not fail on original code): "
+                + "; ".join(new_failures)
+                + ". Fix the regression and rerun cargo_test (or resubmit if an obsolete test asserts the buggy behavior removed by the issue)."
+            )
+
     def verify_pre_fix_reproduction(self, targets=None):
         if not shutil.which("cargo"):
             return
@@ -1590,6 +1713,22 @@ class PatchState:
                     or self._test_generation > 0
                     or self._last_check_rev >= 0
                 )
+                if not selected and has_test_attempt and self._last_compiling_snapshot is not None:
+                    cur_snap = self._capture_snapshot()
+                    try:
+                        self._restore_snapshot(self._last_compiling_snapshot)
+                        snap_selected = [p for p in self.changed_paths() if p not in self.regression_tests]
+                        if snap_selected:
+                            if self.post_strip_check and shutil.which("cargo"):
+                                self.run_post_strip_check(snap_selected)
+                            self.patch = self.build_patch(snap_selected)
+                            if self.patch:
+                                return self.patch
+                    except Exception:
+                        pass
+                    finally:
+                        if not self.patch:
+                            self._restore_snapshot(cur_snap)
                 if selected and has_test_attempt:
                     if self._last_compiling_snapshot is not None and self.post_strip_check and shutil.which("cargo"):
                         current_compiles = True
@@ -2306,6 +2445,7 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 raise ValueError(f"Include all other changed files or revert them and rerun tests: {names}")
             if state.post_strip_check:
                 state.run_post_strip_check(selected)
+                state.check_existing_tests_regression(selected)
             patch = build_patch(selected)
             inline_conflicts = _detect_inline_test_patch_conflicts(patch, state.originals)
             if inline_conflicts:

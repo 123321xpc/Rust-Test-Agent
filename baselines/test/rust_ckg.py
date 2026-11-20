@@ -1262,7 +1262,7 @@ class RustCodeGraph:
         kind: str = "",
         hops: int = 1,
         exclude_tests: bool = True,
-        max_neighbors: int = 12,
+        max_neighbors: int = 8,
     ) -> dict[str, Any]:
         """Inspect a symbol (foo, Type::method) or file (src/lib.rs, src/lib.rs:42, src/lib.rs:symbol)."""
         clean = target.strip()
@@ -1348,7 +1348,7 @@ class RustCodeGraph:
                         continue
                     matched_defs.append(dict(it))
         matched_defs.sort(key=lambda x: (0 if x.get("vis") == "pub" else 1, 0 if x.get("has_body") else 1, x["path"], x["line"]))
-        for enriched in matched_defs[:8]:
+        for enriched in matched_defs[:5]:
             enriched["public_paths"] = self._public_paths_for_item(enriched, all_files)
 
         trait_impls: list[dict[str, Any]] = []
@@ -1406,8 +1406,8 @@ class RustCodeGraph:
         res_payload = {
             "target": clean,
             "mode": "symbol",
-            "definitions": matched_defs[:8],
-            "trait_impls": trait_impls[:10],
+            "definitions": matched_defs[:5],
+            "trait_impls": trait_impls[:6],
             "callers": callers,
             "callees": callees[:max_neighbors],
         }
@@ -1601,7 +1601,7 @@ def make_rust_ckg_tool(root: Path, graph: RustCodeGraph | None = None):
         """
         try:
             res = ckg.query_neighborhood(target=target, kind=kind, hops=hops, exclude_tests=exclude_tests)
-            return json.dumps(res, ensure_ascii=False)
+            return json.dumps(res, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 

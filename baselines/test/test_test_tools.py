@@ -2064,3 +2064,100 @@ def test_discover_integration_targets_and_snapshot_smoke_filter(tmp_path, monkey
         assert any("--" in cmd and "install" in cmd for cmd in commands)
     finally:
         state.close()
+
+
+def test_e0753_guardrail_respects_module_scopes_and_block_comments_and_duplicate_edit_reports_lines(normal):
+    _, tools, _ = normal
+    valid_nested = (
+        "/*\nLicense header without leading stars\n*/\n"
+        "#![deny(missing_docs)]\n"
+        "pub struct Receiver;\n"
+        "pub mod error {\n"
+        "    //! Broadcast error types\n"
+        "    pub struct RecvError;\n"
+        "}\n"
+    )
+    ok_res = tools["write_file"].invoke({"path": "src/nested_mod.rs", "content": valid_nested})
+    assert "Updated src/nested_mod.rs" in ok_res
+
+    reg_res = tools["write_regression_test"].invoke({
+        "path": "test_nested",
+        "target_src": "src/nested_mod.rs",
+        "content": "#[test] fn ok() {}",
+    })
+    assert "Mounted temporary in-module regression test" in reg_res
+
+    bad_nested = "pub struct S;\npub mod m {\n    //! ok\n}\n//! bad top-level doc\n"
+    bad_res = tools["write_file"].invoke({"path": "src/bad_e0753.rs", "content": bad_nested})
+    assert "E0753" in bad_res
+
+    tools["write_file"].invoke({"path": "src/dup.rs", "content": "fn a() {\n    let x = 1;\n}\nfn b() {\n    let x = 1;\n}\n"})
+    dup_err = tools["edit_file"].invoke({"path": "src/dup.rs", "old_text": "let x = 1;", "new_text": "let x = 2;"})
+    assert "more than once" in dup_err and "2" in dup_err and "5" in dup_err
+
+
+def test_replace_broken_lock_reason_allows_compile_broken_or_setup_panic_but_not_assertions(normal, monkeypatch):
+    _, tools, state = normal
+    (state.root / "Cargo.toml").write_text('[package]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (state.root / "src").mkdir(exist_ok=True)
+    (state.root / "src" / "lib.rs").write_text("pub fn ok() -> i32 { 1 }\n", encoding="utf-8")
+
+    tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_assert.rs",
+        "content": "#[test] fn assert_case() { assert_eq!(1, 2); }\n",
+    })
+    tok = state.start_test()
+    state.fail_test(
+        tok,
+        manifest_path="Cargo.toml",
+        test_target="test_regression_assert",
+        executed=1,
+        failures=["assert_case"],
+        returncode=101,
+    )
+    assert state._locked_regressions
+    blocked = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_assert.rs",
+        "content": "#[test] fn assert_case() { assert_eq!(1, 1); }\n",
+        "replace_broken_lock_reason": "trying to weaken a failing assertion test",
+    })
+    assert "cannot self-unlock" in blocked
+
+    tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_compile.rs",
+        "content": "#[test] fn compile_case() { assert_eq!(1, 2); }\n",
+    })
+    tok2 = state.start_test()
+    state.fail_test(
+        tok2,
+        manifest_path="Cargo.toml",
+        test_target="test_regression_compile",
+        executed=1,
+        failures=["compile_case"],
+        failure_details=[{"name": "compile_case", "kind": "unexpected_panic", "output": "No such file or directory"}],
+        returncode=101,
+    )
+    replaced = tools["write_regression_test"].invoke({
+        "path": "tests/test_regression_compile.rs",
+        "content": "#[test] fn compile_case() { assert_eq!(1, 1); }\n",
+        "replace_broken_lock_reason": "locked oracle panicked in setup with missing file path",
+    })
+    assert "Error" not in replaced
+    assert "1, 1" in (state.root / "tests" / "test_regression_compile.rs").read_text(encoding="utf-8")
+
+    tests_dir = state.root / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "parser_v2.rs").write_text("#[test] fn t() {}\n", encoding="utf-8")
+    seen_targets = []
+    import subprocess as sp_mod
+    orig_sp_run = sp_mod.run
+    monkeypatch.setattr(
+        sp_mod, "run",
+        lambda cmd, **kw: (
+            (seen_targets.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+            if cmd and cmd[0] == "cargo"
+            else orig_sp_run(cmd, **kw)
+        ),
+    )
+    state.run_existing_test_smoke([Path("src/parser_extra.rs")])
+    assert any("parser_v2" in " ".join(c) for c in seen_targets)

@@ -326,6 +326,294 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(captured['api_key'], 'yj-key')
             self.assertEqual(captured['base_url'], 'https://yj.example/v1')
 
+    def test_resume_skips_completed_retries_agent_errors_and_cleans_interrupted_dir(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            here = root / 'validation'
+            harness = root / 'Rust-bench'
+            (root / 'baselines/graph').mkdir(parents=True)
+            (root / 'baselines/graph/agent.py').write_text('print("v1")\n', encoding='utf-8')
+            (root / 'data').mkdir()
+            tasks = [{'instance_id': f'inst__{i}', 'size': 'small', 'patch_changed_lines': 3,
+                      'image': f'img:{i}', 'base_commit': f'c{i}', 'rust_toolchain': '1.80.0'}
+                     for i in (1, 2, 3, 4)]
+            dataset_rows = [{'instance_id': t['instance_id'], 'problem_statement': f'issue {t["instance_id"]}'}
+                            for t in tasks]
+            (root / 'data/rustbench-all.jsonl').write_text(
+                ''.join(json.dumps(r) + '\n' for r in dataset_rows), encoding='utf-8'
+            )
+            ds_hash = hashlib.sha256((root / 'data/rustbench-all.jsonl').read_bytes()).hexdigest()
+
+            manifest = {'tasks': tasks}
+            here.mkdir()
+            runner.write_json(here / 'manifest.json', manifest)
+            run_id = 'testset_20261120_110000_abc123'
+            run_dir = here / 'runs' / run_id
+            agent_dir = run_dir / 'graph'
+            (agent_dir / 'inst__2').mkdir(parents=True)
+            (agent_dir / 'inst__2' / 'stale.txt').write_text('old error output', encoding='utf-8')
+            (agent_dir / 'inst__4').mkdir(parents=True)
+            (agent_dir / 'inst__4' / 'partial.log').write_text('interrupted mid-run', encoding='utf-8')
+            runner.write_json(run_dir / 'manifest.json', manifest)
+
+            eval_id = f'{run_id}_graph'
+            stale_eval_dir = harness / 'logs/run_evaluation' / eval_id / 'graph' / 'inst__2'
+            stale_eval_dir.mkdir(parents=True)
+            (stale_eval_dir / 'report.json').write_text('{}', encoding='utf-8')
+            kept_eval_dir = harness / 'logs/run_evaluation' / eval_id / 'graph' / 'inst__1'
+            kept_eval_dir.mkdir(parents=True)
+            (kept_eval_dir / 'report.json').write_text(json.dumps({'inst__1': {'resolved': True}}), encoding='utf-8')
+            (kept_eval_dir / 'test_output.txt').write_text('ok', encoding='utf-8')
+
+            with patch.object(runner, 'ROOT', root), patch.object(runner, 'HERE', here), \
+                    patch.object(runner, 'HARNESS', harness):
+                hashes = runner.compute_agent_source_hashes(['graph'])
+                runner.write_json(run_dir / 'run_metadata.json', {
+                    'api': 'yj', 'model': 'm', 'api_limit': '70',
+                    'agent_source_sha256': hashes,
+                    'instances': [t['instance_id'] for t in tasks],
+                    'dataset_sha256': ds_hash,
+                })
+                # inst__1 ok, inst__2 agent_error (retried), inst__3 exit 0 no_patch (skipped), inst__4 unrecorded (run)
+                runner.write_jsonl(agent_dir / 'predictions.jsonl', [
+                    {'instance_id': 'inst__1', 'model_name_or_path': 'graph', 'model_patch': 'patch1'},
+                    {'instance_id': 'inst__2', 'model_name_or_path': 'graph', 'model_patch': ''},
+                    {'instance_id': 'inst__3', 'model_name_or_path': 'graph', 'model_patch': ''},
+                ])
+                runner.write_json(agent_dir / 'agent_status.json', [
+                    {'instance_id': 'inst__1', 'agent_exit_code': 0, 'seconds': 10, 'patch_bytes': 6, 'error': None},
+                    {'instance_id': 'inst__2', 'agent_exit_code': 1, 'seconds': 5, 'patch_bytes': 0, 'error': None},
+                    {'instance_id': 'inst__3', 'agent_exit_code': 0, 'seconds': 12, 'patch_bytes': 0, 'error': None},
+                ])
+
+                ran = []
+                eval_calls = []
+
+                def fake_run_baseline(agent, task, row, folder, env):
+                    iid = task['instance_id']
+                    ran.append(iid)
+                    self.assertFalse((folder / 'stale.txt').exists())
+                    self.assertFalse((folder / 'partial.log').exists())
+                    return 0, 2.0, f'patch_{iid}'
+
+                def fake_evaluate(agent, eval_tasks, folder, eid, env, workers, timeout):
+                    eval_calls.append((agent, [t['instance_id'] for t in eval_tasks], eid))
+                    self.assertFalse(stale_eval_dir.exists())
+                    self.assertTrue(kept_eval_dir.exists())
+                    for pred in runner.read_jsonl(folder / 'predictions.jsonl'):
+                        if pred['model_patch']:
+                            rdir = harness / 'logs/run_evaluation' / eid / agent / pred['instance_id']
+                            rdir.mkdir(parents=True, exist_ok=True)
+                            if not (rdir / 'report.json').exists():
+                                (rdir / 'report.json').write_text(
+                                    json.dumps({pred['instance_id']: {'resolved': True}}), encoding='utf-8'
+                                )
+                                (rdir / 'test_output.txt').write_text('ok', encoding='utf-8')
+                    return 0
+
+                with patch.object(runner, 'child_env', return_value={'MODEL': 'm', 'API_LIMIT': '70'}), \
+                        patch.object(runner, 'resolve_api_env', return_value='yj'), \
+                        patch.object(runner, 'resolve_api_limit', return_value=70), \
+                        patch.object(runner, 'preflight'), \
+                        patch.object(runner, 'run_baseline', side_effect=fake_run_baseline), \
+                        patch.object(runner, 'evaluate', side_effect=fake_evaluate), \
+                        patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id]):
+                    rc = runner.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(ran, ['inst__2', 'inst__4'])
+            final_preds = runner.read_jsonl(agent_dir / 'predictions.jsonl')
+            self.assertEqual([(p['instance_id'], p['model_patch']) for p in final_preds], [
+                ('inst__1', 'patch1'),
+                ('inst__2', 'patch_inst__2'),
+                ('inst__3', ''),
+                ('inst__4', 'patch_inst__4'),
+            ])
+            self.assertEqual(eval_calls, [('graph', ['inst__1', 'inst__2', 'inst__3', 'inst__4'], eval_id)])
+            summary = json.loads((run_dir / 'summary.json').read_text(encoding='utf-8'))
+            self.assertEqual(summary['graph']['total'], 4)
+            self.assertEqual([p.name for p in agent_dir.glob('*.tmp')], [])
+
+    def test_resume_blocks_when_agent_source_sha256_changes_or_invalid(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            here = root / 'validation'
+            (root / 'baselines/graph').mkdir(parents=True)
+            agent_file = root / 'baselines/graph/agent.py'
+            agent_file.write_text('print("v1")\n', encoding='utf-8')
+            (root / 'data').mkdir()
+            ds_file = root / 'data/rustbench-all.jsonl'
+            ds_file.write_text(json.dumps({'instance_id': 'inst__1'}) + '\n', encoding='utf-8')
+            tasks = [{'instance_id': 'inst__1', 'size': 'small', 'patch_changed_lines': 2,
+                      'image': 'img:1', 'base_commit': 'c1', 'rust_toolchain': '1.80.0'}]
+            here.mkdir()
+            runner.write_json(here / 'manifest.json', {'tasks': tasks})
+            run_id = 'testset_20261120_110000_deadbf'
+            run_dir = here / 'runs' / run_id
+            run_dir.mkdir(parents=True)
+            runner.write_json(run_dir / 'manifest.json', {'tasks': tasks})
+
+            with patch.object(runner, 'ROOT', root), patch.object(runner, 'HERE', here):
+                hashes = runner.compute_agent_source_hashes(['graph'])
+                ds_hash = hashlib.sha256(ds_file.read_bytes()).hexdigest()
+                runner.write_json(run_dir / 'run_metadata.json', {
+                    'agent_source_sha256': hashes,
+                    'instances': ['inst__1'],
+                    'dataset_sha256': ds_hash,
+                })
+
+                common = [
+                    patch.object(runner, 'child_env', return_value={'MODEL': 'm', 'API_LIMIT': '70'}),
+                    patch.object(runner, 'resolve_api_env', return_value='yj'),
+                    patch.object(runner, 'resolve_api_limit', return_value=70),
+                    patch.object(runner, 'preflight'),
+                ]
+                with common[0], common[1], common[2], common[3]:
+                    with patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', 'missing_id', '--dry-run']):
+                        with self.assertRaisesRegex(RuntimeError, 'not found'):
+                            runner.main()
+
+                    with patch.object(sys, 'argv', ['run.py', '--agent', 'normal', '--resume', run_id, '--dry-run']):
+                        with self.assertRaisesRegex(RuntimeError, 'not in run_metadata'):
+                            runner.main()
+
+                    buf = io.StringIO()
+                    with patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id, '--dry-run']), \
+                            redirect_stdout(buf):
+                        self.assertEqual(runner.main(), 0)
+                    self.assertIn(f'resume: {run_id}', buf.getvalue())
+
+                    agent_file.write_text('print("v2")\n', encoding='utf-8')
+                    with patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id, '--dry-run']):
+                        with self.assertRaisesRegex(RuntimeError, 'source hash changed'):
+                            runner.main()
+
+                    agent_file.write_text('print("v1")\n', encoding='utf-8')
+                    ds_file.write_text(json.dumps({'instance_id': 'inst__changed'}) + '\n', encoding='utf-8')
+                    with patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id, '--dry-run']):
+                        with self.assertRaisesRegex(RuntimeError, 'dataset_sha256 changed'):
+                            runner.main()
+
+    def test_testset_runner_delegates_resume_flag(self):
+        testset_runner = load('../testset/run')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            here = root / 'testset'
+            (root / 'baselines/graph').mkdir(parents=True)
+            (root / 'baselines/graph/agent.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'data').mkdir()
+            (root / 'data/rustbench-all.jsonl').write_text(json.dumps({'instance_id': 'inst__1'}) + '\n', encoding='utf-8')
+            tasks = [{'instance_id': 'inst__1', 'size': 'small', 'patch_changed_lines': 2,
+                      'image': 'img:1', 'base_commit': 'c1', 'rust_toolchain': '1.80.0'}]
+            here.mkdir()
+            testset_runner.runner.write_json(here / 'manifest.json', {'tasks': tasks})
+            run_id = 'testset_20261120_110000_fedcba'
+            run_dir = here / 'runs' / run_id
+            run_dir.mkdir(parents=True)
+            testset_runner.runner.write_json(run_dir / 'manifest.json', {'tasks': tasks})
+            with patch.object(testset_runner.runner, 'ROOT', root), patch.object(testset_runner.runner, 'HERE', here):
+                hashes = testset_runner.runner.compute_agent_source_hashes(['graph'])
+                testset_runner.runner.write_json(run_dir / 'run_metadata.json', {
+                    'agent_source_sha256': hashes,
+                    'instances': ['inst__1'],
+                })
+                buf = io.StringIO()
+                with patch.object(testset_runner.runner, 'child_env', return_value={'MODEL': 'm', 'API_LIMIT': '70'}), \
+                        patch.object(testset_runner.runner, 'resolve_api_env', return_value='yj'), \
+                        patch.object(testset_runner.runner, 'resolve_api_limit', return_value=70), \
+                        patch.object(testset_runner.runner, 'preflight'), \
+                        patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id, '--dry-run']), \
+                        redirect_stdout(buf):
+                    self.assertEqual(testset_runner.runner.main(), 0)
+                self.assertIn(f'resume: {run_id}', buf.getvalue())
+
+    def test_run_stops_early_on_api_server_5xx_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            here = root / 'validation'
+            harness = root / 'Rust-bench'
+            (root / 'baselines/graph').mkdir(parents=True)
+            (root / 'baselines/graph/agent.py').write_text('print("v1")\n', encoding='utf-8')
+            (root / 'data').mkdir()
+            tasks = [{'instance_id': f'inst__{i}', 'size': 'small', 'patch_changed_lines': 3,
+                      'image': f'img:{i}', 'base_commit': f'c{i}', 'rust_toolchain': '1.80.0'}
+                     for i in (1, 2, 3)]
+            (root / 'data/rustbench-all.jsonl').write_text(
+                ''.join(json.dumps({'instance_id': t['instance_id'], 'problem_statement': 'issue'}) + '\n' for t in tasks),
+                encoding='utf-8',
+            )
+            here.mkdir()
+            runner.write_json(here / 'manifest.json', {'tasks': tasks})
+
+            first_ran = []
+
+            def run_until_5xx(agent, task, row, folder, env):
+                iid = task['instance_id']
+                first_ran.append(iid)
+                if iid == 'inst__1':
+                    return 0, 1.0, 'patch_1'
+                return runner.API_SERVER_ERROR_EXIT_CODE, 360.0, ''
+
+            with patch.object(runner, 'ROOT', root), patch.object(runner, 'HERE', here), \
+                    patch.object(runner, 'HARNESS', harness), \
+                    patch.object(runner, 'child_env', return_value={'MODEL': 'm', 'API_LIMIT': '70'}), \
+                    patch.object(runner, 'resolve_api_env', return_value='yj'), \
+                    patch.object(runner, 'resolve_api_limit', return_value=70), \
+                    patch.object(runner, 'preflight'), \
+                    patch.object(runner.subprocess, 'check_output', return_value='sha256:img\n'), \
+                    patch.object(runner, 'run_baseline', side_effect=run_until_5xx), \
+                    patch.object(runner, 'evaluate') as eval_mock, \
+                    patch.object(sys, 'argv', ['run.py', '--agent', 'graph']):
+                rc1 = runner.main()
+
+            self.assertEqual(rc1, runner.API_SERVER_ERROR_EXIT_CODE)
+            self.assertEqual(first_ran, ['inst__1', 'inst__2'])
+            eval_mock.assert_not_called()
+
+            run_dirs = list((here / 'runs').iterdir())
+            self.assertEqual(len(run_dirs), 1)
+            run_id = run_dirs[0].name
+            preds_before = runner.read_jsonl(run_dirs[0] / 'graph/predictions.jsonl')
+            self.assertEqual([(p['instance_id'], p['model_patch']) for p in preds_before], [('inst__1', 'patch_1'), ('inst__2', '')])
+
+            resumed_ran = []
+
+            def fake_resume_run(agent, task, row, folder, env):
+                iid = task['instance_id']
+                resumed_ran.append(iid)
+                return 0, 1.0, f'patch_{iid}'
+
+            def fake_eval(agent, eval_tasks, folder, eid, env, workers, timeout):
+                for pred in runner.read_jsonl(folder / 'predictions.jsonl'):
+                    if pred['model_patch']:
+                        rdir = harness / 'logs/run_evaluation' / eid / agent / pred['instance_id']
+                        rdir.mkdir(parents=True, exist_ok=True)
+                        (rdir / 'report.json').write_text(json.dumps({pred['instance_id']: {'resolved': True}}), encoding='utf-8')
+                        (rdir / 'test_output.txt').write_text('ok', encoding='utf-8')
+                return 0
+
+            with patch.object(runner, 'ROOT', root), patch.object(runner, 'HERE', here), \
+                    patch.object(runner, 'HARNESS', harness), \
+                    patch.object(runner, 'child_env', return_value={'MODEL': 'm', 'API_LIMIT': '70'}), \
+                    patch.object(runner, 'resolve_api_env', return_value='yj'), \
+                    patch.object(runner, 'resolve_api_limit', return_value=70), \
+                    patch.object(runner, 'preflight'), \
+                    patch.object(runner, 'run_baseline', side_effect=fake_resume_run), \
+                    patch.object(runner, 'evaluate', side_effect=fake_eval), \
+                    patch.object(sys, 'argv', ['run.py', '--agent', 'graph', '--resume', run_id]):
+                rc2 = runner.main()
+
+            self.assertEqual(rc2, 0)
+            self.assertEqual(resumed_ran, ['inst__2', 'inst__3'])
+            preds_after = runner.read_jsonl(run_dirs[0] / 'graph/predictions.jsonl')
+            self.assertEqual([(p['instance_id'], p['model_patch']) for p in preds_after], [
+                ('inst__1', 'patch_1'),
+                ('inst__2', 'patch_inst__2'),
+                ('inst__3', 'patch_inst__3'),
+            ])
+
 
 if __name__ == '__main__':
     unittest.main()

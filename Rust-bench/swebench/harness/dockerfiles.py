@@ -68,6 +68,8 @@ WORKDIR /testbed/
 """
 
 _DOCKERFILE_INSTANCE = r"""FROM --platform={platform} {env_image_name}
+ENV RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ENV RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 RUN cd ../testbed/
 COPY ./setup_repo.sh /root/
 RUN /bin/bash /root/setup_repo.sh

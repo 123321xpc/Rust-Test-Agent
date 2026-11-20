@@ -83,6 +83,24 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
     raw_code_cutoff = max(0, total_tools - min(keep_recent_steps, total_tools))
     raw_test_cutoff = max(0, total_tools - min(test_cutoff_steps, total_tools))
 
+    tool_results_by_id = {}
+    for idx in tool_indices:
+        tm = messages[idx]
+        tm_id = getattr(tm, "tool_call_id", "") or (tm.get("tool_call_id") if isinstance(tm, dict) else "")
+        if tm_id:
+            tm_content = getattr(tm, "content", "") if not isinstance(tm, dict) else tm.get("content", "")
+            tool_results_by_id[tm_id] = tm_content if isinstance(tm_content, str) else ""
+
+    def _mutation_succeeded(res_text: str | None) -> bool:
+        if res_text is None:
+            return False
+        head = res_text.lstrip()
+        if head.startswith(("Error", "No changes to revert")):
+            return False
+        if head.startswith("[earlier ") and "error omitted" in head[:80]:
+            return False
+        return True
+
     tc_map = {}
     file_modified_indices = {}
     last_restore_idx = -1
@@ -93,10 +111,11 @@ def _compress_history_messages(messages, keep_recent_steps=6, test_cutoff_steps=
             if isinstance(t_calls, list):
                 for tc in t_calls:
                     if isinstance(tc, dict) and tc.get("id"):
-                        tc_map[tc["id"]] = tc
+                        tc_id = tc["id"]
+                        tc_map[tc_id] = tc
                         t_name = tc.get("name")
                         t_args = tc.get("args") or {}
-                        if isinstance(t_args, dict):
+                        if isinstance(t_args, dict) and _mutation_succeeded(tool_results_by_id.get(tc_id)):
                             if t_name in ("edit_file", "write_file", "write_regression_test", "revert_file"):
                                 p = _norm_rel_path(t_args.get("target_src") or t_args.get("path"))
                                 if p:
@@ -450,6 +469,9 @@ def main():
         status = "completed"
     except BaseException as exc:
         trace.record("run_error", stage=stage, error=str(exc), error_type=type(exc).__name__)
+        if getattr(exc, "is_api_server_error", False):
+            print(f"Aborting task due to persistent API server error: {exc}", file=sys.stderr, flush=True)
+            sys.exit(getattr(_trace, "API_SERVER_ERROR_EXIT_CODE", 75))
         raise
     finally:
         trace.record("agent_metrics", status=status, elapsed_seconds=time.perf_counter() - started,

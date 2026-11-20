@@ -275,13 +275,19 @@ def make_rust_tools(root, resolve_path, env=None):
                 m_path = Path(p["manifest_path"])
                 pkg_entry = {
                     "name": p["name"], "import_name": imp_name,
-                    "version": p["version"], "id": p["id"],
+                    "version": p["version"],
                     "manifest_path": display_path(p["manifest_path"]),
                     "has_lib": any("lib" in t.get("kind", []) for t in p.get("targets", [])),
-                    "features": list(p.get("features", {}).keys())[:25],
-                    "default_features": p.get("features", {}).get("default", []),
-                    "targets": [{"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])} for t in p["targets"]],
+                    "features": list(p.get("features", {}).keys())[:15],
+                    "targets": [
+                        {"name": t["name"], "kind": t["kind"], "src_path": display_path(t["src_path"])}
+                        for t in p["targets"]
+                        if any(k in ("lib", "rlib", "proc-macro", "bin", "test") for k in t.get("kind", []))
+                    ],
                 }
+                default_feats = p.get("features", {}).get("default")
+                if default_feats:
+                    pkg_entry["default_features"] = default_feats
                 common_imports = extract_common_test_imports(m_path, imp_name)
                 if common_imports:
                     pkg_entry["common_test_imports"] = common_imports
@@ -295,7 +301,7 @@ def make_rust_tools(root, resolve_path, env=None):
                     except OSError:
                         pass
                 packages.append(pkg_entry)
-            return json.dumps({"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages}, ensure_ascii=False, indent=2)
+            return json.dumps({"workspace_root": display_path(metadata["workspace_root"]), "workspace_members": packages}, ensure_ascii=False, separators=(",", ":"))
         except (OSError, ValueError, subprocess.TimeoutExpired, KeyError) as exc:
             return f"Error querying Cargo workspace: {exc}"
 

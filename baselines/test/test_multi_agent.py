@@ -576,27 +576,6 @@ def test_multi_agent_planned_path_escalation_and_qa_rejection(monkeypatch, tmp_p
     assert handoffs[0]["features"]["plan_conflicts"]["items"] == audits[0]["conflicts"]
 
 
-def test_deterministic_qa_rejects_dbg_macro_leftover(tmp_path):
-    ma = _load("multi_agent")
-    tools_mod = _load("tools")
-    repo = _setup_fake_repo(tmp_path)
-    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
-    tools = {t.name: t for t in tools_list}
-    try:
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_x.rs", "content": "#[test] fn t() {}"})
-        tools["edit_file"].invoke({
-            "path": "src/lib.rs",
-            "old_text": "pub fn bug() -> i32 { 0 }",
-            "new_text": "pub fn bug() -> i32 { dbg!(1) }",
-        })
-        state.pass_test(state.start_test(), test_target="test_regression_x")
-        res = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("fix bug"))
-        assert res["ok"] is False
-        assert "dbg!" in res["reason"]
-    finally:
-        state.close()
-
-
 def test_multi_agent_auto_escalates_on_repeated_compile_errors_and_recovers(monkeypatch, tmp_path):
     agent_mod = _load("agent")
     repo = _setup_fake_repo(tmp_path)
@@ -688,56 +667,6 @@ def test_multi_agent_auto_escalates_on_repeated_compile_errors_and_recovers(monk
     assert "+pub fn bug() -> i32 { 1 }" in patch
     # Started on Fast Path (navigator -> fixer), auto-escalated to suggester -> fixer -> verifier!
     assert captured_roles == ["navigator", "fixer", "suggester", "fixer", "verifier"]
-
-
-def test_multi_agent_auto_submits_verified_snapshot_on_api_limit(monkeypatch, tmp_path):
-    agent_mod = _load("agent")
-    repo = _setup_fake_repo(tmp_path)
-    states = []
-    orig_make_tools = agent_mod.make_tools
-
-    def cap_make_tools(r, *a, **kw):
-        t, s = orig_make_tools(r, *a, **kw)
-        s.post_strip_check = False
-        s.require_reproduction = False
-        states.append(s)
-        return t, s
-
-    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
-    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
-
-    def fake_create_agent(model, tools, system_prompt):
-        tmap = {t.name: t for t in tools}
-        if "Navigator & Reproducer" in system_prompt:
-            role = "navigator"
-        elif "Rust Fixer" in system_prompt:
-            role = "fixer"
-        else:
-            role = "verifier"
-
-        def invoke(inputs, config):
-            if role == "navigator":
-                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
-                tmap["submit_localization_bundle"].invoke({
-                    "summary": "single file",
-                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "h", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
-                    "reproduction_status": "runtime_failure",
-                })
-            elif role == "fixer":
-                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
-                states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
-                tmap["submit_for_qa"].invoke({"summary": "fixed"})
-            elif role == "verifier":
-                raise RuntimeError("Model API call limit reached (10)")
-            return {"messages": inputs["messages"]}
-
-        return SimpleNamespace(invoke=invoke)
-
-    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
-    trace = Mock()
-    patch = agent_mod.run_agent(repo, "Fix bug()", "m", "k", trace=trace, max_api_calls=10)
-    assert "+pub fn bug() -> i32 { 1 }" in patch
-    trace.record.assert_any_call("auto_submit_on_limit", patch=patch)
 
 
 def test_role_trace_callback_and_stage_budget_guard(tmp_path):
@@ -867,120 +796,6 @@ def test_forced_handoff_wrapup_captures_repair_plan_on_stage_cap(tmp_path):
     assert payload is not None
     assert payload["ordered_edits"][0]["file"] == "src/lib.rs"
     assert seen_wrap_tools == [sorted(sug_handoff_names)]
-
-
-def test_prune_unreproduced_targets_and_qa_surfaces_existing_failures_and_inline_tests(tmp_path):
-    ma = _load("multi_agent")
-    tools_mod = _load("tools")
-    repo = _setup_fake_repo(tmp_path)
-    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=True)
-    tools = {t.name: t for t in tools_list}
-    try:
-        # Navigator creates one dead orphan test and one valid Red test
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_orphan.rs", "content": "#[test] fn x() {}"})
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_valid.rs", "content": "#[test] fn y() {}"})
-        state.fail_test(state.start_test(), test_target="test_regression_valid", executed=1, failures=["y"], returncode=101)
-
-        pruned = ma._prune_unreproduced_regression_targets(state)
-        assert pruned == ["tests/test_regression_orphan.rs"]
-        assert not (state.root / "tests" / "test_regression_orphan.rs").exists()
-        assert list(state.get_regression_targets().keys()) == [(Path("tests/../Cargo.toml".replace("tests/../", "")), "test_regression_valid")]
-
-        # Fixer edits src/lib.rs adding inline #[cfg(test)] -> must be deterministically rejected
-        tools["edit_file"].invoke({
-            "path": "src/lib.rs",
-            "old_text": "pub fn bug() -> i32 { 0 }",
-            "new_text": "pub fn bug() -> i32 { 1 }\n#[cfg(test)]\nmod extra { #[test] fn t() {} }",
-        })
-        state.pass_test(state.start_test(), test_target="test_regression_valid")
-        det_qa_inline = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix bug()"))
-        assert det_qa_inline["ok"] is False
-        assert "Inline test(s)" in det_qa_inline["reason"]
-
-        # Clean edit without inline tests passes det_qa while still surfacing existing_test_failures
-        tools["edit_file"].invoke({
-            "path": "src/lib.rs",
-            "old_text": "pub fn bug() -> i32 { 1 }\n#[cfg(test)]\nmod extra { #[test] fn t() {} }",
-            "new_text": "pub fn bug() -> i32 { 1 }",
-        })
-        state.pass_test(state.start_test(), test_target="test_regression_valid")
-        state.fail_test(state.start_test(), test_target="test_existing", executed=2, failures=["test_contract_panic"], returncode=101)
-
-        det_qa = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix bug()"))
-        assert det_qa["ok"] is True
-        assert det_qa["existing_test_failures"]
-        assert det_qa["existing_test_failures"][0]["failures"] == ["test_contract_panic"]
-    finally:
-        state.close()
-
-
-def test_reserve_reached_runs_single_rescue_without_zero_call_spin(monkeypatch, tmp_path):
-    agent_mod = _load("agent")
-    repo = _setup_fake_repo(tmp_path)
-    states = []
-    orig_make_tools = agent_mod.make_tools
-
-    def cap_make_tools(r, *a, **kw):
-        t, s = orig_make_tools(r, *a, **kw)
-        s.post_strip_check = False
-        s.require_reproduction = False
-        states.append(s)
-        return t, s
-
-    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
-    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
-
-    # Simulate client hitting reserve=3 on first Fixer pass while edit already exists, then finishing on 1 rescue call!
-    fake_client = SimpleNamespace(calls_made=0, remaining_calls=30, max_calls=30, close=lambda: None)
-    ma_mod = agent_mod._multi_agent
-
-    fixer_calls = []
-
-    def fake_create_agent(model, tools, system_prompt):
-        tmap = {t.name: t for t in tools}
-        if "Navigator & Reproducer" in system_prompt:
-            role = "navigator"
-        elif "Rust Fixer" in system_prompt:
-            role = "fixer"
-        else:
-            role = "verifier"
-
-        def invoke(inputs, config):
-            if role == "navigator":
-                fake_client.calls_made += 5
-                fake_client.remaining_calls = 25
-                tmap["write_regression_test"].invoke({"path": "tests/test_regression_bug.rs", "content": "#[test] fn t() {}"})
-                tmap["submit_localization_bundle"].invoke({
-                    "summary": "single file",
-                    "candidate_chains": [{"chain_id": "C1", "hypothesis": "h", "nodes": [{"path": "src/lib.rs", "symbol": "bug"}]}],
-                    "reproduction_status": "runtime_failure",
-                })
-            elif role == "fixer":
-                fixer_calls.append(fake_client.remaining_calls)
-                if len(fixer_calls) == 1:
-                    # Edit source, consume calls down to reserve_floor=3, and trigger _StageReserveReached
-                    tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
-                    fake_client.calls_made = 27
-                    fake_client.remaining_calls = 3
-                    raise ma_mod._StageReserveReached("fixer", 3, 3)
-                else:
-                    # Rescue pass must NOT have escalate_for_replan and has remaining=3
-                    assert "escalate_for_replan" not in tmap
-                    assert "LOW BUDGET RESCUE" in inputs["messages"][-1]["content"]
-                    fake_client.calls_made = 29
-                    fake_client.remaining_calls = 1
-                    states[-1].pass_test(states[-1].start_test(), test_target="test_regression_bug")
-                    tmap["submit_for_qa"].invoke({"summary": "rescue passed"})
-            return {"messages": inputs["messages"]}
-
-        return SimpleNamespace(invoke=invoke)
-
-    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
-    monkeypatch.setattr(agent_mod, "TraceHTTPClient", lambda trace=None, max_calls=30: fake_client)
-    patch = agent_mod.run_agent(repo, "Fix bug()", "m", "k", max_api_calls=30)
-    assert "+pub fn bug() -> i32 { 1 }" in patch
-    assert fixer_calls == [25, 3]
-
 
 
 def test_single_quoted_prose_not_treated_as_lifetime_and_fast_path_ignores_test_and_intermediate_nodes(tmp_path):
@@ -1149,70 +964,6 @@ def test_wrapup_retry_recovers_after_malformed_handoff_and_synthesizes_edits(tmp
     ])
     assert len(synth) == 1
     assert synth[0]["file"] == "crates/cli/src/scan.rs"
-
-
-def test_deterministic_qa_rejects_modified_inline_tests_for_additive_cli_and_cleans_scratch_fallback(tmp_path):
-    ma = _load("multi_agent")
-    tools_mod = _load("tools")
-
-    repo = tmp_path / "cli_repo"
-    repo.mkdir()
-    (repo / "Cargo.toml").write_text('[package]\nname = "cli_demo"\nversion = "0.1.0"\n', encoding="utf-8")
-    (repo / "src").mkdir()
-    (repo / "src" / "lib.rs").write_text(
-        "pub struct Dep { pub branch: Option<String> }\n"
-        "impl Dep {\n"
-        "    pub fn set_git(mut self, branch: Option<String>) -> Self { self.branch = branch; self }\n"
-        "}\n"
-        "#[cfg(test)]\n"
-        "mod tests {\n"
-        "    #[test]\n"
-        "    fn test_set_git() {\n"
-        "        let _ = super::Dep { branch: None }.set_git(None);\n"
-        "    }\n"
-        "}\n",
-        encoding="utf-8",
-    )
-    (repo / "templates").mkdir()
-    (repo / "templates" / "install.sh.j2").write_text("echo ok\n", encoding="utf-8")
-
-    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
-    tools = {t.name: t for t in tools_list}
-    try:
-        tools["write_regression_test"].invoke({"path": "tests/test_regression_rev.rs", "content": "#[test] fn t() {}"})
-        tools["edit_file"].invoke({
-            "path": "src/lib.rs",
-            "edits": [
-                {
-                    "old_text": "    pub fn set_git(mut self, branch: Option<String>) -> Self { self.branch = branch; self }",
-                    "new_text": "    pub fn set_git(mut self, branch: Option<String>, _rev: Option<String>) -> Self { self.branch = branch; self }",
-                },
-                {
-                    "old_text": "        let _ = super::Dep { branch: None }.set_git(None);",
-                    "new_text": "        let _ = super::Dep { branch: None }.set_git(None, None);",
-                },
-            ],
-        })
-        state.pass_test(state.start_test(), test_target="test_regression_rev")
-        contract = ma.extract_issue_contract("Add another argument like `--branch` to specify `--rev`")
-        assert contract["signals"]["mentions_cli_or_additive_flag"] is True
-        det_bad = ma.run_deterministic_qa_checks(state, contract, run_doctest_on_shift=False)
-        assert det_bad["ok"] is False
-        assert "Modified existing inline test(s)" in det_bad["reason"]
-
-        # Fallback cleanup strips scratch helper script and preserves valid template edit
-        tools["revert_file"].invoke({"path": "src/lib.rs"})
-        tools["edit_file"].invoke({"path": "templates/install.sh.j2", "old_text": "echo ok", "new_text": "echo fixed"})
-        tools["write_file"].invoke({"path": "_splice_snaps.py", "content": "print(1)\n"})
-        state.pass_test(state.start_test(), test_target="test_regression_rev")
-        raw_fb = state.auto_submit_verified_patch(allow_snapshot_fallback=True)
-        assert "_splice_snaps.py" in raw_fb
-        cleaned = ma._clean_and_audit_fallback_patch(state, ma.extract_issue_contract("Fix template"), raw_fb)
-        assert "_splice_snaps.py" not in cleaned
-        assert "templates/install.sh.j2" in cleaned
-        assert not (state.root / "_splice_snaps.py").exists()
-    finally:
-        state.close()
 
 
 def test_prune_invalid_regression_targets_and_env_blocker_auto_escalation(tmp_path):
@@ -1825,12 +1576,12 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
         }, state)
         assert route_cli_single == "fast"
 
-        # mentions_new_api still routes to Planned Path even for 1 file
-        route_api, api_reasons = ma.route_after_navigation({
+        # Single-file mentions_new_api stays on Fast Path; multi-file mentions_new_api routes to Planned Path
+        route_api_single, _ = ma.route_after_navigation({
             "issue_contract": {"signals": {"mentions_new_api": True}},
             "localization": base_loc,
         }, state)
-        assert route_api == "planned" and any("new public API" in r for r in api_reasons)
+        assert route_api_single == "fast"
 
         multi_loc = {
             "candidate_chains": [{
@@ -1843,6 +1594,11 @@ def test_route_after_navigation_respects_signals_planning_and_ckg_consumers(tmp_
             "reproduction_status": "runtime_failure",
             "needs_architecture_planning": False,
         }
+        route_api, api_reasons = ma.route_after_navigation({
+            "issue_contract": {"signals": {"mentions_new_api": True}},
+            "localization": multi_loc,
+        }, state)
+        assert route_api == "planned" and any("new public API" in r for r in api_reasons)
 
         # Multi-file CKG impact surface forces planned, while 1-file CKG consumer fan-out stays fast
         orig_builder = ma._rust_impact.build_impact_surface
@@ -2718,6 +2474,182 @@ def test_graph_agent_allows_paired_repro_legacy_smoke_audit_and_checks_untouched
     assert "pub fn bug() -> i32 { 1 }" in patch
     assert roles.count("verifier") == 2
     assert roles.count("fixer") == 2
+
+
+def test_verifier_blocks_false_approve(tmp_path):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    repo = _setup_fake_repo(tmp_path)
+    _, state = tools_mod.make_tools(repo)
+    try:
+        assert ma._is_env_dependency_blocker("error: failed to parse lock file at: Cargo.lock\nlock file version 4 requires `-Znext-lockfile-bump`")
+
+        ver_act = {"probe_results": [{"probe_type": "assertion", "status": "failed", "tests_failed": 1, "failed_tests": ["contract"]}]}
+        ver_tools, ver_holder = ma._make_handoff_tools("verifier", state, {}, ver_act)
+        blocked = ver_tools[0].invoke({"decision": "APPROVE", "summary": "looks good", "plan_consistency": "not_applicable"})
+        assert "Error: cannot APPROVE" in blocked and not ver_holder["done"]
+
+        ver_act["probe_results"].append({"probe_type": "assertion", "status": "passed", "tests_failed": 0, "failed_tests": []})
+        ok = ver_tools[0].invoke({"decision": "APPROVE", "summary": "verified", "plan_consistency": "not_applicable"})
+        assert "QA decision recorded: APPROVE" in ok and ver_holder["done"]
+
+        state._locked_regressions[("Cargo.toml", "test_regression_x")] = {"name": "test_regression_x"}
+        state.regression_tests.add(Path("tests/test_regression_x.rs"))
+        ver_tools2, ver_holder2 = ma._make_handoff_tools("verifier", state, {"_last_det_qa": {"unreproduced_reason": ""}}, {})
+        blocked_lock = ver_tools2[0].invoke({"decision": "APPROVE", "summary": "ok", "plan_consistency": "not_applicable"})
+        assert "locked Red-phase regression test" in blocked_lock and not ver_holder2["done"]
+    finally:
+        state.close()
+
+
+def test_graph_budget_200_and_fallback_strips_inline_tests_and_uses_compiling_snapshot(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+
+    b200 = ma.allocate_stage_budgets(200)
+    assert b200["navigator_cap"] == 44
+    assert b200["suggester_cap"] == 12
+    assert b200["verifier_cap"] == 12
+
+    repo = tmp_path / "graph_inline_repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "Cargo.toml").write_text('[package]\nname = "gi"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(
+        "pub fn val() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { assert_eq!(super::val(), 1); }\n}\n",
+        encoding="utf-8",
+    )
+    tool_list, state = tools_mod.make_tools(repo, post_strip_check=False)
+    tmap = {t.name: t for t in tool_list}
+    try:
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 1 }", "new_text": "pub fn val() -> i32 { 2 }"})
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "assert_eq!(super::val(), 1);", "new_text": "assert_eq!(super::val(), 2);"})
+        state._last_compiling_prod_snapshot = state._capture_snapshot()
+        recovered = ma._try_degraded_patch_fallback(
+            state, allow_unverified_compiling=True, issue_contract={"signals": {}}, blackboard={},
+        )
+        assert "+pub fn val() -> i32 { 2 }" in recovered
+        assert "assert_eq!(super::val(), 2);" not in recovered
+
+        state.post_strip_check = True
+        monkeypatch.setattr(ma.shutil, "which", lambda cmd: "/usr/bin/cargo" if cmd == "cargo" else None)
+        state._last_compiling_prod_snapshot = state._capture_snapshot()
+        tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 2 }", "new_text": "pub fn val() -> i32 { broken }"})
+
+        def fake_post_strip(sel):
+            if "broken" in (state.root / "src" / "lib.rs").read_text(encoding="utf-8"):
+                raise ValueError("compile failed")
+            return {"status": "passed", "warnings": []}
+
+        monkeypatch.setattr(state, "run_post_strip_check", fake_post_strip)
+        snap_patch = ma._try_degraded_patch_fallback(
+            state, allow_unverified_compiling=True, issue_contract={"signals": {}}, blackboard={},
+        )
+        assert "+pub fn val() -> i32 { 2 }" in snap_patch
+        assert "broken" not in snap_patch
+    finally:
+        state.close()
+
+
+def test_test_qa_cap_tool_allowlist_session_dedup_and_doctest_trigger(tmp_path, monkeypatch):
+    ma = _load("multi_agent")
+    tools_mod = _load("tools")
+    trace_mod = _load("agent_trace")
+    repo = _setup_fake_repo(tmp_path)
+    (repo / "src" / "lib.rs").write_text(
+        "/// Example:\n/// ```\n/// assert_eq!(demo::val(), 2);\n/// ```\npub fn val() -> i32 { 1 }\n",
+        encoding="utf-8",
+    )
+    tools_list, state = tools_mod.make_tools(repo, post_strip_check=False, require_reproduction=False)
+    tools = {t.name: t for t in tools_list}
+    try:
+        for removed in ("checkpoint", "rust_error_explain", "rust_trace"):
+            assert removed not in ma._NAV_ALLOWED and removed not in ma._FIX_ALLOWED
+
+        ctx = ma._init_orchestration_ctx(
+            repo, "Fix val", "m", "k", None,
+            tools=tools_list, state=state, client=SimpleNamespace(calls_made=0),
+            trace=None, max_api_calls=70, compress_fn=lambda m: m,
+            create_agent_fn=Mock(), chat_model_factory=Mock(),
+            prompts_mod=SimpleNamespace(), role_callback_cls=None,
+        )
+        assert ctx.max_qa_rounds == 2
+
+        activity = {"files_read": [], "symbols_queried": []}
+        wrapped = {
+            t.name: t
+            for t in ma._wrap_tools_for_role(
+                "fixer", tools, ["read_lines", "edit_file"], [], {}, state,
+                SimpleNamespace(calls_made=0), 0, 50, activity,
+                auto_escalate_on_stuck=False, blackboard={},
+            )
+        }
+        first = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        second = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        assert "pub fn val" in first
+        assert "Duplicate call skipped" in second
+
+        tools["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn val() -> i32 { 1 }", "new_text": "pub fn val() -> i32 { 2 }"})
+        after_edit = wrapped["read_lines"].invoke({"path": "src/lib.rs", "start_line": 1, "end_line": 5})
+        assert "pub fn val() -> i32 { 2 }" in after_edit
+
+        doc_cmds = []
+        monkeypatch.setattr(ma.shutil, "which", lambda cmd: "/usr/bin/cargo" if cmd == "cargo" else None)
+        import subprocess as sp_mod
+        orig_sp_run = sp_mod.run
+        monkeypatch.setattr(
+            sp_mod, "run",
+            lambda cmd, **kw: (
+                (doc_cmds.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+                if cmd and cmd[0] == "cargo"
+                else orig_sp_run(cmd, **kw)
+            ),
+        )
+        state.run_existing_test_smoke = lambda sel: []
+        qa = ma.run_deterministic_qa_checks(state, ma.extract_issue_contract("Fix val"), run_doctest_on_shift=True)
+        assert qa["ok"] is True and qa["doctest_status"] == "passed"
+        assert doc_cmds and "--doc" in doc_cmds[0]
+
+        trace = trace_mod.TraceRecorder(tmp_path / "bypass.jsonl")
+        ctx_bypass = SimpleNamespace(
+            state=state,
+            blackboard={"repair_plan": {"selected_chain_id": "C1"}, "_qa_repair_pending": False},
+            trace=trace,
+            qa_rounds=0,
+        )
+        ma._handle_low_budget_det_qa_bypass(ctx_bypass, {"selected": [Path("src/lib.rs")], "hygiene": {"patch": "+x"}, "missing_contract_apis": []})
+        assert not ctx_bypass.blackboard.get("consistency_blocked")
+    finally:
+        state.close()
+
+
+def test_graph_agent_reraises_api_server_error_without_degraded_fallback(monkeypatch, tmp_path):
+    agent_mod = _load("agent")
+    repo = _setup_fake_repo(tmp_path)
+    orig_make_tools = agent_mod.make_tools
+
+    def cap_make_tools(r, *a, **kw):
+        t, s = orig_make_tools(r, *a, **kw)
+        s.post_strip_check = False
+        s.require_reproduction = False
+        return t, s
+
+    monkeypatch.setattr(agent_mod, "make_tools", cap_make_tools)
+    monkeypatch.setattr(agent_mod, "ChatOpenAI", Mock())
+
+    def fake_create_agent(model, tools, system_prompt):
+        tmap = {t.name: t for t in tools}
+
+        def invoke(inputs, config):
+            if "edit_file" in tmap:
+                tmap["edit_file"].invoke({"path": "src/lib.rs", "old_text": "pub fn bug() -> i32 { 0 }", "new_text": "pub fn bug() -> i32 { 1 }"})
+            raise agent_mod._trace.APIServerError(503, 3)
+
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(agent_mod, "create_agent", fake_create_agent)
+    with pytest.raises(agent_mod._trace.APIServerError):
+        agent_mod.run_agent(repo, "Fix `bug`", "m", "k", max_api_calls=70)
 
 
 

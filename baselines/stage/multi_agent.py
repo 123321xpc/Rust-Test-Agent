@@ -5059,6 +5059,8 @@ def run_multi_agent(
             _record_stage_transition(ctx, "verifier", "fixer")
 
     except Exception as exc:
+        if getattr(exc, "is_api_server_error", False):
+            raise
         fallback = _try_degraded_patch_fallback(
             ctx.state, trace=ctx.trace, allow_unverified_compiling=True,
             issue_contract=ctx.issue_contract, blackboard=ctx.blackboard,

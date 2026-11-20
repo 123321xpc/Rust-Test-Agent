@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 def find_repo_crate_names(repo_path: Path) -> list[str]:
@@ -266,14 +267,20 @@ def prepare_rust_environment(root, benchmark_version, repo_path=None, instance_i
     elif not pinned:
         raise ValueError("A benchmark Rust toolchain is required when the repository does not pin one")
     versions = []
+    _transient_markers = ("could not download file", "unsuccessful status code", "timed out", "connection")
     for executable in ("rustc", "cargo"):
-        try:
-            result = subprocess.run([executable, "--version"], cwd=root, env=env,
-                                    capture_output=True, text=True, encoding="utf-8",
-                                    errors="replace", timeout=60, check=True)
-        except (OSError, subprocess.SubprocessError) as exc:
-            detail = getattr(exc, "stderr", "") or str(exc)
-            raise RuntimeError(f"Cannot verify {executable} for the evaluation toolchain: {detail}") from exc
+        for attempt in range(3):
+            try:
+                result = subprocess.run([executable, "--version"], cwd=root, env=env,
+                                        capture_output=True, text=True, encoding="utf-8",
+                                        errors="replace", timeout=60, check=True)
+                break
+            except (OSError, subprocess.SubprocessError) as exc:
+                detail = getattr(exc, "stderr", "") or str(exc)
+                if attempt < 2 and any(m in detail.lower() for m in _transient_markers):
+                    time.sleep(2)
+                    continue
+                raise RuntimeError(f"Cannot verify {executable} for the evaluation toolchain: {detail}") from exc
         versions.append(result.stdout.strip())
     if selected_version and re.fullmatch(r"\d+\.\d+\.\d+", selected_version):
         actual = re.match(r"rustc\s+(\S+)", versions[0])

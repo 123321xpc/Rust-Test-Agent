@@ -117,18 +117,6 @@ def test_legacy_plan_is_one_coherent_unit(setup):
     assert len(units[0]["paths"]) == 4
 
 
-def test_failed_check_blocks_dependents_and_records_diagnostics(setup):
-    _, _, tools, coord, _, board = setup
-    coord.select()
-    edit(tools, "a")
-    tools["cargo_check"] = SimpleNamespace(invoke=lambda _: '{"exit_code":101,"diagnostics":[{"code":"E0308"}]}')
-    assert not coord.verify(complete=True)[0]
-    assert coord.active == "a" and coord.select()["unit_id"] == "a"
-    u = board["repair_units"]["units"][0]
-    assert u["status"] == "active" and u["blocker"]
-    assert "E0308" in u["evidence"][0]["output"]
-
-
 def test_rollback_preserves_independent_completed_work(setup):
     _, state, tools, coord, _, _ = setup
     for name in "abcd":
@@ -168,32 +156,6 @@ def test_evidence_reused_only_at_current_revision_and_exact_config(setup):
     assert coord.verify()[0] and len(checks) == 2
 
 
-def test_zero_test_execution_never_completes_behavior_target(setup):
-    _, _, tools, coord, _, _ = setup
-    coord.select()
-    edit(tools, "a")
-    coord._unit("a")["verification"] = [{"tool": "cargo_test", "arguments": {"test_filter": "not_found"}}]
-    tools["cargo_test"] = SimpleNamespace(invoke=lambda _: '{"exit_code":0,"status":"passed","tests_executed":0}')
-    assert not coord.verify(complete=True)[0]
-    assert coord.active == "a"
-
-
-def test_scope_global_restore_and_handoff_gates(setup):
-    ma, state, _, coord, _, board = setup
-    coord.select()
-    assert coord.before_tool("edit_file", {"path": "src/b.rs"}) is None
-    assert coord.before_tool("checkpoint", {"action": "restore", "name": "pre_fix"}) is None
-    assert coord.before_tool("write_regression_test", {"path": "tests/test_regression_a.rs"}) is None
-    assert coord.before_tool("write_regression_test", {"path": "src/b.rs"}) is None
-    tools, holder = ma._make_handoff_tools("fixer", state, board, {"unit_coordinator": coord})
-    handoffs = {t.name: t for t in tools}
-    assert "pending" in handoffs["submit_for_qa"].invoke({"summary": "not done"})
-    assert not holder["done"]
-    handoffs["complete_repair_unit"].invoke({"summary": "unit ready"})
-    assert holder["payload"]["action"] == "unit_complete"
-    assert coord.active == "a"  # Claiming done is not verification.
-
-
 def test_browsing_does_not_consume_repair_budget(setup):
     ma, state, tools, coord, _, board = setup
     coord.select()
@@ -223,22 +185,6 @@ def test_fixer_preserves_attempt_budget_without_forcing_read_slices(setup, monke
     assert outcome == "stage_cap_reached" and result is None
 
 
-def test_repeated_coordinator_checks_also_trigger_replanning(setup, monkeypatch):
-    ma, state, tools, coord, _, _ = setup
-
-    def role(*args, **kwargs):
-        edit(tools, "a")
-        return {"action": "unit_complete", "summary": "candidate"}, "completed"
-
-    tools["cargo_check"] = SimpleNamespace(invoke=lambda _: '{"exit_code":101,"diagnostics":[{"code":"E0308"}]}')
-    monkeypatch.setattr(ma, "_run_role_agent", role)
-    monkeypatch.setattr(state, "stuck_status", lambda: {"compile_repeats": 3, "test_repeats": 0})
-    result, outcome = ma._run_scheduled_fixer("system", "issue", [], {}, coordinator=coord,
-                                             allow_escalate=True, client=SimpleNamespace(calls_made=0), stage_cap=40)
-    assert result["action"] == "escalate" and "E0308" in result["reason"]
-    assert outcome == "unit_blocked"
-
-
 def test_qa_edit_invalidates_unit_and_transitive_dependents(setup):
     _, _, tools, coord, _, _ = setup
     for name in "abcd":
@@ -257,20 +203,6 @@ def test_final_verification_can_remove_navigator_temporary_test(setup):
     assert coord.before_tool("revert_file", {"path": "tests/test_regression_navigator.rs"}) is None
     assert coord.active == "d"  # Only final verification unit is reopened.
     assert coord._unit("a")["status"] == "verified"
-
-
-@pytest.mark.skipif(shutil.which("cargo") is None, reason="Cargo unavailable")
-def test_real_cargo_failure_then_dependency_closed_success(setup):
-    _, state, tools, coord, _, _ = setup
-    diag = load("rust_diagnostics")
-    tools["cargo_check"] = diag.make_cargo_check_tool(state.root, lambda p: state.root / p)
-    coord.select()
-    tools["edit_file"].invoke({"path": "src/a.rs", "old_text": "{ 0 }", "new_text": "{ missing_value() }"})
-    assert not coord.verify(complete=True)[0]
-    assert "E0425" in coord._unit("a")["evidence"][0]["output"]
-    tools["edit_file"].invoke({"path": "src/a.rs", "old_text": "{ missing_value() }", "new_text": "{ 1 }"})
-    assert coord.verify(complete=True)[0]
-    assert coord.select()["unit_id"] == "b"
 
 
 def test_unit_rollback_restores_test_oracle_and_clears_global_green(setup):

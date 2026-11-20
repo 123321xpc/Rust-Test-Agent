@@ -579,6 +579,9 @@ def main():
         status = "completed"
     except BaseException as exc:
         trace.record("run_error", stage=stage, error=str(exc), error_type=type(exc).__name__)
+        if getattr(exc, "is_api_server_error", False):
+            print(f"Aborting task due to persistent API server error: {exc}", file=sys.stderr, flush=True)
+            sys.exit(getattr(_trace, "API_SERVER_ERROR_EXIT_CODE", 75))
         raise
     finally:
         trace.record("agent_metrics", status=status, elapsed_seconds=time.perf_counter() - started,

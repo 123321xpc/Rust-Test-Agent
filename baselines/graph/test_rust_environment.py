@@ -162,3 +162,26 @@ def test_find_repo_crate_names(tmp_path):
     (repo / "crates" / "sub" / "Cargo.toml").write_text('[package]\nname = "sub_pkg"\nversion = "0.1.0"\n', encoding="utf-8")
     names = environment.find_repo_crate_names(repo)
     assert set(names) == {"root_pkg", "sub_pkg"}
+
+
+def test_prepare_rust_environment_retries_transient_rustup_download(tmp_path, monkeypatch):
+    repo = tmp_path / "work" / "repo"
+    repo.mkdir(parents=True)
+    calls = {"rustc": 0}
+    monkeypatch.setattr(environment.time, "sleep", lambda _s: None)
+
+    def fake_run(cmd, **kwargs):
+        exe = cmd[0]
+        if exe == "rustc":
+            calls["rustc"] += 1
+            if calls["rustc"] < 2:
+                err = subprocess.CalledProcessError(1, cmd, stderr="error: could not download file from rsproxy.cn: 504")
+                raise err
+            return SimpleNamespace(stdout="rustc 1.80.0\n", stderr="")
+        return SimpleNamespace(stdout="cargo 1.80.0\n", stderr="")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    env, info = environment.prepare_rust_environment(repo, "1.80.0", instance_id="demo__demo-1")
+    assert calls["rustc"] == 2
+    assert info["rustc"] == "rustc 1.80.0"
+    assert "CARGO_TARGET_DIR" in env

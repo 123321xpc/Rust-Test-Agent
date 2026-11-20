@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -107,13 +108,40 @@ def _body(data):
         return text
 
 
+API_SERVER_ERROR_EXIT_CODE = 75
+DEFAULT_SERVER_ERROR_RETRIES = 3
+DEFAULT_SERVER_ERROR_RETRY_INTERVAL = 120.0
+
+
+class APIServerError(RuntimeError):
+    """Raised when the model API keeps returning HTTP 5xx after all retries are exhausted."""
+
+    is_api_server_error = True
+
+    def __init__(self, status_code, retries, message=""):
+        self.status_code = status_code
+        self.retries = retries
+        super().__init__(
+            message or f"Model API returned HTTP {status_code} after {retries} retries; aborting task"
+        )
+
+
 class TraceHTTPClient(httpx.Client):
     """Record each actual SDK HTTP attempt, including retries and errors."""
 
-    def __init__(self, recorder, max_calls=None):
+    def __init__(
+        self,
+        recorder,
+        max_calls=None,
+        *,
+        server_error_retries=DEFAULT_SERVER_ERROR_RETRIES,
+        server_error_retry_interval=DEFAULT_SERVER_ERROR_RETRY_INTERVAL,
+    ):
         super().__init__(timeout=180, follow_redirects=True)
         self.recorder = recorder
         self.max_calls = max_calls
+        self.server_error_retries = max(0, int(server_error_retries))
+        self.server_error_retry_interval = float(server_error_retry_interval)
         self._calls = 0
         self._transient_failures = 0
         self._calls_lock = threading.Lock()
@@ -139,30 +167,59 @@ class TraceHTTPClient(httpx.Client):
                 if self.recorder:
                     self.recorder.record('api_limit', max_calls=self.max_calls)
                 raise RuntimeError(f'Model API call limit reached ({self.max_calls})')
-            self._calls += 1
-        request_id = uuid.uuid4().hex
-        if self.recorder:
-            self.recorder.record('api_request', request_id=request_id, method=request.method,
-                                 path=request.url.path, body=_body(request.content))
-        try:
-            response = super().send(request, **kwargs)
-            response.read()
-        except Exception as exc:
-            transient = isinstance(exc, httpx.TransportError)
+        request.read()
+        for attempt in range(self.server_error_retries + 1):
+            with self._calls_lock:
+                self._calls += 1
+            request_id = uuid.uuid4().hex
+            if self.recorder:
+                self.recorder.record('api_request', request_id=request_id, method=request.method,
+                                     path=request.url.path, body=_body(request.content))
+            try:
+                response = super().send(request, **kwargs)
+                response.read()
+            except Exception as exc:
+                transient = isinstance(exc, httpx.TransportError)
+                if transient:
+                    with self._calls_lock:
+                        self._transient_failures += 1
+                if self.recorder:
+                    self.recorder.record('api_error', request_id=request_id, error=str(exc), transient=transient)
+                raise
+            transient = response.status_code in (408, 409, 429) or response.status_code >= 500
             if transient:
                 with self._calls_lock:
                     self._transient_failures += 1
             if self.recorder:
-                self.recorder.record('api_error', request_id=request_id, error=str(exc), transient=transient)
-            raise
-        transient = response.status_code in (408, 409, 429) or response.status_code >= 500
-        if transient:
-            with self._calls_lock:
-                self._transient_failures += 1
-        if self.recorder:
-            self.recorder.record('api_response', request_id=request_id, status=response.status_code,
-                                 body=_body(response.content), transient=transient)
-        return response
+                self.recorder.record('api_response', request_id=request_id, status=response.status_code,
+                                     body=_body(response.content), transient=transient)
+            if 500 <= response.status_code < 600 and self.server_error_retries > 0:
+                if attempt < self.server_error_retries:
+                    if self.recorder:
+                        self.recorder.record(
+                            'api_retry',
+                            request_id=request_id,
+                            status=response.status_code,
+                            retry=attempt + 1,
+                            max_retries=self.server_error_retries,
+                            wait_seconds=self.server_error_retry_interval,
+                        )
+                    print(
+                        f"[API 5xx] HTTP {response.status_code}; retrying in "
+                        f"{self.server_error_retry_interval:g}s ({attempt + 1}/{self.server_error_retries})...",
+                        flush=True,
+                    )
+                    time.sleep(self.server_error_retry_interval)
+                    continue
+                if self.recorder:
+                    self.recorder.record(
+                        'api_server_abort',
+                        request_id=request_id,
+                        status=response.status_code,
+                        retries=self.server_error_retries,
+                    )
+                raise APIServerError(response.status_code, self.server_error_retries)
+            return response
 
 
 class RoleTraceCallback(BaseCallbackHandler):
