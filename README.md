@@ -57,6 +57,10 @@ To bridge the gap between LLM agents and the Rust ecosystem, this project provid
 
 ```text
 Rust-SWE-Bench/
+├── data/                        # Shared canonical datasets (neutral center)
+│   ├── rustbench-all.jsonl      # 500 benchmark tasks & metadata
+│   └── rb_all_bug_report.json   # Bug reports (624 entries)
+│
 ├── Rust-bench/                  # Core evaluation harness (forked from SWE-bench for Rust)
 │   ├── swebench/
 │   │   ├── harness/             # Docker build, test execution, and grading harness
@@ -64,47 +68,30 @@ Rust-SWE-Bench/
 │   │   └── collect/             # Issue and task collection utilities
 │   └── setup.py                 # Installs the `swebench` python package
 │
-├── RustForger/                  # The proposed RustForger agent system
-│   ├── rustforger-tracer/       # High-performance Rust workspace for AST tracing
-│   │   ├── trace_cli/           # `trace_cli` binary (CLI runner for AST tracing)
-│   │   ├── trace_macro/         # Procedural macros for function entry/exit hooks
-│   │   ├── trace_runtime/       # Concurrent thread-local call stack tracking
-│   │   └── trace_common/        # Shared serialization & data structures
-│   ├── src/                     # Agent orchestration & LLM interaction
-│   │   ├── docker_handler.py    # Containerized task runner for RustForger
-│   │   ├── rustforger_main_tracing.py # Core repair loop with tracing API
-│   │   ├── agent_api.py         # Tools: bash, str_replace, new_file, trace, reports
-│   │   ├── patch_extracter.py   # Extracts unified diff patches from agent logs
-│   │   └── runtime_config.py    # Memory, budget, and context manager
-│   ├── data/                    # Tasks metadata (rustbench-all.jsonl, bug reports)
-│   └── config/                  # Runtime limits and settings
+├── agents/                      # All evaluated & developed agent systems as equal peers
+│   ├── shared/                  # Deduplicated shared modules (trace, symbols, error hints, candidates)
+│   ├── normal/                  # Generic LangChain ReAct baseline
+│   ├── ACI-impr/                # Rust ACI single-agent baseline
+│   ├── graph/                   # LangGraph StateGraph multi-agent workflow
+│   ├── graph-2/                 # Graph + lightweight pure-Rust RAII tracing & in-module tests
+│   ├── CKG/                     # Graph + compiler-precise rustdoc JSON definition graph
+│   ├── test/                    # Full Rust multi-agent repair system (Graph + CKG + Tracing)
+│   ├── rustforger/              # ICSE'26 RustForger dynamic tracing agent & `rustforger-tracer`
+│   ├── swe_agent/               # SWE-agent adapted for Rust projects
+│   └── acr_agentless/           # AutoCodeRover & Agentless prompt-driven workflows
 │
-├── baselines/                   # Benchmark baseline agent implementations
-│   ├── SWE-agent/               # SWE-agent adapted for Rust projects
-│   ├── normal/                  # LangChain ReAct baseline with cargo tools & diagnostics
-│   ├── ACI-impr/                # Experimental ACI improvements (Round 1 baseline)
-│   └── test/                    # Multi-agent Rust repair system
+├── suites/                      # Frozen benchmark suites & shared execution orchestrator
+│   ├── common/                  # Shared runner (`runner.py`) & Cargo offline cache (`cache_cargo.py`)
+│   ├── testset/                 # 50-task balanced test set (`manifest.json`, `testbench`)
+│   └── experimentset/           # 100-task experiment set (`manifest.json`, `experimentbench`)
 │
-├── validation/                  # Frozen 10-task Jifang development set and runner
-│   ├── manifest.json            # Selected task IDs, sizes, commits, and image tags
-│   ├── validate                 # Jifang CLI and background launcher
-│   └── README.md                # Detailed usage and selection rules
-│
-├── reproduce/                   # Experimental reproduction frameworks
-│   ├── reproduction-replay/     # Replays trajectory actions in Docker with output capture
-│   └── acr-agentless-reproduce/ # AutoCodeRover & Agentless prompt-driven workflows
-│
+├── reproduce/                   # Trajectory replay suite (`reproduction-replay`)
+├── analysis/                    # Saved experimental summaries & analysis scripts
 ├── material/                    # Experimental data, manual review sheets, and sample logs
-│   ├── instances.xlsx           # 500 tasks manual review (leakage, clarity, test validity)
-│   ├── rustforger_correct_patch.xlsx # RustForger correct patch manual verification log
-│   ├── openhands_correct_patch.xlsx  # OpenHands correct patch manual verification log
-│   ├── classified_rust_issues.jsonl  # Categorized Rust issue taxonomy
-│   └── *.traj, *.traj.log       # Sample agent execution trajectories
-│
-├── eval_reports/                # Target folder for generated evaluation reports
+├── figures/                     # Publication figures & plotting scripts
+├── pyproject.toml               # Root project anchor & pytest configuration
 ├── .env.example                 # Environment variables template
-├── .env                         # Local API credentials & model settings (keep private)
-└── image.png                    # Average Trace invocation frequency chart
+└── .env                         # Local API credentials & model settings (keep private)
 ```
 
 ---

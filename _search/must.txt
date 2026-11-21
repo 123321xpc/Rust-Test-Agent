@@ -1,4 +1,0 @@
-2026 | Proceedings of the 2026 IEEE/ACM 48th  | Evaluating and Improving Automated Repository-Level Rust Issue Resolution with LLM-based Agents | cites=14 | https://www.semanticscholar.org/paper/e92c79d3cc9014fcce42a5b1ee06e56ce80ef406
-2026 | arXiv | SWE-Bench ProMax: Benchmarking Agents on Large-Scale Multilingual Code Refactoring | cites=0 | http://arxiv.org/abs/2608.09802v2
-2025 | Neural Information Processing Systems | Multi-SWE-bench: A Multilingual Benchmark for Issue Resolving | cites=279 | https://www.semanticscholar.org/paper/2b4aab99b67027083ca7269b8b3d01aa4867b3a4
-2026 | arXiv | Correct Code, Broken Contributions? SWE-CC: Benchmarking Repository Policy Compliance for Codin | cites=0 | http://arxiv.org/abs/2610.06193v1

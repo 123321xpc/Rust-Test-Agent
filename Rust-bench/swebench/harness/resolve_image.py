@@ -21,6 +21,13 @@ from swebench.harness.test_spec import (
 from swebench.harness.utils import load_swebench_dataset
 
 
+def _repo_root() -> Path:
+    env_root = os.environ.get("RUSTBENCH_ROOT")
+    if env_root:
+        return Path(env_root)
+    return Path(__file__).resolve().parents[3]
+
+
 def default_config_path() -> str:
     """Return default config.json path bundled with the harness."""
     pkg_cfg = Path(__file__).resolve().parent / "logs" / "config.json"
@@ -36,9 +43,8 @@ def default_dataset_path() -> Optional[str]:
     """Return default rustbench-all.jsonl path if present on disk."""
     candidates = [
         os.environ.get("RUSTBENCH_DATASET_PATH"),
+        str(_repo_root() / "data" / "rustbench-all.jsonl"),
         str(Path.home() / "xpc" / "data" / "rustbench-all.jsonl"),
-        str(Path(__file__).resolve().parents[3] / "data" / "rustbench-all.jsonl"),
-        str(Path(__file__).resolve().parents[3] / "RustForger" / "data" / "rustbench-all.jsonl"),
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
