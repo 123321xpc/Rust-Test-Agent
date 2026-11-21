@@ -460,7 +460,9 @@ def enrich_diagnostic_symbol_lookup(
                         )
                 if inferred_trait and ckg is not None and (deadline is None or _time.monotonic() < deadline):
                     try:
-                        nb_tr = ckg.query_neighborhood(inferred_trait, kind="trait", exclude_tests=True)
+                        nb_tr = ckg.query_neighborhood(
+                            inferred_trait, kind="trait", exclude_tests=True, _allow_semantic_subprocess=False
+                        )
                         tr_paths = [
                             pp
                             for d_item in nb_tr.get("definitions", [])[:2]
@@ -554,7 +556,9 @@ def enrich_diagnostic_symbol_lookup(
             target_sym = sym or fn_name
             if target_sym and re.match(r"^[A-Za-z_]\w*$", target_sym):
                 try:
-                    nb = ckg.query_neighborhood(target_sym, exclude_tests=True)
+                    nb = ckg.query_neighborhood(
+                        target_sym, exclude_tests=True, _allow_semantic_subprocess=False
+                    )
                     pub_paths = []
                     for d_item in nb.get("definitions", [])[:2]:
                         for pp in d_item.get("public_paths", []):

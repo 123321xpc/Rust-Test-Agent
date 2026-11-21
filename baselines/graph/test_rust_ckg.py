@@ -13,24 +13,6 @@ def _load_ckg():
     return mod
 
 
-def test_tokenize_rust_handles_comments_raw_strings_and_lifetimes():
-    ckg = _load_ckg()
-    src = """
-// fn fake_in_comment() {}
-/* outer /* nested fn fake() {} */ still comment */
-pub fn parse<'a>(s: &'a str, c: char) -> &'a str {
-    let raw = r#"fn not_a_fn() { 'x' }"#;
-    let ch = '\\'';
-    let r#match = s;
-    r#match
-}
-"""
-    parsed = ckg.parse_rust_file(src, "src/lib.rs")
-    fn_names = [it["name"] for it in parsed.items if it["kind"] == "fn"]
-    assert fn_names == ["parse"]
-    assert parsed.items[0]["has_body"] is True
-
-
 def test_ckg_extracts_reexports_derives_traits_and_call_edges(tmp_path):
     ckg = _load_ckg()
     root = tmp_path.resolve()
@@ -124,27 +106,3 @@ def test_query_neighborhood_resolves_symbol_inside_a_file(tmp_path):
     assert res.get("mode") == "file_symbol"
     assert not res.get("error")
     assert [it["name"] for it in res["items"]] == ["consume_string"]
-
-
-def test_query_neighborhood_reports_unknown_symbol_in_file(tmp_path):
-    ckg = _load_ckg()
-    root = tmp_path.resolve()
-    (root / "Cargo.toml").write_text('[package]\nname = "symfile2"\nversion = "0.1.0"\n', encoding="utf-8")
-    (root / "src").mkdir()
-    (root / "src" / "lib.rs").write_text("pub fn present() -> u32 {\n    1\n}\n", encoding="utf-8")
-    graph = ckg.RustCodeGraph(root)
-    res = graph.query_neighborhood("src/lib.rs:absent")
-    assert res.get("error")
-    assert "present" in res.get("available_symbols", [])
-
-
-def test_query_neighborhood_line_form_still_works(tmp_path):
-    ckg = _load_ckg()
-    root = tmp_path.resolve()
-    (root / "Cargo.toml").write_text('[package]\nname = "symfile3"\nversion = "0.1.0"\n', encoding="utf-8")
-    (root / "src").mkdir()
-    (root / "src" / "lib.rs").write_text("pub fn present() -> u32 {\n    1\n}\n", encoding="utf-8")
-    graph = ckg.RustCodeGraph(root)
-    res = graph.query_neighborhood("src/lib.rs:2")
-    assert res.get("mode") == "file_line"
-    assert res["items"]

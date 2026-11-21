@@ -1,0 +1,5 @@
+method,resolved_count,total_tasks,resolved_pct,small_solved,small_total,small_pct,medium_solved,medium_total,medium_pct,large_solved,large_total,large_pct,total_tokens,input_tokens,output_tokens,mean_tokens,api_calls,total_time_s,total_time_h,mean_time_s
+swe-agent,14,100,14.0,11,40,27.5,3,55,5.5,0,5,0.0,16196675,15857220,339455,161966.8,1788,18249.53,5.07,182.50
+normal,27,100,27.0,16,40,40.0,11,55,20.0,0,5,0.0,9388374,9254849,133525,93883.7,1732,18048.77,5.01,180.49
+ACI-impr,31,100,31.0,21,40,52.5,10,55,18.2,0,5,0.0,30374421,30048423,325998,303744.2,3336,34019.04,9.45,340.19
+graph,32,100,32.0,22,40,55.0,10,55,18.2,0,5,0.0,72830868,72171500,659368,728308.7,5242,47926.91,13.31,479.27

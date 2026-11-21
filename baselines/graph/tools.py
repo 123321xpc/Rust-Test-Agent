@@ -799,10 +799,72 @@ def _edited_inline_test_warning(orig_code: str, updated_code: str, path_str: str
         span_str = ", ".join(f"{s}-{e}" for s, e in ranges[:3])
         return (
             f"[Inline-Test Isolation Warning in {path_str}]: edit touches pre-existing #[cfg(test)]/mod tests lines ({span_str}). "
-            "Submission gate BLOCKS patches that modify pre-existing inline tests; leave existing inline tests untouched "
-            "and preserve backwards-compatible signatures/helpers or avoid changing test-helper structs directly."
+            "Submission gate BLOCKS patches that modify pre-existing inline tests (which also risk test_patch merge conflicts). "
+            "Leave existing inline tests untouched; if adding a struct field triggers E0063 only inside untouched #[cfg(test)] "
+            "lines, verify via cargo_check(tests=False) and a standalone tests/test_regression_*.rs test instead."
         )
     return ""
+
+
+def _eof_append_warning(orig_code: str, updated_code: str, path_str: str) -> str:
+    """Warn when appending new top-level items at raw EOF of a non-test .rs file without #[cfg(test)]."""
+    norm = path_str.replace("\\", "/").lower()
+    if (
+        not norm.endswith(".rs")
+        or norm.startswith(("tests/", "benches/", "examples/"))
+        or "/tests/" in norm or "/benches/" in norm or "/examples/" in norm
+        or norm.endswith(("_test.rs", "tests.rs"))
+        or inline_test_line_ranges(orig_code)
+    ):
+        return ""
+    orig_lines = orig_code.rstrip().splitlines()
+    new_lines = updated_code.rstrip().splitlines()
+    if len(orig_lines) < 5 or len(new_lines) <= len(orig_lines):
+        return ""
+    tail = [ln.rstrip() for ln in orig_lines[-2:]]
+    if [ln.rstrip() for ln in new_lines[len(orig_lines) - len(tail):len(orig_lines)]] != tail:
+        return ""
+    appended = "\n".join(new_lines[len(orig_lines):])
+    if re.search(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+)?(?:fn|struct|enum|impl|trait|const|static|mod)\b", appended):
+        return (
+            f"[EOF-Append Conflict Warning in {path_str}]: new item(s) appended at raw EOF of a file without #[cfg(test)]. "
+            "Evaluation test_patch often appends tests at EOF, causing patch merge conflicts. "
+            "Place new private helpers/types immediately after their caller or impl block before the file's final item instead."
+        )
+    return ""
+
+
+def _compile_errors_only_in_untouched_inline_tests(root: Path, compiler_out: str, originals: dict) -> bool:
+    """Return True when every compiler error is E0063/E0560 inside an untouched inline #[cfg(test)] block."""
+    all_codes = set(re.findall(r"error\[(E\d{4})\]", compiler_out or ""))
+    if not all_codes or not (all_codes <= {"E0063", "E0560"}):
+        return False
+    locs = re.findall(r"(?m)^error\[E(?:0063|0560)\]:[^\n]*\n\s*-->\s*([^\n:]+):(\d+):\d+", compiler_out or "")
+    if not locs:
+        return False
+    for raw_file, ln_s in locs:
+        try:
+            fpath = (root / raw_file.strip()).resolve()
+            if not fpath.is_file() or not fpath.is_relative_to(root):
+                return False
+            rel = fpath.relative_to(root)
+            cur_text = fpath.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            return False
+        cur_ranges = inline_test_line_ranges(cur_text)
+        ln = int(ln_s)
+        if not any(s <= ln <= e for s, e in cur_ranges):
+            return False
+        orig_raw = (originals or {}).get(rel)
+        if orig_raw and orig_raw[0] is not None:
+            orig_text = orig_raw[0].decode("utf-8", errors="replace")
+            orig_lines = orig_text.splitlines()
+            cur_lines = cur_text.splitlines()
+            orig_blocks = [orig_lines[s - 1:e] for s, e in inline_test_line_ranges(orig_text)]
+            hit_block = next((cur_lines[s - 1:e] for s, e in cur_ranges if s <= ln <= e), None)
+            if hit_block is None or hit_block not in orig_blocks:
+                return False
+    return True
 
 
 def _unimported_crate_path_hint(prev_code: str, updated_code: str, path_str: str) -> str:
@@ -2542,6 +2604,26 @@ class PatchState:
                     backup[reg_rel] = (reg_file.read_bytes(), st.st_mode, st.st_mtime_ns)
                     reg_file.unlink()
         warnings = []
+
+        def _check_cmd(cmd: list[str], err_prefix: str) -> None:
+            result = self._compare_workspace_compile_with_baseline(cmd, timeout=120)
+            if result["status"] == "regression":
+                if (
+                    any(flag in cmd for flag in ("--tests", "--all-targets"))
+                    and _compile_errors_only_in_untouched_inline_tests(root, result["details"], self.originals)
+                ):
+                    prod_cmd = [c for c in cmd if c not in ("--tests", "--all-targets")]
+                    prod_res = self._compare_workspace_compile_with_baseline(prod_cmd, timeout=120)
+                    if prod_res["status"] == "passed":
+                        warnings.append(
+                            f"Production targets passed under post-strip check; untouched inline #[cfg(test)] "
+                            f"struct-literal E0063/E0560 errors were ignored so benchmark test_patch can update tests."
+                        )
+                        return
+                raise ValueError(f"{err_prefix}\n{result['details']}" if result["details"] else err_prefix)
+            if result["status"] != "passed":
+                warnings.append(result["details"])
+
         try:
             has_lock = (root / "Cargo.lock").is_file()
             for manifest in sorted(valid_manifests):
@@ -2560,15 +2642,11 @@ class PatchState:
                 else:
                     _append_cargo_feature_flags(cmd)
 
-                result = self._compare_workspace_compile_with_baseline(cmd, timeout=120)
-                if result["status"] == "regression":
-                    rel_manifest = manifest.relative_to(root).as_posix() if manifest.is_relative_to(root) else str(manifest)
-                    raise ValueError(
-                        f"Post-strip verification failed for {rel_manifest} under 'cargo check'; "
-                        f"the unpatched checkout passed:\n{result['details']}"
-                    )
-                if result["status"] != "passed":
-                    warnings.append(result["details"])
+                rel_manifest = manifest.relative_to(root).as_posix() if manifest.is_relative_to(root) else str(manifest)
+                _check_cmd(
+                    cmd,
+                    f"Post-strip verification failed for {rel_manifest} under 'cargo check'; the unpatched checkout passed:",
+                )
             downstream_pkgs = self._find_downstream_workspace_packages(valid_manifests)
             ws_manifest = root / "Cargo.toml"
             for dep_pkg in downstream_pkgs:
@@ -2576,14 +2654,10 @@ class PatchState:
                 _append_cargo_feature_flags(dep_cmd)
                 if has_lock:
                     dep_cmd.append("--locked")
-                result = self._compare_workspace_compile_with_baseline(dep_cmd, timeout=120)
-                if result["status"] == "regression":
-                    raise ValueError(
-                        f"Post-strip downstream workspace check failed for dependent package '{dep_pkg}'. "
-                        f"The unpatched checkout passed:\n{result['details']}"
-                    )
-                if result["status"] != "passed":
-                    warnings.append(result["details"])
+                _check_cmd(
+                    dep_cmd,
+                    f"Post-strip downstream workspace check failed for dependent package '{dep_pkg}'. The unpatched checkout passed:",
+                )
             workspace_manifest = root / "Cargo.toml"
             if workspace_manifest.is_file():
                 workspace_text = workspace_manifest.read_text(encoding="utf-8", errors="replace")
@@ -2593,12 +2667,10 @@ class PatchState:
                     workspace_cmd.append("--workspace")
                 if has_lock:
                     workspace_cmd.append("--locked")
-                workspace_result = self._compare_workspace_compile_with_baseline(workspace_cmd)
-                if workspace_result["status"] == "regression":
-                    raise ValueError("Workspace compilation regressed against the unpatched checkout:\n"
-                                     + workspace_result["details"])
-                if workspace_result["status"] != "passed":
-                    warnings.append(workspace_result["details"])
+                _check_cmd(
+                    workspace_cmd,
+                    "Workspace compilation regressed against the unpatched checkout:",
+                )
         finally:
             for reg_rel, data in backup.items():
                 if reg_rel in self.in_module_regressions:
@@ -3180,17 +3252,80 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
         except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
             return f"Error writing {path}: {exc}"
 
+    def _strip_rust_comments(src: str) -> str:
+        no_block = re.sub(r"/\*.*?\*/", "", src or "", flags=re.DOTALL)
+        return re.sub(r"//[^\n]*", "", no_block)
+
+    def _extract_macro_calls(src: str, macro_names: set[str]) -> list[tuple[str, str]]:
+        calls: list[tuple[str, str]] = []
+        pat = re.compile(r"\b(" + "|".join(re.escape(m) for m in macro_names) + r")\s*!\s*([(\[{])")
+        close_for = {"(": ")", "[": "]", "{": "}"}
+        for match in pat.finditer(src):
+            name = match.group(1)
+            open_ch = match.group(2)
+            close_ch = close_for[open_ch]
+            depth = 1
+            idx = match.end()
+            in_str = False
+            escape = False
+            while idx < len(src) and depth > 0:
+                ch = src[idx]
+                if in_str:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == open_ch:
+                        depth += 1
+                    elif ch == close_ch:
+                        depth -= 1
+                idx += 1
+            if depth == 0:
+                calls.append((name, src[match.end():idx - 1]))
+        return calls
+
+    def _is_literal_only_assertion(args_text: str) -> bool:
+        no_strs = re.sub(r'"(?:\\.|[^"\\])*"', "", args_text or "")
+        tokens = re.findall(r"[A-Za-z_]\w*", no_strs)
+        return not any(tok not in {"true", "false"} for tok in tokens)
+
+    def _check_regression_rewrite_not_weakened(old_src: str, new_src: str) -> str | None:
+        assert_macros = {
+            "assert", "assert_eq", "assert_ne", "assert_matches",
+            "debug_assert", "debug_assert_eq", "debug_assert_ne",
+        }
+        value_macros = {"assert_eq", "assert_ne", "debug_assert_eq", "debug_assert_ne"}
+        old_calls = _extract_macro_calls(_strip_rust_comments(old_src), assert_macros)
+        new_calls = _extract_macro_calls(_strip_rust_comments(new_src), assert_macros)
+        if not new_calls:
+            return "rewritten test contains no Rust assertions"
+        if old_calls and len(new_calls) < len(old_calls):
+            return f"rewritten test reduces assertion count ({len(old_calls)} -> {len(new_calls)})"
+        old_eq = sum(1 for name, _ in old_calls if name in value_macros)
+        new_eq = sum(1 for name, _ in new_calls if name in value_macros)
+        if old_eq and new_eq < old_eq:
+            return f"rewritten test downgrades value assertions ({old_eq} -> {new_eq})"
+        if all(_is_literal_only_assertion(args) for _, args in new_calls):
+            return "rewritten test contains only literal/tautological assertions"
+        return None
+
     def _try_unlock_broken_oracle(
         locked_meta: dict[str, Any],
         locked_key: tuple[Any, ...],
         reason: str,
-    ) -> str | None:
+        proposed_content: str = "",
+    ) -> tuple[str | None, bool]:
         clean_reason = str(reason or "").strip()
         if len(clean_reason) < 20:
             return (
                 "Error: replace_broken_lock_reason must be at least 20 characters explaining "
-                "why the locked oracle failed to compile, panicked in setup, or was static-only."
-            )
+                "why the locked oracle is broken or factually wrong."
+            ), False
         repro_info = next(
             (
                 v for k, v in state._reproduced_regressions.items()
@@ -3212,16 +3347,126 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 except OSError:
                     existing_src = ""
         is_static_only = bool(existing_src and _is_static_manifest_only_test(existing_src))
-        if not (is_compile_broken or is_setup_panic or is_static_only):
-            return (
-                f"Error: locked regression '{locked_meta.get('name')}' failed with an assertion failure "
-                "(not compile error, setup panic, or static-only check); cannot self-unlock via "
-                "replace_broken_lock_reason. Fix production code or call escalate_for_replan."
-            )
-        res = state.unlock_regression(locked_meta.get("name", ""), clean_reason, approved_by="fixer_broken_oracle")
+        is_broken_infra = is_compile_broken or is_setup_panic or is_static_only
+        if not is_broken_infra:
+            weaken_err = _check_regression_rewrite_not_weakened(existing_src, proposed_content)
+            if weaken_err:
+                return (
+                    f"Error: locked regression '{locked_meta.get('name')}' failed with an assertion failure "
+                    f"and cannot self-unlock via replace_broken_lock_reason ({weaken_err}). "
+                    "Fix production code or preserve assertion strength and fail on the unpatched base."
+                ), False
+        approved_by = "fixer_broken_oracle" if is_broken_infra else "fixer_reverified_red"
+        res = state.unlock_regression(locked_meta.get("name", ""), clean_reason, approved_by=approved_by)
         if not res.get("ok"):
-            return f"Error unlocking broken oracle: {res.get('error', 'unknown')}"
-        return None
+            return f"Error unlocking broken oracle: {res.get('error', 'unknown')}", False
+        return None, (not is_broken_infra)
+
+    def _clear_regression_tracking_for_name(test_name: str) -> None:
+        for reg_key_now in [
+            k for k in list(state._reproduced_regressions)
+            if str(k[1]) == test_name
+        ]:
+            state._reproduced_regressions.pop(reg_key_now, None)
+            state._passed_regressions.discard(reg_key_now)
+            state._passed_regression_configs.pop(reg_key_now, None)
+            state._reproduction_notes.pop(reg_key_now, None)
+            state._regression_test_names.pop(reg_key_now, None)
+        state._verified_revision = None
+
+    def _handle_locked_regression_rewrite(
+        locked_meta: dict[str, Any] | None,
+        locked_key: tuple[Any, ...] | None,
+        rel_posix: str,
+        proposed_content: str,
+        replace_broken_lock_reason: str,
+        *,
+        renamed_to: str = "",
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        if not locked_meta or locked_key is None:
+            return None, None
+        lock_name = str(locked_meta.get("name") or "")
+        if not renamed_to:
+            proposed_sha = hashlib.sha256(proposed_content.encode("utf-8")).hexdigest()
+            if proposed_sha == locked_meta.get("sha256"):
+                return None, None
+        if replace_broken_lock_reason:
+            prev_snapshot = {
+                "locked_key": locked_key,
+                "locked_meta": dict(locked_meta),
+                "repro_entries": {
+                    k: dict(v) for k, v in state._reproduced_regressions.items()
+                    if str(k[1]) == lock_name
+                },
+            }
+            unlock_err, needs_red_recheck = _try_unlock_broken_oracle(
+                locked_meta, locked_key, replace_broken_lock_reason, proposed_content=proposed_content,
+            )
+            if unlock_err:
+                return unlock_err, None
+            prev_snapshot["needs_red_recheck"] = needs_red_recheck
+            return None, prev_snapshot
+        detail = (
+            f"Locked regression '{lock_name}' may not be replaced by '{renamed_to}'."
+            if renamed_to
+            else f"Locked regression '{lock_name}' content was modified."
+        )
+        state._record_red_lock_violation("rewrite_locked_regression", rel_posix, detail)
+        if not renamed_to:
+            _clear_regression_tracking_for_name(lock_name)
+        return (
+            f"Error: '{rel_posix}' holds locked Red-phase regression test '{lock_name}' and cannot be rewritten "
+            "without authorization. Fix production code so it passes, pass replace_broken_lock_reason (>=20 chars) "
+            "with a non-weakening replacement that still fails on unpatched code, or call escalate_for_replan."
+        ), None
+
+    def _verify_or_rollback_self_unlock(
+        unlock_ctx: dict[str, Any] | None,
+        reg_key: tuple[Any, str],
+        target_path: Path,
+        prev_bytes: bytes | None,
+        *,
+        relative: Path,
+        prev_in_mod: dict[str, Any] | None = None,
+    ) -> str | None:
+        if not unlock_ctx or not unlock_ctx.get("needs_red_recheck"):
+            return None
+        if not shutil.which("cargo"):
+            return None
+        err_msg: str | None = None
+        try:
+            state.verify_pre_fix_reproduction({reg_key})
+            repro = state._reproduced_regressions.get(reg_key) or {}
+            if not repro.get("clean_red"):
+                err_msg = "rewritten regression test did not produce a clean Red failure on unpatched code"
+        except Exception as exc:
+            err_msg = str(exc)
+        if err_msg is None:
+            return None
+        with state._lock:
+            if prev_bytes is None:
+                try:
+                    if target_path.is_file():
+                        target_path.unlink()
+                except OSError:
+                    pass
+                state.regression_tests.discard(relative)
+            else:
+                target_path.write_bytes(prev_bytes)
+            if prev_in_mod is not None:
+                state.in_module_regressions[relative] = prev_in_mod
+            locked_key = unlock_ctx["locked_key"]
+            state._unlocked_regressions.pop(locked_key, None)
+            state._locked_regressions[locked_key] = unlock_ctx["locked_meta"]
+            state._reproduced_regressions.pop(reg_key, None)
+            state._reproduced_regressions.update(unlock_ctx.get("repro_entries") or {})
+            state._passed_regressions.discard(reg_key)
+            state._verified_revision = None
+        return (
+            f"Error: locked regression '{unlock_ctx['locked_meta'].get('name')}' cannot self-unlock because "
+            f"the rewritten test was not confirmed Red on the unpatched original code ({err_msg}). "
+            "Restored the previous locked test; fix production code or update the test so it fails on unpatched code."
+        )
 
     @tool
     @synchronized
@@ -3240,8 +3485,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
            `#[cfg(test)] mod __test_regression_<name> { use super::*; ... }` block at the end of the
            target source file. Useful for testing internal logic, pub(crate), or private functions.
            Automatically stripped from final patches and post-strip checks.
-        If replacing a locked test that failed to compile, panicked in setup, or only checked Cargo.toml
-        statically, pass replace_broken_lock_reason (>= 20 chars) to unlock and rewrite it in place.
+        If replacing a locked test once because it failed to compile, panicked in setup, only checked Cargo.toml
+        statically, or had a factually wrong assertion, pass replace_broken_lock_reason (>= 20 chars) to unlock
+        and rewrite it in place (must preserve assertion strength and still fail on the unpatched original code).
         """
         try:
             if _contains_compression_placeholder(content):
@@ -3307,52 +3553,21 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                         locked_meta = prev_lock
                         locked_key = prev_key
                         break
-                if locked_meta and locked_meta.get("name") != clean_name:
-                    if replace_broken_lock_reason:
-                        unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
-                        if unlock_err:
-                            return unlock_err
-                    else:
-                        state._record_red_lock_violation(
-                            "rewrite_locked_regression", relative.as_posix(),
-                            f"Locked regression '{locked_meta.get('name')}' may not be replaced by '{clean_name}'.",
-                        )
-                        return (
-                            f"Error: the Red-phase regression test '{locked_meta.get('name')}' in {relative.as_posix()} is locked "
-                            "as the issue's contract oracle and cannot be replaced or renamed. "
-                            "Fix the production code so the locked test passes instead of rewriting the test. "
-                            "If the locked test fails to compile, panics in setup, or is static-only, pass "
-                            "replace_broken_lock_reason (>=20 chars) to replace it; otherwise call escalate_for_replan."
-                        )
-                elif locked_meta and locked_meta.get("name") == clean_name:
-                    proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    if proposed_sha != locked_meta.get("sha256"):
-                        if replace_broken_lock_reason:
-                            unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
-                            if unlock_err:
-                                return unlock_err
-                        else:
-                            state._record_red_lock_violation(
-                                "rewrite_locked_regression", relative.as_posix(),
-                                f"Locked regression '{clean_name}' content was modified.",
-                            )
-                            for reg_key_now in [
-                                k for k in list(state._reproduced_regressions)
-                                if str(k[1]) == clean_name
-                            ]:
-                                state._reproduced_regressions.pop(reg_key_now, None)
-                                state._passed_regressions.discard(reg_key_now)
-                                state._passed_regression_configs.pop(reg_key_now, None)
-                                state._reproduction_notes.pop(reg_key_now, None)
-                                state._regression_test_names.pop(reg_key_now, None)
-                            state._verified_revision = None
-                            return (
-                                f"Error: the Red-phase regression test '{clean_name}' in {relative.as_posix()} is locked "
-                                "and its assertions cannot be changed. Fix the production code so the locked test passes "
-                                "instead of editing the test, pass replace_broken_lock_reason if the test is broken, "
-                                "or call escalate_for_replan with the concrete reason."
-                            )
+                unlock_ctx = None
+                if locked_meta:
+                    renamed_to = clean_name if locked_meta.get("name") != clean_name else ""
+                    lock_err, unlock_ctx = _handle_locked_regression_rewrite(
+                        locked_meta,
+                        locked_key,
+                        relative.as_posix(),
+                        content,
+                        replace_broken_lock_reason,
+                        renamed_to=renamed_to,
+                    )
+                    if lock_err:
+                        return lock_err
 
+                prev_in_mod = dict(state.in_module_regressions[relative]) if relative in state.in_module_regressions else None
                 for prev_rel, prev_info in list(state.in_module_regressions.items()):
                     if prev_rel != relative and prev_info.get("name") == clean_name:
                         prev_file = root / prev_rel
@@ -3388,10 +3603,21 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                 state._reproduction_notes.pop(reg_key, None)
 
                 target.write_bytes(updated_text.encode("utf-8"))
+                recheck_err = _verify_or_rollback_self_unlock(
+                    unlock_ctx, reg_key, target, orig_bytes, relative=relative, prev_in_mod=prev_in_mod,
+                )
+                if recheck_err:
+                    return recheck_err
                 msg = f"Mounted temporary in-module regression test '{clean_name}' at end of {relative.as_posix()}."
+                manifest_file = manifest_dir / "Cargo.toml"
+                kind, bin_name = _resolve_in_module_test_target(manifest_file)
+                if kind != "bin":
+                    msg += (
+                        " [Visibility Notice: this in-module test shares private module scope in a [lib] crate. "
+                        "If testing a requested public API/type/struct field, ALSO verify crate-boundary accessibility "
+                        "via a standalone tests/test_regression_<name>.rs test so external callers do not hit E0425/E0412/E0423.]"
+                    )
                 if run_now:
-                    manifest_file = manifest_dir / "Cargo.toml"
-                    kind, bin_name = _resolve_in_module_test_target(manifest_file)
                     if kind == "bin" and bin_name:
                         run_res = cargo_test.func(manifest_path=manifest_rel.as_posix(), bin_target=bin_name, test_filter=clean_name)
                     else:
@@ -3441,34 +3667,15 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     locked_meta = prev_lock
                     locked_key = prev_key
                     break
+            unlock_ctx = None
             if locked_meta:
-                proposed_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                if proposed_sha != locked_meta.get("sha256"):
-                    if replace_broken_lock_reason:
-                        unlock_err = _try_unlock_broken_oracle(locked_meta, locked_key, replace_broken_lock_reason)
-                        if unlock_err:
-                            return unlock_err
-                    else:
-                        state._record_red_lock_violation(
-                            "rewrite_locked_regression", relative.as_posix(),
-                            f"Locked regression '{locked_meta.get('name')}' was rewritten.",
-                        )
-                        for reg_key_now in [
-                            k for k in list(state._reproduced_regressions)
-                            if str(k[1]) == locked_meta.get("name", "")
-                        ]:
-                            state._reproduced_regressions.pop(reg_key_now, None)
-                            state._passed_regressions.discard(reg_key_now)
-                            state._passed_regression_configs.pop(reg_key_now, None)
-                            state._reproduction_notes.pop(reg_key_now, None)
-                            state._regression_test_names.pop(reg_key_now, None)
-                        state._verified_revision = None
-                        return (
-                            f"Error: '{relative.as_posix()}' is the locked Red-phase regression test for this issue "
-                            "and cannot be rewritten. Fix the production code so the locked test passes instead of "
-                            "changing the test, pass replace_broken_lock_reason if the test is broken, or call escalate_for_replan."
-                        )
-            existing_text = target.read_bytes().decode("utf-8", errors="replace") if target.is_file() else None
+                lock_err, unlock_ctx = _handle_locked_regression_rewrite(
+                    locked_meta, locked_key, relative.as_posix(), content, replace_broken_lock_reason,
+                )
+                if lock_err:
+                    return lock_err
+            prev_bytes = target.read_bytes() if target.is_file() else None
+            existing_text = prev_bytes.decode("utf-8", errors="replace") if prev_bytes is not None else None
             _check_rust_syntax(relative.as_posix(), content, original_content=existing_text)
             was_registered = relative in state.regression_tests
             state.invalidate_write()
@@ -3480,6 +3687,11 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
             state._reproduction_notes.pop(reg_key, None)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode("utf-8"))
+            recheck_err = _verify_or_rollback_self_unlock(
+                unlock_ctx, reg_key, target, prev_bytes, relative=relative,
+            )
+            if recheck_err:
+                return recheck_err
             active_targets = state.get_regression_targets()
             msg = f"Updated temporary regression test {relative.as_posix()} in the working copy."
             if _is_static_manifest_only_test(content):
@@ -3599,6 +3811,9 @@ def make_tools(repo_path, benchmark_version=None, require_reproduction=False, po
                     inline_warn = _edited_inline_test_warning(orig_code, clean_updated, relative.as_posix())
                     if inline_warn:
                         out_text += f"\n{inline_warn}"
+                    eof_warn = _eof_append_warning(orig_code, clean_updated, relative.as_posix())
+                    if eof_warn:
+                        out_text += f"\n{eof_warn}"
                 clean_prev = _strip_in_module_tests(content) if relative in state.in_module_regressions else content
                 scope_hint = _unimported_crate_path_hint(clean_prev, clean_updated, relative.as_posix())
                 if scope_hint:

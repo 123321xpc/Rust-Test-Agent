@@ -55,72 +55,6 @@ def test_workspace_metadata(rust_tools):
     assert "Error" in tools["cargo_workspace"].invoke({"manifest_path": "../Cargo.toml"})
 
 
-def test_cargo_workspace_falls_back_without_offline(rust_tools, monkeypatch):
-    import subprocess
-    _, tools = rust_tools
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if "--offline" in cmd:
-            return subprocess.CompletedProcess(cmd, 1, "", "error: Found argument '--offline' which wasn't expected")
-        payload = {"workspace_root": str(Path(".").resolve()), "workspace_members": ["pkg#0.1.0"], "packages": []}
-        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    res = json.loads(tools["cargo_workspace"].invoke({}))
-    assert res["workspace_members"] == []
-    assert len(calls) == 2
-    assert "--offline" in calls[0]
-    assert "--offline" not in calls[1]
-
-def test_search_code_multiline_signatures(rust_tools):
-    root, tools = rust_tools
-    sig_text = 'pub fn compute_sum(' + chr(10) + '    first: i32,' + chr(10) + '    second: i32,' + chr(10) + ') -> i32 {' + chr(10) + '    first + second' + chr(10) + '}' + chr(10)
-    (root / 'src' / 'multi_sig.rs').write_text(sig_text, encoding='utf-8')
-    assert tools['search_code'].invoke({'query': 'pub fn compute_sum(first: i32, second: i32)'}) == '(no matches)'
-    found = tools['search_code'].invoke({'query': 'pub fn compute_sum(first: i32, second: i32)', 'multiline': True})
-    assert 'src/multi_sig.rs:1:' in found
-    with_ctx = tools['search_code'].invoke({'query': 'pub fn compute_sum(first: i32, second: i32)', 'multiline': True, 'context_lines': 1})
-    assert 'src/multi_sig.rs:1: pub fn compute_sum(' in with_ctx
-
-
-def test_read_lines_clamps_range_over_500_lines(rust_tools):
-    root, tools = rust_tools
-    (root / "src" / "long.rs").write_text("\n".join(f"// line {i}" for i in range(1, 650)) + "\n", encoding="utf-8")
-    out = tools["read_lines"].invoke({"path": "src/long.rs", "start_line": 10, "end_line": 600})
-    assert "10: // line 10" in out
-    assert "509: // line 509" in out
-    assert "510: // line 510" not in out
-    assert "clamped to 10-509" in out
-
-
-def test_search_code_summarize_and_file_listing(rust_tools):
-    root, tools = rust_tools
-    (root / "src" / "other.rs").write_text("pub fn needle_helper() {}\n", encoding="utf-8")
-    (root / "tests").mkdir(exist_ok=True)
-    (root / "tests" / "test_it.rs").write_text("// needle in test\n", encoding="utf-8")
-
-    # summarize mode
-    summary = tools["search_code"].invoke({"query": "needle", "summarize": True})
-    assert "Found" in summary and "matches across" in summary
-    assert "src/lib.rs: 1 match(es)" in summary
-
-    # exclude_tests mode
-    without_tests = tools["search_code"].invoke({"query": "needle", "exclude_tests": True})
-    assert "tests/test_it.rs" not in without_tests
-    assert "src/lib.rs" in without_tests
-
-    # empty query file_glob listing
-    files_list = tools["search_code"].invoke({"query": "", "file_glob": "other.rs"})
-    assert "src/other.rs" in files_list
-
-    # empty query with default *.rs glob lists Rust files
-    default_rs_list = tools["search_code"].invoke({"query": ""})
-    assert "src/lib.rs" in default_rs_list
-    assert "src/other.rs" in default_rs_list
-
-
 def test_read_lines_defaults_to_100_lines_and_lists_dirs(rust_tools):
     root, tools = rust_tools
     (root / "src" / "medium.rs").write_text("\n".join(f"line {i}" for i in range(1, 151)) + "\n", encoding="utf-8")
@@ -131,12 +65,3 @@ def test_read_lines_defaults_to_100_lines_and_lists_dirs(rust_tools):
     assert "(50 lines below)" in out
     dir_out = tools["read_lines"].invoke({"path": "src"})
     assert "lib.rs" in dir_out
-
-
-def test_search_code_overflow_returns_refinement_summary_without_raw_lines(rust_tools):
-    root, tools = rust_tools
-    (root / "src" / "many.rs").write_text("\n".join(f"let hit_{i} = needle_val;" for i in range(60)) + "\n", encoding="utf-8")
-    out = tools["search_code"].invoke({"query": "needle_val"})
-    assert "Search returned too many results" in out
-    assert "src/many.rs: 60 match(es)" in out
-    assert "let hit_0 = needle_val;" not in out

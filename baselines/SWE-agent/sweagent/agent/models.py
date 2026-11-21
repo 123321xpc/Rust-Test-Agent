@@ -529,8 +529,8 @@ def resolve_api_env(api: str | None = None, api_limit: int | None = None) -> Non
         os.environ["API_LIMIT"] = str(api_limit)
     if api is not None:
         profile = api.strip().lower()
-        if profile not in ("yj", "ds"):
-            raise ValueError("--api must be one of yj, ds")
+        if profile not in ("yj", "ollama"):
+            raise ValueError("--api must be one of yj, ollama")
         prefix = profile.upper()
         base_url = keys_config.get(f"{prefix}_BASE_URL")
         api_key = keys_config.get(f"{prefix}_API_KEY")
@@ -563,5 +563,5 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
     resolve_api_env()
     model_name = keys_config.get("MODEL")
     if not model_name:
-        raise ValueError("Set YJ_*/DS_* (or MODEL and API_KEY) in the repository root .env file")
+        raise ValueError("Set YJ_*/OLLAMA_* (or MODEL and API_KEY) in the repository root .env file")
     return OpenAIModel(replace(args, model_name=model_name), commands)

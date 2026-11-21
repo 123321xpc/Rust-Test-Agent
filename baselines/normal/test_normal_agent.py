@@ -232,9 +232,9 @@ def test_cli_api_limit_and_default_yj_interface(agent_module, monkeypatch, tmp_p
     monkeypatch.setenv("YJ_BASE_URL", "https://yj.example/v1")
     monkeypatch.setenv("YJ_API_KEY", "yj-key")
     monkeypatch.setenv("YJ_MODEL", "yj-model")
-    monkeypatch.setenv("DS_BASE_URL", "https://ds.example/v1")
-    monkeypatch.setenv("DS_API_KEY", "ds-key")
-    monkeypatch.setenv("DS_MODEL", "ds-model")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "https://ollama.example/v1")
+    monkeypatch.setenv("OLLAMA_API_KEY", "ollama-key")
+    monkeypatch.setenv("OLLAMA_MODEL", "ollama-model")
     monkeypatch.setattr(agent_module, "load_dotenv", lambda *_: None)
     monkeypatch.setattr(agent_module, "configure_network_proxy", lambda: None)
     run = Mock(return_value="diff --git a/a b/a\n")
@@ -247,11 +247,11 @@ def test_cli_api_limit_and_default_yj_interface(agent_module, monkeypatch, tmp_p
     assert run.call_args.args == (tmp_path.resolve(), "issue", "yj-model", "yj-key", "https://yj.example/v1")
     assert run.call_args.kwargs["max_api_calls"] == 25
 
-    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds"])
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ollama"])
     agent_module.main()
-    assert run.call_args.args == (tmp_path.resolve(), "issue", "ds-model", "ds-key", "https://ds.example/v1")
+    assert run.call_args.args == (tmp_path.resolve(), "issue", "ollama-model", "ollama-key", "https://ollama.example/v1")
 
-    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ds", "--api-limit", "0"])
+    monkeypatch.setattr(sys, "argv", argv[:-2] + ["--api", "ollama", "--api-limit", "0"])
     with pytest.raises(SystemExit):
         agent_module.main()
 

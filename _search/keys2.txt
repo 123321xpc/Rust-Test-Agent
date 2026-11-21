@@ -1,0 +1,156 @@
+### Unlocking LLM Repair Capabilities Through Cross-Language Translation and Multi-Agent Refinement
+Y:2025 V:Proceedings of the 2026 IEEE/ACM 48th In cites=8 src=semantic_scholar
+URL:https://www.semanticscholar.org/paper/b40718afd5a51614f30e62abac8392444d156fa2
+ABS:Recent advances in leveraging LLMs for APR have demonstrated impressive capabilities in fixing software defects. However, current LLM-based approaches predominantly focus on mainstream programming languages like Java and Python, neglecting less prevalent but emerging languages such as Rust due to expensive training resources, limited datasets, and insufficient community support. This narrow focus creates a significant gap in repair capabilities across the programming language spectrum, where the full potential of LLMs for comprehensive multilingual program repair remains largely unexplored. To address this limitation, we introduce a novel cross-language program repair approach LANTERN that l
+
+### Beyond Fixed Tests: Repository-Level Issue Resolution as Coevolution of Code and Behavioral Constraints
+Y:2026 V:arXiv.org cites=5 src=semantic_scholar
+URL:https://www.semanticscholar.org/paper/2355cbc4c10119a01c2d5c66839f97e8ae2b4246
+ABS:Software engineers resolving repository-level issues do not treat existing tests as immutable correctness oracles. Instead, they iteratively refine both code and the tests used to characterize intended behavior, as new modifications expose missing assumptions or misinterpreted failure conditions. In contrast, most existing large language model (LLM)-based repair systems adopt a linear pipeline in which tests or other validation signals act mostly as post-hoc filters, treating behavioral constraints as fixed during repair. This formulation reduces repair to optimizing code under static and potentially misaligned constraints, leading to under-constrained search and brittle or overfitted fixes.
+
+### MAGIS: LLM-Based Multi-Agent Framework for GitHub Issue Resolution
+Y:2024 V:Neural Information Processing Systems cites=234 src=semantic_scholar,crossref
+URL:https://www.semanticscholar.org/paper/006c4c7470566327e5b02b94936d0be0033fc9f5
+ABS:In software development, resolving the emergent issues within GitHub repositories is a complex challenge that involves not only the incorporation of new code but also the maintenance of existing code. Large Language Models (LLMs) have shown promise in code generation but face difficulties in resolving Github issues, particularly at the repository level. To overcome this challenge, we empirically study the reason why LLMs fail to resolve GitHub issues and analyze the major factors. Motivated by the empirical findings, we propose a novel LLM-based Multi-Agent framework for GitHub Issue reSolution, MAGIS, consisting of four agents customized for software evolution: Manager, Repository Custodian
+
+### SWE-Bench++: A Framework for the Scalable Generation of Software Engineering Benchmarks from Open-Source Repositories
+Y:2025 V:arXiv.org cites=33 src=semantic_scholar,open_alex,arxiv
+URL:https://www.semanticscholar.org/paper/dcc23cede5a4b5ef1f6c9e677fa2be01dbfb5352
+ABS:Benchmarks like SWE-bench have standardized the evaluation of Large Language Models (LLMs) on repository-level software engineering tasks. However, these efforts remain limited by manual curation, static datasets, and a focus on Python-based bug fixes. We introduce SWE-Bench++, an automated framework that generates repository-level coding tasks from open-source GitHub projects. Unlike synthetic approaches, our pipeline harvests live pull requests to cover both bug fixes and feature requests across 11 languages. SWE-Bench++ turns GitHub pull requests (PRs) into reproducible, execution-based tasks via four stages: programmatic sourcing, environment synthesis, test oracle extraction, and qualit
+
+### AdverIntent-Agent: Adversarial Reasoning for Repair Based on Inferred Program Intent
+Y:2025 V:Proceedings of the ACM on software engin cites=31 src=open_alex
+URL:https://doi.org/10.1145/3728939
+ABS:Automated program repair (APR) has shown promising results, particularly with the use of neural networks. Currently, most APR tools focus on code transformations specified by test suites, rather than reasoning about the program’s intent and the high-level bug specification. Without a proper understanding of program intent, these tools tend to generate patches that overfit incomplete test suites and fail to reflect the developer’s intentions. However, reasoning about program intent is challenging. In our work, we propose an approach called AdverIntent-Agent based on critique and adversarial reasoning. Our approach is novel to shift the focus from generating multiple APR patches to inferring m
+
+### Hallucination to Consensus: Multi-Agent LLMs for End-to-End JUnit Test Generation
+Y:2025 V:ACM Transactions on Software Engineering cites=17 src=semantic_scholar
+URL:https://www.semanticscholar.org/paper/bf691cc5e10b5d5125a3de145360a9de3f720e2c
+ABS:Unit testing plays a critical role in ensuring software correctness. However, writing unit tests manually is labor-intensive, especially for strongly typed languages like Java, motivating the need for automated approaches. Traditional methods primarily rely on search-based or randomized algorithms to generate tests that achieve high code coverage and produce regression oracles, which are assertions derived from the program's current behavior rather than its intended functionality. Recent advances in large language models (LLMs) have enabled oracle generation from natural language descriptions, aligning better with user requirements. However, existing LLM-based methods often require LLM fine-
+
+### Test-in-the-loop LLM Repair: Verifiable Automated Program Repair on QuixBugs with a “Failing Test → Patch → Regression Test” Loop
+Y:2024 V:Journal of Advanced Computing Systems cites=3 src=semantic_scholar,crossref
+URL:https://www.semanticscholar.org/paper/270e8aeb7bccf739e9dd75ec86a185d5e7edbe7a
+ABS:Automated Program Repair (APR) has long promised to reduce debugging cost by synthesizing patches that satisfy a test oracle. Recent large language models (LLMs) have revived interest in APR because they can propose semantically rich edits, yet their outputs often remain unverifiable unless integrated with an execution-based validation loop. In this paper we study a concrete and fully reproducible variant of test-driven LLM repair, which we call Test-in-the-loop LLM Repair (TiLLR). TiLLR explicitly closes the loop “failing tests → candidate patch → regression tests → next patch” and treats tests as the ground-truth accept/reject criterion. We evaluate TiLLR on QuixBugs, a 40-program bilingua
+
+### Impact of LSP Diagnostics on Agentic Code Translation Repair : A Controlled Comparison of Raw Compiler Output and Structured LSP Feedback
+Y:2026 V:DiVA (Linnaeus University) cites=0 src=open_alex
+URL:https://openalex.org/W7166257599
+ABS:Automated code translation is an important tool for modernising legacy systems andcodebases, but LLM-based translation pipelines may require automated program re-pair, because so-called one-shot translations frequently fail to compile, and an itera-tive repair loop is a common approach to address this issue. Most existing pipelinesuse raw compiler error output as the feedback signal for the repair stage, while noprior work that we found has compared this against structured feedback signals likeLanguage Server Protocol (LSP) diagnostics in cross-language translation repair. Weperformed a controlled experiment using an agentic C++ to Rust translation pipelinewhere the feedback signal was the o
+
+### Escaping the Self-Repair Trap: Improving Test Oracle Generation via Dual-Context Awareness
+Y:2026 V:arXiv cites=0 src=arxiv,crossref
+URL:http://arxiv.org/abs/2608.05917v2
+ABS:Large Language Models (LLMs) have shown strong potential for regression-oracle completion, where a test prefix is given and the current program version is treated as expected behavior. Recent approaches increasingly rely on iterative self-repair and execution feedback, but optimizing execution success does not necessarily yield strong fault-revealing oracles. This objective, widely adopted in repair-based methods, serves only as a proxy and may be misaligned with the true goal of oracle generation. Such misalignment biases the repair process, giving rise to a feedback-driven degeneration that we term the Self-Repair Trap, where iterative repair progressively drives models toward assertions t
+
+### Nexus: Execution-Grounded Multi-Agent Test Oracle Synthesis
+Y:2025 V:arXiv cites=0 src=arxiv
+URL:http://arxiv.org/abs/2510.26423v1
+ABS:Test oracle generation in non-regression testing is a longstanding challenge in software engineering, where the goal is to produce oracles that can accurately determine whether a function under test (FUT) behaves as intended for a given input. In this paper, we introduce Nexus, a novel multi-agent framework to address this challenge. Nexus generates test oracles by leveraging a diverse set of specialized agents that synthesize test oracles through a structured process of deliberation, validation, and iterative self-refinement. During the deliberation phase, a panel of four specialist agents, each embodying a distinct testing philosophy, collaboratively critiques and refines an initial set of
+
+### C2SafeRust: Memory-Safe C-to-Rust Transpilation via Ownership Inference and Compiler-in-the-Loop Repair
+Y:2026 V:2026 Student Multidisciplinary Innovatio cites=0 src=semantic_scholar,crossref
+URL:https://www.semanticscholar.org/paper/b2d75e1cc811fe9bc01d016338a6644a53d0b327
+ABS:The persistence of C in systems software and its permissive memory model remain primary sources of memorysafety vulnerabilities. While Rust is an ideal migration target, existing translation tools largely produce code reliant on unsafe blocks that mirror C semantics. To address this, we present C2SafeRust, an automated transpilation system designed to generate verified, memory-safe Rust code. C2SafeRust employs a compiler-in-the-loop architecture. It parses C source into an abstract syntax tree, constructs a semantic model encompassing def-use chains and aliasing, and infers strict ownership categories for variables to avoid unsafe patterns. The generated code is compiled using rustc; its st
+
+### Your Code Agent Can Grow Alongside You with Structured Memory
+Y:2026 V:arXiv cites=0 src=arxiv
+URL:http://arxiv.org/abs/2603.13258v1
+ABS:While "Intent-oriented programming" (or "Vibe Coding") redefines software engineering, existing code agents remain tethered to static code snapshots. Consequently, they struggle to model the critical information embedded in the temporal evolution of projects, failing to leverage the "reasoning trajectories" implicit in past successful practices. This limitation results in rigid behavioral logic and a lack of autonomous adaptability, ultimately hindering their ability to tackle complex, repository-level problems. To bridge this static-dynamic mismatch, we propose MemCoder, a framework designed to enable continual human-AI co-evolution. MemCoder first structures historical human experience to 
+
+### Kronumos 2 Kairos: Cost-Bounded Automated Program Repair via Dual-Brain Cybernetic Sub-Cortex on SWE-bench Verified
+Y:None V: cites=0 src=crossref
+URL:https://doi.org/10.21203/rs.3.rs-11205335/v1
+ABS:<title>Abstract</title>
+                <p>
+                  Automated Program Repair (APR) in authentic software repositories presents a formidable challenge: models must localize defects within repository contexts, synthesize character-exact syntactic modifications, and preserve regression invariance without corrupting preexisting functionality. 
+In this paper, we present
+                  <bold>Kronumos 2 Kairos</bold>
+                  , a cost-bounded autonomous program repair engine coupling a fine-tuned 7B open-weight code model (Qwen2.5-Coder-7B-Instruct) with the Tokenectomy Dual-Brain Cybernetic Sub-Cortex—a zero-allocation deterministic runtime featuring an Issue De-Noiser, a 9-d
+
+### Understanding LLM-Driven Test Oracle Generation
+Y:2025 V:2025 2nd IEEE/ACM International Conferen cites=13 src=semantic_scholar,crossref
+URL:https://www.semanticscholar.org/paper/9ebfa851cb259b9f8f6a876f562a5c9acfb686f7
+ABS:Automated unit test generation aims to improve software quality while reducing the time and effort required for creating tests manually. However, existing techniques primarily generate regression oracles that predicate on the implemented behavior of the class under test. They do not address the oracle problem: the challenge of distinguishing correct from incorrect program behavior. With the rise of Foundation Models (FMs), particularly Large Language Models (LLMs), there is a new opportunity to generate test oracles that reflect intended behavior. This positions LLMs as enablers of Promptware, where software creation and testing are driven by natural-language prompts. This paper presents an 
+
+### Probe to Generate: Program Variant-Guided Test Augmentation for Repository-Level Repair Benchmarks
+Y:2026 V:IEEE/ACM International Conference on Aut cites=8 src=open_alex,arxiv
+URL:https://doi.org/10.1145/3832783.3837534
+ABS:Test-based benchmarks such as SWE-bench have become a standard basis for evaluating automated issue resolution agents, deeming a patch correct if it passes a provided regression test suite. In practice, weak test suites can admit plausible but semantically incorrect patches, inflating reported agent performance. We present PROBE, a test augmentation framework that uses semantically modified program variants as behavioral probes to identify and close gaps in benchmark test suites. Variants of the reference patch that survive the original tests reveal under-constrained behaviors, which then guide targeted regression test generation. Each generated test is retained only if it passes on the refe
+
+### Not All Correct Fixes Run Alike: An Empirical Study of Patch Performance in Repository-Level Issue Resolution
+Y:2026 V: cites=0 src=semantic_scholar
+URL:https://www.semanticscholar.org/paper/8b7473e7e216a27da5bd1eba4645e5c0337760bd
+ABS:Repository-level issue-resolution benchmarks such as SWE-bench evaluate submitted patches primarily based on whether they pass the correctness tests, leaving the runtime performance of different test-passing patches largely unexplored. Evaluating patch performance is essential but challenging since designing performance workloads for each benchmark instance is costly. However, these benchmarks already provide a natural candidate: the built-in \emph{FAIL\_TO\_PASS} (F2P) tests, which exercise the behavior affected by the issue fix. We therefore investigate whether the provided F2P tests can be repurposed to evaluate patch performance. Overall, we choose four frontier models, Claude Opus~5, GP
+
+### SWE-Bench+: Enhanced Coding Benchmark for LLMs
+Y:2024 V:arXiv (Cornell University) cites=160 src=open_alex,arxiv
+URL:https://doi.org/10.48550/arxiv.2410.06992
+ABS:Large Language Models (LLMs) in Software Engineering (SE) can offer assistance for coding. To facilitate a rigorous evaluation of LLMs in practical coding contexts, Carlos et al. introduced the SWE-bench dataset, which comprises 2,294 real-world GitHub issues and their corresponding pull requests, collected from 12 widely used Python repositories. Several impressive LLM-based toolkits recently are developed and evaluated on this dataset. However, a systematic evaluation of the quality of SWE-bench remains missing. In this paper, we addressed this gap by presenting an empirical analysis of the SWE-bench dataset. We conducted a manual screening of instances where SWEAgent + GPT-4 successfully 
+
+### AugmenTest: Enhancing Tests with LLM-Driven Oracles
+Y:2025 V:IEEE International Conference on Softwar cites=33 src=open_alex
+URL:https://doi.org/10.1109/icst62969.2025.10988926
+ABS:Automated test generation is crucial for ensuring the reliability and robustness of software applications while at the same time reducing the effort needed. While significant progress has been made in test generation research, generating valid test oracles still remains an open problem. To address this challenge, we present AugmenTest, an approach leveraging Large Language Models (LLMs) to infer correct test oracles based on available documentation of the software under test. Unlike most existing methods that rely on code, AugmenTest utilizes the semantic capabilities of LLMs to infer the intended behavior of a method from documentation and developer comments, without looking at the code. Au
+
+### Improving Retrieval-Augmented Deep Assertion Generation via Joint Training
+Y:2025 V:IEEE Transactions on Software Engineerin cites=17 src=open_alex
+URL:https://doi.org/10.1109/tse.2025.3545970
+ABS:Unit testing attempts to validate the correctness of basic units of the software system under test and has a crucial role in software development and testing. However, testing experts have to spend a huge amount of effort to write unit test cases manually. Very recent work proposes a retrieve-and-edit approach to automatically generate unit test oracles,i.e.,assertions. Despite being promising, it is still far from perfect due to some limitations, such as splitting assertion retrieval and generation into two separate components without benefiting each other. In this paper, we propose AG-RAG, a retrieval-augmented automated assertion generation (AG) approach that leverages external codebases 
+
+### How Do Small Coding Agents Use Code Graphs and Embeddings?
+Y:2026 V: cites=0 src=open_alex
+URL:https://doi.org/10.66977/xsci.2610.0030
+ABS:Coding agents are given embedding search and code-graph tools on the premise that a repository's structure is something the model lacks and the tool supplies. We test that premise on SWE-bench Verified with small open-weight models, stratifying tasks by a deterministic hop depth (the shortest code-graph path from code the issue mentions to code the gold patch changes) that a companion paper defines and validates. First, we ablate a localization agent's tool set (grep only; +embedding search; +graph tools; all) on a depth-balanced 160-task split and on all 500 tasks for ten models (six Qwen3 sizes from 0.6B to 32B with five decodings each, an FP8 control, three Gemma 4 sizes; 79k episodes). S
+
+### Checking Oracle Preservation in LLM Test Refactoring with Calibrated Runtime Assertion Traces
+Y:2026 V:Zenodo (CERN European Organization for N cites=0 src=open_alex
+URL:https://doi.org/10.5281/zenodo.23635756
+ABS:After a large language model (LLM) refactors a test method, the usual check is that the code compiles and the test passes.A test that lost checks passes as well.We describe a runtime check for oracle preservation.A Java agent records every assertion that executes and reads the role of each argument from the signature. Traces are compared after masking events that vary between runs.On 937 labelled variants, the structural trace reached precision 1.000 and recall 0.928 on the operators that change what runs, with two or eight calibration runs and across cutoffs for unstable tests.Two static rules and a probe mode that forces assertions to fail cover two cases that the trace cannot see on our o
+
+### PAIChecker: Uncovering and Checking PR-Issue Misalignment in SWE-Bench-Like Benchmarks
+Y:2026 V:arXiv cites=0 src=arxiv
+URL:http://arxiv.org/abs/2607.28587v2
+ABS:SWE-bench-like benchmarks are widely used for evaluating LLM's issue resolution capability. They typically follow a common construction pipeline: each PR (Pull Request) is paired with its linked issue by extracting issue references from the PR description; the issue description is used as the problem statement, and the PR patch serves as the test oracle. However, due to the inherent complexity of developing and maintaining large repositories, such PR-Issue pairings are often misaligned in practice. In this work, we systematically study SWE-bench Verified instances, finding that 13.6% exhibit misalignment across five patterns in eleven fine-grained scenarios. To enable reliable and scalable c
+
+### Simulating Ideological Deadlock: Persona Stability and Conflict Resolution in LLM-Based Multi-Agent Frameworks
+Y:None V: cites=0 src=crossref
+URL:https://doi.org/10.21203/rs.3.rs-9414531/v1
+ABS:<title>Abstract</title>
+                <p>
+                  The integration of Large Language Models (LLMs) into Agent-Based Modeling (ABM) has revolutionized the capacity to simulate complex sociopolitical dynamics. However, state-of-the-art models are fundamentally aligned via safety protocols (e.g., RLHF) to prioritize helpfulness and consensus, severely limiting their utility in simulating intractable, zero-sum human conflict. To address this limitation, this study presents a novel sociotechnical stress test designed to measure the boundaries of persona stability and affective polarization under extreme cognitive dissonance. Utilizing the AutoGen multi-agent framework and the Gemini fo
+
+### ChatAssert: LLM-Based Test Oracle Generation With External Tools Assistance
+Y:2024 V:IEEE Transactions on Software Engineerin cites=47 src=open_alex
+URL:https://doi.org/10.1109/tse.2024.3519159
+ABS:Test oracle generation is an important and challenging problem. Neural-based solutions have been recently proposed for oracle generation but they are still inaccurate. For example, the accuracy of the state-of-the-art techniquetecois only 27.5% on its dataset including 3,540 test cases. We proposeChatAssert, a prompt engineering framework designed for oracle generation that uses dynamic and static information to iteratively refine prompts for querying large language models (LLMs).ChatAssertuses code summaries and examples to assist an LLM in generating candidate test oracles, uses a lightweight static analysis to assist the LLM in repairing generated oracles that fail to compile, and uses dy
+
+### SWE-Bench Pro Verified: A Reliable Benchmark for Software Engineering Agents
+Y:2026 V:arXiv (Cornell University) cites=10 src=open_alex,arxiv
+URL:https://doi.org/10.48550/arxiv.2609.08149
+ABS:SWE-Bench Pro has emerged as a standard benchmark for evaluating software engineering agents on challenging repository-level tasks. However, our analysis work show that its evaluation is undermined by two sources of unreliability: reward hacking, enabled by leakage of gold solutions or hidden evaluation information, and task quality issues, including misleading problem statements and improperly scoped tests. These issues can inflate benchmark performance and obscure agents' true coding ability. We present SWE-Bench Pro Verified, a verified version of SWE-Bench Pro that addresses both problems. Our approach combines anti-hacking safeguards that eliminate major leakage channels without disrupt
+
+### Whose Oracle Is It? The Authority Problem in Deployed Agentic Program Repair
+Y:2026 V:IEEE/ACM International Workshop on Autom cites=0 src=open_alex
+URL:https://doi.org/10.1145/3843776.3844673
+ABS:Tests play two roles in automated program repair (APR): they are the evidence that accepts a patch, and they are repository artifacts that may themselves need repair. Benchmarks resolve the tension by making evaluator-owned tests immutable; deployment cannot, because tests legitimately evolve with the code they check. We argue that the resulting question, who may authorize a change to the evidence that accepts a patch, is a problem of allocating authority, distinct from whether a patch is correct, and that no diff separates an authorized change of requirements from an agent weakening its own acceptance test. We propose an admissible repair witness, evidence that exists before the agent runs 
+
+### APITestGenie: Automated API Test Generation through Generative AI
+Y:2024 V:arXiv cites=0 src=arxiv
+URL:http://arxiv.org/abs/2409.03838v1
+ABS:Intelligent assistants powered by Large Language Models (LLMs) can generate program and test code with high accuracy, boosting developers' and testers' productivity. However, there is a lack of studies exploring LLMs for testing Web APIs, which constitute fundamental building blocks of modern software systems and pose significant test challenges. Hence, in this article, we introduce APITestGenie, an approach and tool that leverages LLMs to generate executable API test scripts from business requirements and API specifications. In experiments with 10 real-world APIs, the tool generated valid test scripts 57% of the time. With three generation attempts per task, this success rate increased to 8
+
+### Adventure of a Lifetime: Extract Method Refactoring for Rust
+Y:2023 V:Proceedings of the ACM on Programming La cites=10 src=open_alex
+URL:https://doi.org/10.1145/3622821
+ABS:We present a design and implementation of the automated "Extract Method" refactoring for Rust programs. Even though Extract Method is one of the most well-studied and widely used in practice automated refactorings, featured in all major IDEs for all popular programming languages, implementing it soundly for Rust is surprisingly non-trivial due to the restrictions of the Rust's ownership and lifetime-based type system. In this work, we provide a systematic decomposition of the Extract Method refactoring for Rust programs into a series of program transformations, each concerned with satisfying a particular aspect of Rust type safety, eventually producing a well-typed Rust program. Our key disc
+
+### Teach it to stop, not just to click
+Y:2026 V:arXiv (Cornell University) cites=1 src=open_alex
+URL:https://doi.org/10.48550/arxiv.2607.17136
+ABS:Agentic computer-use RL is reported in single runs, and those numbers mislead. Using verifier-guided repair of a 35B computer-use agent (CUA) across five oracle-graded environments, we show a repaired policy's success rate is dominated by upstream variance: a variance-components decomposition across three cells (crossed data-draw $\times$ seed grid, bootstrap CIs) finds evaluation variance negligible ($σ_{\mathrm{eval}} \approx 0$) and the training-seed effect small everywhere ($\leq 10\%$); instead it splits between the data draw and run-to-run nondeterminism, the data draw's share rising to dominant ($48\%$) on the hardest cell. There the run-to-run distribution is bimodal (Hartigan dip $p
+
+### Automated Testing and Repair for Verified Compilers Generated by a Coding Agent
+Y:2026 V:arXiv cites=0 src=arxiv
+URL:http://arxiv.org/abs/2607.28928v1
+ABS:We present an agent based automated testing and repair system for verified compilers that contain four kinds of code: verified code, checked code, unverified code, and specification. We present specialized defect detection techniques that exploit the structure present in such compilers. For each surfaced defect the system invokes a coding agent to repair the defect and validate the repair. We evaluate the system on the Axon compiler, a compiler completely generated by a coding agent operating under developer supervision. The compiler was validated during development on a small benchmark set (the Livermore benchmarks), raising the possibility that its coding agent reward hacked the compiler. 

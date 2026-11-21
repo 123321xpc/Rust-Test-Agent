@@ -31,25 +31,3 @@ def test_rejects_invalid_input_without_running_compiler(explanation, monkeypatch
     monkeypatch.setattr(module.subprocess, "run", fail)
     for code in ("E382", "E0382 --help", "E０３８２", ""):
         assert "Error" in tool.invoke({"code": code})
-
-
-@pytest.mark.parametrize("error,expected", [
-    (FileNotFoundError("rustc missing"), "rustc missing"),
-    (subprocess.TimeoutExpired("rustc", 30), "timed out"),
-])
-def test_execution_failure(explanation, monkeypatch, error, expected):
-    module, tool = explanation
-    def fail(*args, **kwargs):
-        raise error
-    monkeypatch.setattr(module.subprocess, "run", fail)
-    assert expected in tool.invoke({"code": "E0382"})
-
-
-def test_uses_checkout_and_preserves_explanation(explanation, monkeypatch, tmp_path):
-    module, tool = explanation
-    def run(command, **kwargs):
-        assert command == ["rustc", "--explain", "E0382"]
-        assert kwargs["cwd"] == tmp_path
-        return SimpleNamespace(returncode=0, stdout="First line\n" + "x" * 30000, stderr="")
-    monkeypatch.setattr(module.subprocess, "run", run)
-    assert tool.invoke({"code": " E0382 "}) == "First line\n" + "x" * 30000

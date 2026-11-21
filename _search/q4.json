@@ -1,0 +1,11 @@
+{
+  "queries": [
+    "multi-agent LLM repository issue resolution SWE-bench",
+    "Rust repair agent compiler diagnostics",
+    "agent orchestration directed graph software engineering"
+  ],
+  "start_year": 2024,
+  "end_year": 2026,
+  "max_papers": 15,
+  "sources": ["semantic_scholar", "openreview"]
+}

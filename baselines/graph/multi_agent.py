@@ -894,26 +894,65 @@ def _relaxed_source_patch(state: Any, selected: list[Path] | None = None) -> str
 
 
 def _check_missing_contract_apis(issue_contract: dict[str, Any], patch_text: str, state: Any) -> list[str]:
-    """Check if explicitly requested new API names are missing from added patch lines and source."""
-    candidates = issue_contract.get("new_api_candidates") or []
-    if not candidates or not patch_text:
+    """Check if requested new APIs are missing or lack public visibility/crate exports."""
+    base_candidates = list(issue_contract.get("new_api_candidates") or [])
+    if not base_candidates or not patch_text:
         return []
-    added_lines = "\n".join(
+    signals = issue_contract.get("signals") or {}
+    candidates = list(base_candidates)
+    if signals.get("mentions_new_api"):
+        for req in issue_contract.get("requested_symbols") or ():
+            parts = [p for p in str(req).split("::") if p]
+            if len(parts) == 2 and parts[0][:1].isupper() and parts[1] in base_candidates and req not in candidates:
+                candidates.append(req)
+    non_comment_added = "\n".join(
         line[1:] for line in patch_text.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
+        if line.startswith("+") and not line.startswith("+++") and not line[1:].lstrip().startswith("//")
     )
+    in_trait_impl = bool(re.search(r"(?m)^\s*impl\b[^;\n]*\bfor\b", non_comment_added))
+
+    def _is_public_ckg_def(item: dict[str, Any]) -> bool:
+        if item.get("vis") == "pub" or item.get("public_paths"):
+            return True
+        enc = str(item.get("enclosing") or "")
+        return "impl " in enc and " for " in enc
+
+    ckg = getattr(state, "ckg", None)
     missing: list[str] = []
     for sym in candidates:
-        if re.search(rf"\b{re.escape(sym)}\b", added_lines):
+        base = sym.split("::")[-1].strip()
+        if not base:
             continue
-        if getattr(state, "ckg", None) is not None:
+        defs: list[dict[str, Any]] = []
+        if ckg is not None:
             try:
-                nb = state.ckg.query_neighborhood(sym, exclude_tests=True)
-                if nb.get("definitions"):
-                    continue
+                try:
+                    nb = ckg.query_neighborhood(sym, exclude_tests=True, _allow_semantic_subprocess=False)
+                except TypeError:
+                    nb = ckg.query_neighborhood(sym, exclude_tests=True)
+                defs = list(nb.get("definitions") or [])
             except Exception:
-                pass
-        missing.append(sym)
+                defs = []
+        if defs and any(_is_public_ckg_def(d) for d in defs):
+            continue
+        if defs:
+            has_pub_reexport = bool(re.search(rf"(?m)\bpub\s+use\b[^;\n]*\b{re.escape(base)}\b|\bpub\s+{re.escape(base)}\s*:", non_comment_added))
+            if not has_pub_reexport:
+                missing.append(f"{sym} (private/unexported)")
+            continue
+        if not re.search(rf"\b{re.escape(base)}\b", non_comment_added):
+            missing.append(sym)
+            continue
+        priv_decl = re.search(
+            rf"(?m)^[ \t]*(?:async\s+|unsafe\s+|const\s+)?(?:fn|struct|enum|trait|type)\s+{re.escape(base)}\b",
+            non_comment_added,
+        )
+        has_pub_decl = re.search(
+            rf"(?m)\bpub(?:\s*\([^)]*\))?\s+(?:(?:async|unsafe|const)\s+)?(?:fn|struct|enum|trait|type)\s+{re.escape(base)}\b|\bpub\s+use\b[^;\n]*\b{re.escape(base)}\b",
+            non_comment_added,
+        )
+        if priv_decl and not has_pub_decl and not in_trait_impl:
+            missing.append(f"{sym} (private/unexported)")
     return missing
 
 
@@ -2457,14 +2496,31 @@ def _make_handoff_tools(
                         f"({assertion_probes[-1].get('failed_tests')}). Call submit_qa_decision('REJECT', ...) "
                         "with the failing assertion evidence, or rerun a corrected assertion probe if the probe itself was flawed."
                     )
+                det_qa_now = blackboard.get("_last_det_qa") or {}
                 locked_regs = getattr(state, "_locked_regressions", None) or {}
                 reg_targets = set(state.get_regression_targets().keys()) if hasattr(state, "get_regression_targets") else set()
                 passed_regs = getattr(state, "_passed_regressions", set()) or set()
-                unrepro_reason = str(((blackboard.get("_last_det_qa") or {}).get("unreproduced_reason")) or "")
+                unrepro_reason = str(det_qa_now.get("unreproduced_reason") or "")
                 if locked_regs and reg_targets and not (reg_targets <= passed_regs) and not _is_env_dependency_blocker(unrepro_reason):
                     return (
                         "Error: cannot APPROVE while a locked Red-phase regression test has not passed. "
                         "Call submit_qa_decision('REJECT', ...) so Fixer resolves the failure or Architect calls release_locked_regression."
+                    )
+                missing_apis = det_qa_now.get("missing_contract_apis") or []
+                passing_assertion_probe = bool(
+                    assertion_probes
+                    and assertion_probes[-1].get("status") == "passed"
+                    and int(assertion_probes[-1].get("tests_passed") or 0) > 0
+                )
+                if (
+                    missing_apis
+                    and det_qa_now.get("reproduction") != "not_applicable_documentation"
+                    and (any("private/unexported" in m for m in missing_apis) or not passing_assertion_probe)
+                ):
+                    return (
+                        "Error: cannot APPROVE while requested new API(s) are missing or not publicly exported: "
+                        f"{missing_apis}. Implement/export them as pub (or pub use) and verify externally, "
+                        "or call submit_qa_decision('REJECT', ...)."
                     )
             holder["done"] = True
             holder["payload"] = {
@@ -2645,6 +2701,13 @@ def _wrap_tools_for_role(
             if isinstance(out, str):
                 if role == "navigator":
                     used_stage = (_client_calls_made(client) - stage_start_calls) if stage_cap is not None else 0
+                    if __tname == "write_regression_test":
+                        activity["wrt_calls"] = activity.get("wrt_calls", 0) + 1
+                        if activity["wrt_calls"] >= 2 and not state.reproduced() and "[Navigator pacing notice:" not in out:
+                            out += (
+                                "\n[Navigator pacing notice: 2+ write_regression_test attempts without clean reproduction. "
+                                "Stop rewriting temporary tests and call submit_localization_bundle now so Fixer can start editing.]"
+                            )
                     if used_stage >= 12 and not state.get_regression_targets() and "[Navigator pacing notice:" not in out:
                         out += (
                             "\n[Navigator pacing notice: 12+ calls used without write_regression_test yet. "
@@ -2681,13 +2744,14 @@ def _wrap_tools_for_role(
                     elif __tname == "write_regression_test":
                         prev_passed = len(getattr(state, "_passed_regressions", set()))
                         activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
+                        activity["reg_write_total"] = activity.get("reg_write_total", 0) + 1
                         if prev_passed > activity.get("last_passed_reg_count", 0):
                             activity["reg_write_streak"] = 0
                         activity["last_passed_reg_count"] = prev_passed
-                        if activity["reg_write_streak"] >= 4:
+                        if activity["reg_write_streak"] >= 2 or (activity["reg_write_total"] >= 3 and not state.reproduced()):
                             out += (
                                 "\n[Pacing notice: multiple write_regression_test edits without passing; "
-                                "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
+                                "stop rewriting temporary tests, proceed with production edits and existing crate tests (or record unreproduced_reason).]"
                             )
                     streak = activity.get("read_only_streak", 0)
                     if streak >= 10 and not auto_escalate_on_stuck:
@@ -2771,6 +2835,50 @@ def _make_guarded_llm(
     return llm
 
 
+def _is_system_message(msg: Any) -> bool:
+    return getattr(msg, "type", None) == "system" or (
+        isinstance(msg, dict) and msg.get("role") == "system"
+    )
+
+
+def _strip_system_messages(msgs: Any) -> list[Any]:
+    if not isinstance(msgs, list):
+        return []
+    return [m for m in msgs if not _is_system_message(m)]
+
+
+def _bound_slice_history(msgs: Any, max_messages: int = 12) -> list[Any]:
+    """Keep a bounded, tool-call-aligned tail when continuing Fixer across unit slices."""
+    cleaned = _strip_system_messages(msgs)
+    if not cleaned:
+        return []
+    if len(cleaned) > max_messages:
+        start = len(cleaned) - max_messages
+        while start < len(cleaned):
+            m = cleaned[start]
+            m_type = getattr(m, "type", None)
+            m_role = m.get("role") if isinstance(m, dict) else None
+            if m_type == "tool" or m_role == "tool":
+                start += 1
+                continue
+            break
+        cleaned = cleaned[start:]
+    folded: list[Any] = []
+    cutoff = max(0, len(cleaned) - 2)
+    for idx, m in enumerate(cleaned):
+        m_type = getattr(m, "type", None)
+        m_role = m.get("role") if isinstance(m, dict) else None
+        is_user = (m_type == "human") or (m_role == "user")
+        content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
+        if idx < cutoff and is_user and isinstance(content, str) and len(content) > 600:
+            head = content.splitlines()[0][:140]
+            summary = f"[earlier prompt omitted ({len(content)} chars): {head}]"
+            folded.append({**m, "content": summary} if isinstance(m, dict) else {"role": "user", "content": summary})
+            continue
+        folded.append(m)
+    return folded
+
+
 def _run_role_agent(
     role: str,
     system_prompt: str,
@@ -2817,7 +2925,7 @@ def _run_role_agent(
         cb = role_callback_cls(trace, role=role, attempt=attempt) if role_callback_cls else trace
         config["callbacks"] = [cb]
 
-    messages = (list(compress_fn(history)) if history else []) + [{"role": "user", "content": user_prompt}]
+    messages = (_strip_system_messages(compress_fn(history)) if history else []) + [{"role": "user", "content": user_prompt}]
     outcome = "completed"
     try:
         try:
@@ -2833,7 +2941,7 @@ def _run_role_agent(
                 cont_msg = continuation_fn(role, step) if continuation_fn else (
                     f"Complete your role ({role}) now by calling your structured handoff tool."
                 )
-                messages = compress_fn(result["messages"]) + [{"role": "user", "content": cont_msg}]
+                messages = _strip_system_messages(compress_fn(result["messages"])) + [{"role": "user", "content": cont_msg}]
         except _StageBudgetReached as exc:
             outcome = "stage_cap_reached"
             if trace:
@@ -2878,7 +2986,7 @@ def _run_role_agent(
                         "Call the handoff tool NOW with short, valid JSON (keep every description <= 200 chars, no long quotes)."
                     )
                 )
-                wrap_input = compress_fn(base_msgs) + [{"role": "user", "content": msg_now}]
+                wrap_input = _strip_system_messages(compress_fn(base_msgs)) + [{"role": "user", "content": msg_now}]
                 try:
                     wrap_agent.invoke({"messages": wrap_input}, config=config)
                 except (_StageBudgetReached, _StageReserveReached):
@@ -2890,7 +2998,7 @@ def _run_role_agent(
                     outcome = "completed"
                     break
     finally:
-        holder["history"] = latest_msgs_ref["msgs"] or messages
+        holder["history"] = _strip_system_messages(latest_msgs_ref["msgs"] or messages)
         if trace:
             trace.record(
                 "stage_end",
@@ -2962,7 +3070,7 @@ def _run_scheduled_fixer(system_prompt, user_prompt, role_tools, holder, *, coor
         payload, outcome = _run_role_agent(
             "fixer", system_prompt, prompt, role_tools, holder, stage_cap=slice_cap, history=history, **kwargs,
         )
-        history = holder.get("history") or history
+        history = _bound_slice_history(holder.get("history") or history)
         slices += 1
         action = (payload or {}).get("action")
         if action == "qa":
@@ -3935,7 +4043,7 @@ def _exec_navigator_initial(ctx: SimpleNamespace) -> tuple[str, list[str], str, 
     ctx.state.save_checkpoint("pre_fix")
     route, route_reasons = route_after_navigation(ctx.blackboard, ctx.state)
     ctx.route = route
-    ctx.fix_session_history = nav_holder.get("history") if route == "fast" else None
+    ctx.fix_session_history = None
 
     ctx.candidate_policy = _repair_candidates.CandidatePolicy(ctx.blackboard, ctx.state, ctx.trace)
     if nav_payload.get("unresolved_chain_ids"):
@@ -4856,6 +4964,7 @@ def run_graph_agent(
                         "and call submit_for_qa immediately."
                     )
                     ctx.last_qa_feedback = msg
+                    ctx.fix_session_history = None
                     if ctx.trace:
                         ctx.trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=ctx.qa_rounds + 1, rescue=True)
                     return _transition(
@@ -4917,6 +5026,7 @@ def run_graph_agent(
                 ctx.qa_rounds += 1
                 msg = f"Deterministic QA gate failed: {det_qa['reason']}"
                 ctx.last_qa_feedback = msg
+                ctx.fix_session_history = None
                 if ctx.trace:
                     ctx.trace.record("qa_gate", deterministic_ok=False, reason=det_qa["reason"], qa_round=ctx.qa_rounds)
                 return _transition(
@@ -4968,6 +5078,7 @@ def run_graph_agent(
                     state_in, "deterministic_qa", "suggester", "unreproduced_arbitrate", "Repeated passed_on_original",
                     update={"route": "planned", "last_qa_feedback": msg},
                 )
+            ctx.fix_session_history = None
             return _transition(
                 state_in, "deterministic_qa", "fixer", "unreproduced_bounce", "Temporary regression test passed on original",
                 update={"last_qa_feedback": msg},
@@ -5116,16 +5227,7 @@ def run_graph_agent(
                 plan_conflicts=list(ver_payload.get("plan_conflicts") or []),
                 feedback=_feature_meta(repair_feedback),
             )
-        if ctx.fix_session_history and callable(ctx.compress_fn):
-            try:
-                try:
-                    ctx.fix_session_history = ctx.compress_fn(
-                        ctx.fix_session_history, keep_recent_steps=2, test_cutoff_steps=1,
-                    )
-                except TypeError:
-                    ctx.fix_session_history = ctx.compress_fn(ctx.fix_session_history)
-            except Exception:
-                pass
+        ctx.fix_session_history = None
         return _transition(
             state_in, "verifier", "fixer", "qa_reject_fix", ver_payload.get("summary", ""),
             update={"last_qa_feedback": repair_feedback},

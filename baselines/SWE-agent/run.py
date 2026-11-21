@@ -117,8 +117,8 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     api_limit: int | None = None
 
     def __post_init__(self):
-        if self.api is not None and self.api.strip().lower() not in ("yj", "ds"):
-            raise ValueError("--api must be one of yj, ds")
+        if self.api is not None and self.api.strip().lower() not in ("yj", "ollama"):
+            raise ValueError("--api must be one of yj, ollama")
         if self.api_limit is not None and self.api_limit < 1:
             raise ValueError("--api-limit must be a positive integer")
 

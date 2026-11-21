@@ -1,0 +1,12 @@
+{
+  "queries": [
+    "SWE-bench agent tampering with test cases cheating weak test",
+    "Rust programming language automated program repair lifetime trait benchmark",
+    "test generation oracle lock agent cannot modify test file repair",
+    "multi-agent repair rollback partial patch dependency group verification"
+  ],
+  "start_year": 2023,
+  "end_year": 2026,
+  "max_papers": 12,
+  "sources": ["arxiv", "open_alex", "crossref", "semantic_scholar"]
+}

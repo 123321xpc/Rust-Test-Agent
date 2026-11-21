@@ -50,9 +50,9 @@ def test_configured_model_defaults_to_yj_and_supports_api_limit(monkeypatch):
     monkeypatch.setenv("YJ_BASE_URL", "https://yj.example/v1")
     monkeypatch.setenv("YJ_API_KEY", "yj-key")
     monkeypatch.setenv("YJ_MODEL", "yj-model")
-    monkeypatch.setenv("DS_BASE_URL", "https://ds.example/v1")
-    monkeypatch.setenv("DS_API_KEY", "ds-key")
-    monkeypatch.setenv("DS_MODEL", "ds-model")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "https://ollama.example/v1")
+    monkeypatch.setenv("OLLAMA_API_KEY", "ollama-key")
+    monkeypatch.setenv("OLLAMA_MODEL", "ollama-model")
     resolve_api_env(api_limit=42)
     with patch("sweagent.agent.models.OpenAI") as client:
         model = get_model(ModelArguments("configured"))
@@ -61,10 +61,10 @@ def test_configured_model_defaults_to_yj_and_supports_api_limit(monkeypatch):
     client.assert_called_once_with(api_key="yj-key", base_url="https://yj.example/v1",
                                    http_client=ANY, max_retries=0)
 
-    resolve_api_env(api="ds", api_limit=15)
+    resolve_api_env(api="ollama", api_limit=15)
     with patch("sweagent.agent.models.OpenAI") as client2:
-        ds_model = get_model(ModelArguments("configured"))
-    assert ds_model.api_model == "ds-model"
-    assert ds_model.api_budget.limit == 15
-    client2.assert_called_once_with(api_key="ds-key", base_url="https://ds.example/v1",
+        ollama_model = get_model(ModelArguments("configured"))
+    assert ollama_model.api_model == "ollama-model"
+    assert ollama_model.api_budget.limit == 15
+    client2.assert_called_once_with(api_key="ollama-key", base_url="https://ollama.example/v1",
                                     http_client=ANY, max_retries=0)

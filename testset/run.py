@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('validation_runner', HERE.parent / 'validation/run.py')
+spec = importlib.util.spec_from_file_location('validation_runner', HERE.parent / 'testset/runner.py')
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 runner.HERE = HERE

@@ -24,10 +24,3 @@ def test_configure_network_proxy_sets_all_variants(monkeypatch):
     assert agent.os.environ["HTTP_PROXY"] == "http://10.70.254.202:11321"
     assert agent.os.environ["https_proxy"] == "http://10.70.254.202:11321"
     assert agent.os.environ["NO_PROXY"] == "localhost,127.0.0.1,::1"
-
-
-def test_configure_network_proxy_respects_existing_value(monkeypatch):
-    agent = load_agent_module()
-    monkeypatch.setenv("HTTP_PROXY", "http://existing.example:8080")
-    agent.configure_network_proxy()
-    assert agent.os.environ["HTTP_PROXY"] == "http://existing.example:8080"

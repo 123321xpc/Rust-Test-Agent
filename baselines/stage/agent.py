@@ -370,7 +370,7 @@ def _resolve_api_settings(api=None, model_override=None):
     model = model_val or os.getenv("YJ_MODEL")
     if base_url and api_key and model:
         return model, api_key, base_url, None
-    return None, None, None, "set YJ_*/DS_* (or MODEL and API_KEY) in the project-root .env"
+    return None, None, None, "set YJ_*/OLLAMA_* (or MODEL and API_KEY) in the project-root .env"
 
 
 def main():
@@ -379,7 +379,7 @@ def main():
     parser.add_argument("--instance-id", required=True)
     parser.add_argument("--issue-file", required=True, help="UTF-8 file containing the issue description")
     parser.add_argument("--output", required=True, help="Prediction JSONL file (appends one record)")
-    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"), help="API interface from .env to use (default: yj)")
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ollama"), help="API interface from .env to use (default: yj)")
     parser.add_argument("--model", help="Override the default model for the selected API interface")
     parser.add_argument("--api-limit", type=int, default=None, help="Override API_LIMIT from .env (default: 70)")
     parser.add_argument("--max-api-calls", type=int, default=None, help="Optional lower per-task limit for model HTTP calls, including retries")

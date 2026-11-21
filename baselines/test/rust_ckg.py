@@ -10,9 +10,12 @@ Supports:
 """
 
 import bisect
+import importlib.util
 import json
 import os
 import re
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -1122,13 +1125,96 @@ def parse_rust_file(source: str, rel_path: str) -> ParsedRustFile:
     return parsed
 
 
+_SEMANTICS_MOD: Any = None
+
+
+def _load_semantics_module():
+    global _SEMANTICS_MOD
+    if _SEMANTICS_MOD is None:
+        sem_path = Path(__file__).with_name("rust_semantics.py")
+        if not sem_path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("test_rust_semantics", sem_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _SEMANTICS_MOD = mod
+    return _SEMANTICS_MOD
+
+
 class RustCodeGraph:
     """Incremental repository-level Rust Code Knowledge Graph (CKG)."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, env: dict[str, str] | None = None):
         self.root = Path(root).resolve()
+        self.env = env
         self._file_cache: dict[Path, tuple[int, int, ParsedRustFile]] = {}
         self._pkg_roots: list[tuple[Path, str]] | None = None
+        self.semantic: Any = None
+        self._semantic_fp: str | None = None
+        self._semantic_lock = threading.Lock()
+
+    def _package_name_for_path(self, rel_path: str) -> str | None:
+        fpath = (self.root / rel_path).resolve()
+        while fpath != self.root.parent and fpath != fpath.parent:
+            manifest = fpath / "Cargo.toml"
+            if manifest.is_file():
+                try:
+                    content = manifest.read_text(encoding="utf-8", errors="replace")
+                    m_sec = re.search(r"(?ms)^\[package\](.*?)(?:^\[|\Z)", content)
+                    if m_sec:
+                        m_name = re.search(r'(?m)^name\s*=\s*["\']([^"\']+)["\']', m_sec.group(1))
+                        if m_name:
+                            return m_name.group(1).strip()
+                except OSError:
+                    pass
+                break
+            fpath = fpath.parent
+        return None
+
+    def ensure_semantic(
+        self,
+        *,
+        target_symbols: list[str] | None = None,
+        target_files: list[str] | None = None,
+        need_mir: bool = False,
+        force_mir_packages: list[str] | None = None,
+        allow_subprocess: bool = True,
+    ) -> Any:
+        """Lazily build/refresh Stage 1 compiler definitions and optional Stage 2/3 MIR."""
+        if not allow_subprocess:
+            return self.semantic
+        if self.semantic is not None and self._semantic_fp is None:
+            return self.semantic
+        has_manifest = (self.root / "Cargo.toml").is_file() or any(self.root.glob("*/Cargo.toml"))
+        if not has_manifest:
+            return None
+        sem_mod = _load_semantics_module()
+        if sem_mod is None:
+            return None
+        try:
+            with self._semantic_lock:
+                fp = sem_mod.compute_source_fingerprint(self.root)
+                focus_pkgs: list[str] = []
+                for tf in target_files or ():
+                    pkg = self._package_name_for_path(tf)
+                    if pkg and pkg not in focus_pkgs:
+                        focus_pkgs.append(pkg)
+                if self.semantic is None or self._semantic_fp != fp:
+                    self.semantic = sem_mod.build_workspace_graph(
+                        self.root, self.env, fingerprint=fp, focus_packages=focus_pkgs or None,
+                    )
+                    self._semantic_fp = fp
+                elif focus_pkgs and len(getattr(self.semantic, "packages", {})) > 6:
+                    self.semantic.ensure_packages(focus_pkgs[:4], env=self.env)
+                if self.semantic is not None and self.semantic.precise:
+                    if force_mir_packages:
+                        self.semantic.ensure_mir_for_packages(force_mir_packages, env=self.env)
+                    elif need_mir and target_symbols:
+                        self.semantic.ensure_mir_for_symbols(target_symbols, env=self.env)
+        except Exception:
+            return self.semantic
+        return self.semantic
 
     def _refresh_package_roots(self):
         roots: list[tuple[Path, str]] = []
@@ -1256,6 +1342,106 @@ class RustCodeGraph:
                         paths.append(candidate)
         return paths[:6]
 
+    @staticmethod
+    def _item_tokens(it: dict[str, Any]) -> set[str]:
+        refs = set(it.get("type_refs") or ())
+        for field in ("enclosing", "context"):
+            txt = it.get(field) or ""
+            if txt:
+                refs.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", txt))
+        return refs
+
+    def _resolve_callee_item(
+        self,
+        sem: Any,
+        cname: str,
+        caller_item: dict[str, Any],
+        fn_defs: dict[str, list[dict[str, Any]]],
+        by_loc: dict[tuple[str, int, str], dict[str, Any]],
+        pf_by_path: dict[str, ParsedRustFile],
+    ) -> dict[str, Any] | None:
+        """Resolve a callee token to a concrete fn definition via MIR -> Stage 1 -> lexical ranking."""
+        cb = cname.split("::")[-1].strip().removeprefix("r#")
+        if not cb:
+            return None
+
+        if sem is not None and sem.precise:
+            caller_sem = next(
+                (it for it in sem.items_by_file_line.get((caller_item["path"], int(caller_item["line"])), ())
+                 if it.name == caller_item["name"]),
+                None,
+            )
+            if caller_sem is not None:
+                for edge in sem.callees_by_caller.get(caller_sem.key, ()):
+                    if edge.callee_name == cb:
+                        hit = by_loc.get((edge.callee_file, edge.callee_line, edge.callee_name))
+                        if hit is not None:
+                            return hit
+
+        cands = [x for x in fn_defs.get(cb, []) if x["kind"] == "fn"]
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+
+        if "::" in cname:
+            owner = cname.split("::")[-2]
+            owned = [
+                x for x in cands
+                if owner in (x.get("enclosing") or "") or x.get("module_path", "").endswith(owner)
+            ]
+            if len(owned) == 1:
+                return owned[0]
+            if owned:
+                cands = owned
+
+        if sem is not None and sem.precise:
+            caller_types = self._item_tokens(caller_item)
+            caller_pf = pf_by_path.get(caller_item["path"])
+            caller_mod = caller_item.get("module_path", "")
+            caller_sem = next(
+                (it for it in sem.items_by_file_line.get((caller_item["path"], int(caller_item["line"])), ())
+                 if it.name == caller_item["name"]),
+                None,
+            )
+            caller_sem_mod = caller_sem.module_path if caller_sem else ""
+            use_targets = {rx.get("target", "") for rx in (caller_pf.reexports if caller_pf else ())}
+
+            def _sem_score(cand: dict[str, Any]) -> tuple[int, int, int, int, str]:
+                sem_it = next(
+                    (it for it in sem.items_by_file_line.get((cand["path"], int(cand["line"])), ())
+                     if it.name == cand["name"]),
+                    None,
+                )
+                type_hit = 1
+                mod_hit = 1
+                if sem_it is not None:
+                    ot = (sem_it.owner_type or "").split("::")[-1]
+                    tr = (sem_it.owner_trait or "").split("::")[-1]
+                    if ot and ot in caller_types:
+                        type_hit = 0
+                    elif tr and tr in caller_types:
+                        type_hit = 0
+                    if caller_sem_mod and sem_it.module_path == caller_sem_mod:
+                        mod_hit = 0
+                    elif any(ut and sem_it.full_path.endswith(ut) for ut in use_targets):
+                        mod_hit = 0
+                elif caller_mod and cand.get("module_path") == caller_mod:
+                    mod_hit = 0
+                return (
+                    type_hit,
+                    mod_hit,
+                    0 if cand.get("has_body") else 1,
+                    0 if cand["path"] == caller_item["path"] else 1,
+                    cand["path"],
+                )
+
+            cands.sort(key=_sem_score)
+            return cands[0]
+
+        cands.sort(key=lambda x: (0 if x.get("has_body") else 1, 0 if x["path"] == caller_item["path"] else 1, x["path"]))
+        return cands[0]
+
     def query_neighborhood(
         self,
         target: str,
@@ -1263,6 +1449,8 @@ class RustCodeGraph:
         hops: int = 1,
         exclude_tests: bool = True,
         max_neighbors: int = 8,
+        _focus_item: tuple[str, int, str] | None = None,
+        _allow_semantic_subprocess: bool = True,
     ) -> dict[str, Any]:
         """Inspect a symbol (foo, Type::method) or file (src/lib.rs, src/lib.rs:42, src/lib.rs:symbol)."""
         clean = target.strip()
@@ -1270,6 +1458,7 @@ class RustCodeGraph:
             return {"error": "Provide a symbol name, Type::method, or file[:line]"}
         hops = max(1, min(3, hops))
         all_files = self._all_parsed(exclude_tests=exclude_tests)
+        pf_by_path = {pf.rel_path: pf for pf in all_files}
 
         file_part = clean
         line_num: int | None = None
@@ -1310,9 +1499,17 @@ class RustCodeGraph:
                     }
             else:
                 focus_items = items[:25]
+            focus_names = [x.get("name", "") for x in focus_items if x.get("name")]
+            sem = self.ensure_semantic(
+                target_symbols=focus_names,
+                target_files=[pf.rel_path],
+                need_mir=(line_num is not None or symbol_name is not None),
+                allow_subprocess=_allow_semantic_subprocess,
+            )
             result: dict[str, Any] = {
                 "target": clean,
                 "mode": "file_line" if line_num is not None else ("file_symbol" if symbol_name else "file"),
+                "precision": sem.mode if (sem is not None and sem.precise) else "lexical",
                 "module_path": pf.module_path,
                 "crate": self.crate_for_path(pf.rel_path),
                 "items": focus_items,
@@ -1322,9 +1519,18 @@ class RustCodeGraph:
             if (line_num is not None or symbol_name is not None) and focus_items:
                 fn_item = next((x for x in focus_items if x["kind"] == "fn"), None)
                 if fn_item:
-                    nb = self.query_neighborhood(fn_item["name"], kind="fn", hops=hops, exclude_tests=exclude_tests, max_neighbors=max_neighbors)
+                    nb = self.query_neighborhood(
+                        fn_item["name"],
+                        kind="fn",
+                        hops=hops,
+                        exclude_tests=exclude_tests,
+                        max_neighbors=max_neighbors,
+                        _focus_item=(fn_item["path"], int(fn_item["line"]), fn_item["name"]),
+                        _allow_semantic_subprocess=_allow_semantic_subprocess,
+                    )
                     result["callers"] = nb.get("callers", [])
                     result["callees"] = nb.get("callees", [])
+                    result["precision"] = nb.get("precision", result["precision"])
             return result
 
         owner_filter = None
@@ -1335,77 +1541,238 @@ class RustCodeGraph:
                 owner_filter = parts[-2]
                 sym_name = parts[-1]
 
-        matched_defs: list[dict[str, Any]] = []
         clean_sym = sym_name.removeprefix("r#")
+        sym_files = list(dict.fromkeys(
+            it["path"] for pf in all_files for it in pf.items
+            if not (exclude_tests and it.get("is_test"))
+            and it["name"].removeprefix("r#") == clean_sym
+        ))[:4]
+        sem = self.ensure_semantic(
+            target_symbols=[clean, clean_sym],
+            target_files=[_focus_item[0]] if _focus_item else sym_files,
+            need_mir=(kind in ("", "fn")),
+            allow_subprocess=_allow_semantic_subprocess,
+        )
+        sem_kind = "function" if kind == "fn" else kind
+        sem_matches = sem.items_for_symbol(clean, kind=sem_kind) if (sem is not None and sem.precise) else []
+        if _focus_item is not None and sem_matches:
+            f_path, f_line, f_name = _focus_item
+            exact_sem = [it for it in sem_matches if it.file == f_path and it.line == f_line and it.name == f_name]
+            if exact_sem:
+                sem_matches = exact_sem
+
+        fn_defs: dict[str, list[dict[str, Any]]] = {}
+        by_loc: dict[tuple[str, int, str], dict[str, Any]] = {}
+        matched_defs: list[dict[str, Any]] = []
+        sem_match_locs = {(it.file, it.line, it.name): it for it in sem_matches}
+
         for pf in all_files:
             for it in pf.items:
                 if exclude_tests and it.get("is_test"):
                     continue
+                if it["kind"] == "fn":
+                    fn_defs.setdefault(it["name"], []).append(it)
+                    by_loc[(it["path"], int(it["line"]), it["name"])] = it
                 if kind and it["kind"] != kind:
+                    continue
+                if _focus_item is not None:
+                    if (it["path"], int(it["line"]), it["name"]) != _focus_item:
+                        continue
+                    matched_defs.append(dict(it))
                     continue
                 if it["name"].removeprefix("r#") == clean_sym:
                     if owner_filter and owner_filter not in (it.get("enclosing") or "") and owner_filter not in it.get("module_path", ""):
-                        continue
+                        if (it["path"], int(it["line"]), it["name"]) not in sem_match_locs:
+                            continue
                     matched_defs.append(dict(it))
+
+        if _focus_item is None and "::" in clean and sem_match_locs:
+            filtered = [d for d in matched_defs if (d["path"], int(d["line"]), d["name"]) in sem_match_locs]
+            if filtered:
+                matched_defs = filtered
+
         matched_defs.sort(key=lambda x: (0 if x.get("vis") == "pub" else 1, 0 if x.get("has_body") else 1, x["path"], x["line"]))
         for enriched in matched_defs[:5]:
             enriched["public_paths"] = self._public_paths_for_item(enriched, all_files)
+            if sem is not None and sem.precise:
+                sem_it = next(
+                    (it for it in sem.items_by_file_line.get((enriched["path"], int(enriched["line"])), ())
+                     if it.name == enriched["name"]),
+                    None,
+                )
+                if sem_it is not None:
+                    enriched["full_path"] = sem_it.full_path
+                    if sem_it.owner_trait:
+                        enriched["owner_trait"] = sem_it.owner_trait
+                    if sem_it.owner_type:
+                        enriched["owner_type"] = sem_it.owner_type
 
         trait_impls: list[dict[str, Any]] = []
-        for pf in all_files:
-            for ib in pf.impl_blocks:
-                if exclude_tests and ib.get("is_test"):
-                    continue
-                if ib.get("for_type") == sym_name or ib.get("trait") == sym_name or (owner_filter and ib.get("for_type") == owner_filter):
-                    trait_impls.append(ib)
+        used_semantic_impls = False
+        is_ambiguous_bare = False
+        if sem is not None and sem.precise and sem_matches:
+            sem_traits: list[str] = []
+            sem_types: list[str] = []
+            for it in sem_matches:
+                if it.kind == "trait" and it.full_path not in sem_traits:
+                    sem_traits.append(it.full_path)
+                if it.kind in ("struct", "enum", "type", "union") and it.full_path not in sem_types:
+                    sem_types.append(it.full_path)
+                if it.owner_trait and it.owner_trait not in sem_traits and "::" in clean:
+                    sem_traits.append(it.owner_trait)
+                if it.owner_type and it.owner_type not in sem_types and "::" in clean:
+                    sem_types.append(it.owner_type)
+            if sem_traits or sem_types:
+                used_semantic_impls = True
+                is_ambiguous_bare = len(sem_traits) > 1 and "::" not in clean and _focus_item is None
+                seen_imp: set[str] = set()
+                seen_loc_tr: set[tuple[str, int, str]] = set()
+                for imp in sem.dependents_of_trait_any(sem_traits) + sem.impls_for_type_any(sem_types):
+                    if imp.key in seen_imp:
+                        continue
+                    seen_imp.add(imp.key)
+                    t_short = imp.trait_name or ""
+                    ty_short = imp.type_name or ""
+                    seen_loc_tr.add((imp.file, imp.line, t_short))
+                    trait_impls.append({
+                        "path": imp.file,
+                        "line": imp.line,
+                        "end_line": imp.end_line,
+                        "header": imp.context,
+                        "trait": t_short or None,
+                        "trait_path": imp.trait_full_path,
+                        "for_type": ty_short or None,
+                        "for_type_path": imp.type_full_path,
+                        "context": imp.context,
+                        "precision": "compiler_ambiguous" if is_ambiguous_bare else "compiler",
+                    })
+                # Keep #[derive(...)] attributes attached to matched structs/enums if not already emitted by rustdoc
+                type_locs = {(it.file, it.line, it.name) for it in sem_matches if it.kind in ("struct", "enum")}
+                for pf in all_files:
+                    for ib in pf.impl_blocks:
+                        if exclude_tests and ib.get("is_test"):
+                            continue
+                        if str(ib.get("header") or "").startswith("#[derive("):
+                            if (ib.get("path"), int(ib.get("line") or 0), ib.get("for_type")) in type_locs:
+                                key_lt = (str(ib.get("path")), int(ib.get("line") or 0), str(ib.get("trait") or ""))
+                                if key_lt not in seen_loc_tr:
+                                    seen_loc_tr.add(key_lt)
+                                    trait_impls.append(ib)
+
+        if not used_semantic_impls:
+            for pf in all_files:
+                for ib in pf.impl_blocks:
+                    if exclude_tests and ib.get("is_test"):
+                        continue
+                    if ib.get("for_type") == sym_name or ib.get("trait") == sym_name or (owner_filter and ib.get("for_type") == owner_filter):
+                        trait_impls.append(ib)
 
         callers: list[dict[str, Any]] = []
         seen_callers: set[str] = set()
-        frontier = {sym_name}
-        for hop in range(1, hops + 1):
-            next_frontier: set[str] = set()
-            for pf in all_files:
-                for ce in pf.call_edges:
-                    if exclude_tests and ce.get("is_test"):
-                        continue
-                    callee_base = ce["callee"].split("::")[-1]
-                    if ce["callee"] in frontier or callee_base in frontier:
-                        cid = ce["caller_id"]
+        mir_pkgs = getattr(sem, "mir_packages_ok", set()) if (sem is not None and sem.precise) else set()
+        if sem is not None and sem.precise and sem_matches and mir_pkgs:
+            # Stage 2 MIR exact caller traversal across resolved callee keys
+            mir_frontier = [it.key for it in sem_matches]
+            for hop in range(1, hops + 1):
+                next_mir: list[str] = []
+                for ckey in mir_frontier:
+                    for edge in sem.callers_by_callee.get(ckey, ()):
+                        cid = f"{edge.caller_file}:{edge.caller_line}:{edge.caller_name}"
                         if cid not in seen_callers and len(callers) < max_neighbors:
                             seen_callers.add(cid)
+                            lex_caller = by_loc.get((edge.caller_file, edge.caller_line, edge.caller_name))
                             callers.append({
                                 "hop": hop,
-                                "caller": ce["caller"],
-                                "path": ce["caller_path"],
-                                "line": ce["caller_line"],
-                                "enclosing": ce.get("caller_enclosing"),
+                                "caller": edge.caller_name,
+                                "path": edge.caller_file,
+                                "line": edge.caller_line,
+                                "enclosing": lex_caller.get("enclosing") if lex_caller else None,
+                                "full_path": edge.caller_full_path,
+                                "precision": "compiler_mir",
                             })
-                            next_frontier.add(ce["caller"])
-            frontier = next_frontier
-            if not frontier:
-                break
+                            next_mir.append(edge.caller_key)
+                mir_frontier = next_mir
+                if not mir_frontier:
+                    break
+
+        all_pkgs_mir = bool(sem is not None and sem.precise and sem.packages and not (set(sem.packages) - mir_pkgs))
+        if not all_pkgs_mir:
+            frontier = {sym_name}
+            allowed_owners = {
+                (it.owner_type or "").split("::")[-1]
+                for it in sem_matches if it.owner_type
+            }
+            if owner_filter:
+                allowed_owners.add(owner_filter)
+            for hop in range(1, hops + 1):
+                next_frontier: set[str] = set()
+                for pf in all_files:
+                    pf_pkg = sem.crate_to_pkg.get(self.crate_for_path(pf.rel_path)) if sem is not None else None
+                    if pf_pkg and pf_pkg in mir_pkgs and sem_matches:
+                        continue  # Already covered accurately by MIR for this package
+                    for ce in pf.call_edges:
+                        if exclude_tests and ce.get("is_test"):
+                            continue
+                        callee_str = ce["callee"]
+                        callee_base = callee_str.split("::")[-1]
+                        if callee_str in frontier or callee_base in frontier:
+                            if "::" in callee_str and allowed_owners:
+                                ce_owner = callee_str.split("::")[-2]
+                                if ce_owner not in allowed_owners and ce_owner not in {it.module_path.split("::")[-1] for it in sem_matches}:
+                                    continue
+                            cid = ce["caller_id"]
+                            if cid not in seen_callers and len(callers) < max_neighbors:
+                                seen_callers.add(cid)
+                                callers.append({
+                                    "hop": hop,
+                                    "caller": ce["caller"],
+                                    "path": ce["caller_path"],
+                                    "line": ce["caller_line"],
+                                    "enclosing": ce.get("caller_enclosing"),
+                                })
+                                next_frontier.add(ce["caller"])
+                frontier = next_frontier
+                if not frontier:
+                    break
 
         callees: list[dict[str, Any]] = []
         seen_callee_names: set[str] = set()
         for d in sorted(matched_defs, key=lambda x: (0 if x.get("has_body") else 1, x["path"]))[:5]:
+            if sem is not None and sem.precise and mir_pkgs:
+                caller_sem = next(
+                    (it for it in sem.items_by_file_line.get((d["path"], int(d["line"])), ())
+                     if it.name == d["name"]),
+                    None,
+                )
+                if caller_sem is not None:
+                    for edge in sem.callees_by_caller.get(caller_sem.key, ())[:max_neighbors]:
+                        if edge.callee_full_path not in seen_callee_names:
+                            seen_callee_names.add(edge.callee_full_path)
+                            seen_callee_names.add(edge.callee_name)
+                            callees.append({
+                                "name": edge.callee_expr or edge.callee_full_path,
+                                "defined_at": [f"{edge.callee_file}:{edge.callee_line}"],
+                                "full_path": edge.callee_full_path,
+                                "precision": "compiler_mir",
+                            })
             for cname in d.get("callees", [])[:max_neighbors]:
-                if cname not in seen_callee_names:
+                if cname not in seen_callee_names and cname.split("::")[-1] not in seen_callee_names:
                     seen_callee_names.add(cname)
-                    c_base = cname.split("::")[-1]
-                    c_defs = []
-                    for pf in all_files:
-                        for it in pf.items:
-                            if not (exclude_tests and it.get("is_test")) and it["kind"] == "fn" and it["name"] == c_base:
-                                c_defs.append(f"{it['path']}:{it['line']}")
-                                if len(c_defs) >= 2:
-                                    break
-                        if len(c_defs) >= 2:
-                            break
+                    resolved = self._resolve_callee_item(sem, cname, d, fn_defs, by_loc, pf_by_path)
+                    c_defs = [f"{resolved['path']}:{resolved['line']}"] if resolved is not None else []
                     callees.append({"name": cname, "defined_at": c_defs})
+
+        if sem is None or not sem.precise:
+            precision = "lexical"
+        elif is_ambiguous_bare or (len({it.full_path for it in sem_matches}) > 1 and "::" not in clean and _focus_item is None):
+            precision = "compiler_ambiguous"
+        else:
+            precision = sem.mode
 
         res_payload = {
             "target": clean,
             "mode": "symbol",
+            "precision": precision,
             "definitions": matched_defs[:5],
             "trait_impls": trait_impls[:6],
             "callers": callers,
@@ -1491,20 +1858,38 @@ class RustCodeGraph:
     ) -> list[dict[str, Any]]:
         """Build 1..max_chains distinct candidate fault propagation paths across call/trait/re-export edges."""
         all_files = self._all_parsed(exclude_tests=True)
+        pf_by_path = {pf.rel_path: pf for pf in all_files}
         fn_defs: dict[str, list[dict[str, Any]]] = {}
+        by_loc: dict[tuple[str, int, str], dict[str, Any]] = {}
         for pf in all_files:
             for it in pf.items:
                 if not it.get("is_test"):
                     fn_defs.setdefault(it["name"], []).append(it)
+                    if it.get("kind") == "fn":
+                        by_loc[(it["path"], int(it["line"]), it["name"])] = it
 
+        chain_files = list(dict.fromkeys(
+            list(seed_files or ()) + [
+                it["path"]
+                for sym in seed_symbols
+                for it in fn_defs.get(sym.split("::")[-1].strip().removeprefix("r#"), ())[:2]
+            ]
+        ))[:4]
+        sem = self.ensure_semantic(target_symbols=seed_symbols, target_files=chain_files, need_mir=True)
         chains: list[dict[str, Any]] = []
-        seen_roots: set[tuple[str, str]] = set()
+        seen_roots: set[tuple[str, int, str]] = set()
 
         for sym in seed_symbols:
             clean = sym.split("::")[-1].strip().removeprefix("r#")
-            root_cands = sorted(fn_defs.get(clean, []), key=lambda x: (0 if x.get("has_body") else 1, x["path"]))
+            root_cands = sorted(fn_defs.get(clean, []), key=lambda x: (0 if x.get("has_body") else 1, x["path"], x["line"]))
+            if sem is not None and sem.precise and "::" in sym:
+                sem_roots = sem.items_for_symbol(sym)
+                sem_locs = {(it.file, it.line, it.name) for it in sem_roots}
+                narrowed = [x for x in root_cands if (x["path"], int(x["line"]), x["name"]) in sem_locs]
+                if narrowed:
+                    root_cands = narrowed
             for root_item in root_cands[:2]:
-                rkey = (root_item["path"], root_item["name"])
+                rkey = (root_item["path"], int(root_item["line"]), root_item["name"])
                 if rkey in seen_roots:
                     continue
                 seen_roots.add(rkey)
@@ -1518,19 +1903,37 @@ class RustCodeGraph:
                     "enclosing": root_item.get("enclosing"),
                     "role": "entry_or_seed",
                 }]
-                cur_callees = list(root_item.get("callees", []))
-                visited = {root_item["name"]}
+                cur_item = root_item
+                visited_locs: set[tuple[str, int, str]] = {rkey}
                 for depth in range(max_depth):
                     next_node = None
-                    for cname in cur_callees:
-                        cb = cname.split("::")[-1]
-                        if cb in visited:
-                            continue
-                        cands = [x for x in fn_defs.get(cb, []) if x["kind"] == "fn"]
-                        if cands:
-                            cands.sort(key=lambda x: (0 if x.get("has_body") else 1, 0 if x["path"] == root_item["path"] else 1, x["path"]))
-                            chosen = cands[0]
-                            visited.add(cb)
+                    # 1. Stage 2 MIR exact edge if available for current node
+                    if sem is not None and sem.precise and sem.callees_by_caller:
+                        cur_sem = next(
+                            (it for it in sem.items_by_file_line.get((cur_item["path"], int(cur_item["line"])), ())
+                             if it.name == cur_item["name"]),
+                            None,
+                        )
+                        if cur_sem is not None:
+                            for edge in sem.callees_by_caller.get(cur_sem.key, ()):
+                                nkey = (edge.callee_file, edge.callee_line, edge.callee_name)
+                                if nkey in visited_locs:
+                                    continue
+                                hit = by_loc.get(nkey)
+                                if hit is not None:
+                                    visited_locs.add(nkey)
+                                    next_node = hit
+                                    break
+                    # 2. Step 1.5 / lexical disambiguation
+                    if next_node is None:
+                        for cname in cur_item.get("callees", ()):
+                            chosen = self._resolve_callee_item(sem, cname, cur_item, fn_defs, by_loc, pf_by_path)
+                            if chosen is None:
+                                continue
+                            ckey = (chosen["path"], int(chosen["line"]), chosen["name"])
+                            if ckey in visited_locs:
+                                continue
+                            visited_locs.add(ckey)
                             next_node = chosen
                             break
                     if not next_node:
@@ -1545,7 +1948,7 @@ class RustCodeGraph:
                         "enclosing": next_node.get("enclosing"),
                         "role": "callee" if depth < max_depth - 1 else "inner_candidate",
                     })
-                    cur_callees = list(next_node.get("callees", []))
+                    cur_item = next_node
 
                 chains.append({
                     "chain_id": f"C{len(chains) + 1}",
@@ -1579,9 +1982,170 @@ class RustCodeGraph:
                 })
         return chains[:max_chains]
 
+    def _lexical_fn_slice(
+        self,
+        fn_item: dict[str, Any] | None,
+        line_num: int | None,
+        var: str,
+        direction: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Lightweight lexical def-use fallback inside an enclosing function when MIR is unavailable."""
+        if fn_item is None:
+            return {"direction": direction, "var": var or None, "precision": "lexical", "slice_lines": [], "reason": reason}
+        rel = fn_item["path"]
+        s_line = int(fn_item.get("line") or 1)
+        e_line = int(fn_item.get("end_line") or s_line)
+        try:
+            lines = (self.root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        seed_ln = line_num if (line_num and s_line <= line_num <= e_line) else s_line
+        seed_vars = {var.split(".")[0]} if var else set()
+        if not seed_vars and 1 <= seed_ln <= len(lines):
+            seed_vars.update(
+                tok for tok in re.findall(r"\b[a-z_][A-Za-z0-9_]*\b", lines[seed_ln - 1])
+                if tok not in _SKIP_CALL_NAMES and tok not in ("let", "mut", "if", "else", "match", "return", "fn", "pub")
+            )
+        out_lines: list[dict[str, Any]] = []
+        rng = range(s_line, min(e_line, len(lines)) + 1)
+        for ln in rng:
+            txt = lines[ln - 1].rstrip()
+            toks = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", txt))
+            if ln == seed_ln or (seed_vars & toks):
+                out_lines.append({
+                    "path": rel,
+                    "line": ln,
+                    "function": fn_item["name"],
+                    "vars": sorted(seed_vars & toks)[:6],
+                    "hop": 0,
+                    "code": txt[:160],
+                })
+                if len(out_lines) >= 25:
+                    break
+        res = {
+            "direction": direction,
+            "var": var or None,
+            "precision": "lexical",
+            "root_function": fn_item["name"],
+            "slice_lines": out_lines,
+            "cross_function_hops": [],
+        }
+        if reason:
+            res["reason"] = reason
+        return res
 
-def make_rust_ckg_tool(root: Path, graph: RustCodeGraph | None = None):
-    ckg = graph or RustCodeGraph(root)
+    def slice_dataflow(
+        self,
+        target: str,
+        direction: str = "backward",
+        var: str = "",
+        hops: int = 1,
+        exclude_tests: bool = True,
+    ) -> dict[str, Any]:
+        """Stage 3: Compute statement-level MIR def-use data-flow slice for a symbol or file[:line]."""
+        clean = (target or "").strip()
+        dir_norm = (direction or "backward").strip().lower()
+        if dir_norm not in ("backward", "forward", "both"):
+            dir_norm = "backward"
+        if not clean:
+            return {"error": "Provide a symbol name or file[:line] for dataflow slicing"}
+
+        file_part = clean
+        line_num: int | None = None
+        sym_in_file: str | None = None
+        if ":" in clean and not clean.startswith("::"):
+            fp, lp = clean.rsplit(":", 1)
+            if lp.isdigit():
+                file_part = fp.strip()
+                line_num = int(lp)
+            elif fp.strip().endswith(".rs") and lp.strip():
+                file_part = fp.strip()
+                sym_in_file = lp.strip()
+
+        all_files = self._all_parsed(exclude_tests=exclude_tests)
+        fn_item: dict[str, Any] | None = None
+        target_files: list[str] = []
+        target_syms: list[str] = []
+
+        if file_part.endswith(".rs"):
+            pf = self.get_parsed_file((self.root / file_part).resolve())
+            if pf is None:
+                return {"error": f"Rust file not found: {file_part}"}
+            target_files.append(pf.rel_path)
+            items = [it for it in pf.items if not (exclude_tests and it.get("is_test")) and it.get("kind") == "fn"]
+            if line_num is not None:
+                cands = [it for it in items if it["line"] <= line_num <= it.get("end_line", it["line"])]
+                cands.sort(key=lambda x: (x.get("end_line", x["line"]) - x["line"], -x["line"]))
+                fn_item = cands[0] if cands else None
+            elif sym_in_file:
+                bare = sym_in_file.split("::")[-1].removeprefix("r#")
+                owner = sym_in_file.split("::")[-2] if "::" in sym_in_file else ""
+                cands = [
+                    it for it in items
+                    if it["name"].removeprefix("r#") == bare and (not owner or owner in (it.get("enclosing") or ""))
+                ]
+                fn_item = cands[0] if cands else None
+            if fn_item:
+                target_syms.append(fn_item["name"])
+        else:
+            bare = clean.split("::")[-1].removeprefix("r#")
+            owner = clean.split("::")[-2] if "::" in clean else ""
+            target_syms.append(clean)
+            cands = [
+                it for pf in all_files for it in pf.items
+                if not (exclude_tests and it.get("is_test")) and it.get("kind") == "fn"
+                and it["name"].removeprefix("r#") == bare
+                and (not owner or owner in (it.get("enclosing") or "") or owner in it.get("module_path", ""))
+            ]
+            cands.sort(key=lambda x: (0 if x.get("vis") == "pub" else 1, 0 if x.get("has_body") else 1, x["path"], x["line"]))
+            fn_item = cands[0] if cands else None
+            target_files = list(dict.fromkeys(c["path"] for c in cands[:4]))
+
+        force_pkgs: list[str] = []
+        for tf in target_files:
+            pkg = self._package_name_for_path(tf)
+            if pkg and pkg not in force_pkgs:
+                force_pkgs.append(pkg)
+        sem = self.ensure_semantic(
+            target_symbols=target_syms,
+            target_files=target_files,
+            need_mir=True,
+            force_mir_packages=force_pkgs or None,
+        )
+        sem_mod = _load_semantics_module()
+        if sem is not None and sem.precise and sem_mod is not None and sem.mir_functions:
+            sem_items: list[Any] = []
+            if fn_item is not None:
+                sem_items = [
+                    it for it in sem.items_by_file_line.get((fn_item["path"], int(fn_item["line"])), ())
+                    if it.name == fn_item["name"]
+                ]
+            if not sem_items and target_syms:
+                sem_items = sem.items_for_symbol(target_syms[0], kind="function")
+            if not sem_items and file_part.endswith(".rs") and line_num is not None:
+                sem_items = [
+                    it for it in sem.items.values()
+                    if it.file == file_part and it.line <= line_num <= it.end_line
+                ]
+            if sem_items:
+                mir_res = sem_mod.slice_mir_dataflow(
+                    sem,
+                    sem_items,
+                    direction=dir_norm,
+                    var=var,
+                    target_line=line_num,
+                    hops=hops,
+                )
+                if mir_res.get("precision") == "compiler_mir_slice":
+                    return mir_res
+                return self._lexical_fn_slice(fn_item, line_num, var, dir_norm, reason=mir_res.get("reason", ""))
+
+        return self._lexical_fn_slice(fn_item, line_num, var, dir_norm, reason="MIR unavailable")
+
+
+def make_rust_ckg_tool(root: Path, graph: RustCodeGraph | None = None, env: dict[str, str] | None = None):
+    ckg = graph or RustCodeGraph(root, env=env)
 
     @tool
     def inspect_rust_neighborhood(
@@ -1589,18 +2153,31 @@ def make_rust_ckg_tool(root: Path, graph: RustCodeGraph | None = None):
         kind: str = "",
         hops: int = 1,
         exclude_tests: bool = True,
+        slice_mode: str = "",
+        var: str = "",
     ) -> str:
         """Inspect a Rust symbol, Type::method, or file[:line] via the Rust Code Knowledge Graph (CKG).
 
         Target forms: "foo", "Type::method", "src/lib.rs", "src/lib.rs:42" (line),
         "src/lib.rs:method" or "src/lib.rs:Type::method" (symbol inside that file).
 
+        Optional Stage 3 data-flow slicing: pass slice_mode="backward" | "forward" | "both"
+        (and optional var="name") to extract statement-level def-use data-flow lines via MIR.
+
         Returns definitions (with visibility and exact line spans), public pub use import paths,
-        related impl Trait / #[derive] blocks, callers, and callees in one structured call.
+        related impl Trait / #[derive] blocks, callers, callees, and optional dataflow_slice.
         Use this instead of chaining multiple search_code/rust_symbols calls before planning edits or tests.
         """
         try:
             res = ckg.query_neighborhood(target=target, kind=kind, hops=hops, exclude_tests=exclude_tests)
+            if slice_mode and slice_mode.strip():
+                res["dataflow_slice"] = ckg.slice_dataflow(
+                    target=target,
+                    direction=slice_mode.strip().lower(),
+                    var=var.strip(),
+                    hops=hops,
+                    exclude_tests=exclude_tests,
+                )
             return json.dumps(res, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)

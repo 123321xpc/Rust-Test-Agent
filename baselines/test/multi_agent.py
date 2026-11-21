@@ -2896,6 +2896,13 @@ def _wrap_tools_for_role(
             if isinstance(out, str):
                 if role == "navigator":
                     used_stage = (_client_calls_made(client) - stage_start_calls) if stage_cap is not None else 0
+                    if __tname == "write_regression_test":
+                        activity["wrt_calls"] = activity.get("wrt_calls", 0) + 1
+                        if activity["wrt_calls"] >= 2 and not state.reproduced() and "[Navigator pacing notice:" not in out:
+                            out += (
+                                "\n[Navigator pacing notice: 2+ write_regression_test attempts without clean reproduction. "
+                                "Stop rewriting temporary tests and call submit_localization_bundle now so Fixer can start editing.]"
+                            )
                     if used_stage >= 12 and not state.get_regression_targets() and "[Navigator pacing notice:" not in out:
                         out += (
                             "\n[Navigator pacing notice: 12+ calls used without write_regression_test yet. "
@@ -2932,13 +2939,14 @@ def _wrap_tools_for_role(
                     elif __tname == "write_regression_test":
                         prev_passed = len(getattr(state, "_passed_regressions", set()))
                         activity["reg_write_streak"] = activity.get("reg_write_streak", 0) + 1
+                        activity["reg_write_total"] = activity.get("reg_write_total", 0) + 1
                         if prev_passed > activity.get("last_passed_reg_count", 0):
                             activity["reg_write_streak"] = 0
                         activity["last_passed_reg_count"] = prev_passed
-                        if activity["reg_write_streak"] >= 4:
+                        if activity["reg_write_streak"] >= 2 or (activity["reg_write_total"] >= 3 and not state.reproduced()):
                             out += (
                                 "\n[Pacing notice: multiple write_regression_test edits without passing; "
-                                "inspect existing tests/ helpers or run existing crate tests instead of rewriting boilerplate.]"
+                                "stop rewriting temporary tests, proceed with production edits and existing crate tests (or record unreproduced_reason).]"
                             )
                     streak = activity.get("read_only_streak", 0)
                     if streak >= 10 and not auto_escalate_on_stuck:

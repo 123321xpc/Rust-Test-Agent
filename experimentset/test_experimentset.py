@@ -9,6 +9,12 @@ spec = importlib.util.spec_from_file_location('selector', HERE / 'select_tasks.p
 selector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(selector)
 
+EXCLUDED_SMALL_IDS = {
+    'tokio-rs__bytes-377',
+    'chronotope__chrono-991',
+    'dtolnay__async-trait-150',
+}
+
 
 class ExperimentSetTests(unittest.TestCase):
     def test_manifest_is_complete_and_balanced(self):
@@ -25,22 +31,17 @@ class ExperimentSetTests(unittest.TestCase):
         ts_ids = {t['instance_id'] for t in testset['tasks']}
         self.assertTrue(ts_ids.issubset(ids), 'All 50 testset tasks must be in experiment set')
 
-        validation = json.loads((HERE.parent / 'validation/manifest.json').read_text(encoding='utf-8'))
-        val_small = {t['instance_id'] for t in validation['tasks'] if t['size'] == 'small'}
-        self.assertFalse(val_small & ids, 'Validation small tasks must not be in experiment set')
+        self.assertFalse(EXCLUDED_SMALL_IDS & ids, 'Excluded small tasks must not be in 100-task set')
 
         self.assertTrue(all(selector.patch_size(task['patch_changed_lines']) == task['size']
                             for task in tasks))
 
     def test_reproducible_selection(self):
         manifest = json.loads((HERE / 'manifest.json').read_text(encoding='utf-8'))
-        validation = json.loads((HERE.parent / 'validation/manifest.json').read_text(encoding='utf-8'))
         testset = json.loads((HERE.parent / 'testset/manifest.json').read_text(encoding='utf-8'))
 
-        val_ids = {t['instance_id'] for t in validation['tasks']}
         ts_ids = {t['instance_id'] for t in testset['tasks']}
-
-        reproduced = selector.select_tasks(manifest['tasks'], val_ids, ts_ids)
+        reproduced = selector.select_tasks(manifest['tasks'], EXCLUDED_SMALL_IDS, ts_ids)
         self.assertEqual(manifest['tasks'], reproduced)
 
 

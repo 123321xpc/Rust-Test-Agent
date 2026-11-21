@@ -341,7 +341,7 @@ def load_instances(jsonl_path, filter_id=None, skip_existing_logs=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RustForger Docker Runner")
-    parser.add_argument("--api", type=str.lower, choices=("yj", "ds"),
+    parser.add_argument("--api", type=str.lower, choices=("yj", "ollama"),
                         help="API interface from .env to use (default: yj)")
     parser.add_argument("--model", type=str, default=None,
                         help="Override the default model for the selected API interface")
@@ -379,7 +379,7 @@ if __name__ == "__main__":
         api_key = os.environ.get("YJ_API_KEY")
         model_name = model_override or os.environ.get("YJ_MODEL")
         if not base_url or not api_key or not model_name:
-            parser.error("Set YJ_*/DS_* (or MODEL and API_KEY) in the repository root .env file")
+            parser.error("Set YJ_*/OLLAMA_* (or MODEL and API_KEY) in the repository root .env file")
         os.environ["BASE_URL"] = base_url
         os.environ["API_KEY"] = api_key
         os.environ["MODEL"] = model_name

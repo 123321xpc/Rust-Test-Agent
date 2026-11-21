@@ -1,0 +1,140 @@
+  1 | https://www.semanticscholar.org/paper/e92c79d3cc9014fcce42a5b1ee06e56ce80ef406 | 2026 | Proceedings of the 2026 IEEE/ACM 4 | cites=14 | score=21 | sema,open,arxi
+      TITLE: Evaluating and Improving Automated Repository-Level Rust Issue Resolution with LLM-based Agents
+  2 | https://doi.org/10.48550/arxiv.2506.16650 | 2025 | arXiv (Cornell University) | cites=14 | score=20 | open
+      TITLE: SemAgent: A Semantics Aware Program Repair Agent
+  3 | https://www.semanticscholar.org/paper/44de3e0b8fd8a2d55edc1287652145fc477cc85a | 2026 | arXiv.org | cites=5 | score=19 | sema
+      TITLE: DebugRepair: Enhancing LLM-Based Automated Program Repair via Self-Directed Debugging
+  4 | https://doi.org/10.1145/3830238 | 2026 | ACM Transactions on Software Engin | cites=4 | score=19 | open
+      TITLE: BLAgent : Agentic RAG for File-Level Bug Localization
+  5 | https://www.semanticscholar.org/paper/a1e4a477d6b29c88b3abcda3d157ee6a006d7475 | 2026 | International Journal of Knowledge | cites=0 | score=19 | sema
+      TITLE: The Systems Architecture of LLM Multi-Agent Systems: Routing, Memory, and Resource Optimisation
+  6 | https://doi.org/10.2139/ssrn.7234653 | 2026 | SSRN Electronic Journal | cites=107 | score=18 | open,arxi
+      TITLE: SWE-Exp: Experience-Driven Software Issue Resolution
+  7 | https://doi.org/10.1145/3744916.3773202 | 2026 | ACM/IEEE International Conference  | cites=33 | score=18 | open
+      TITLE: Unified Software Engineering Agent as AI Software Engineer
+  8 | https://www.semanticscholar.org/paper/7246c96b649ef5a4feda6c1a0f432cd902b23d15 | 2026 | ACM Transactions on Software Engin | cites=21 | score=18 | sema,open
+      TITLE: SGAgent: Suggestion-Guided LLM-Based Multi-Agent Framework for Repository-Level Software Repair
+  9 | https://doi.org/10.18653/2026.aacl-long.228 | 2026 | International Joint Conference on  | cites=10 | score=18 | open
+      TITLE: SWE-Adept: An LLM-Based Agentic Framework for Deep Codebase Analysis and Structured Issue Resolution
+ 10 | https://www.semanticscholar.org/paper/b40718afd5a51614f30e62abac8392444d156fa2 | 2025 | Proceedings of the 2026 IEEE/ACM 4 | cites=8 | score=18 | sema
+      TITLE: Unlocking LLM Repair Capabilities Through Cross-Language Translation and Multi-Agent Refinement
+ 11 | https://www.semanticscholar.org/paper/fa623bec2d4b7c9efceae7da35a7026178e5e382 | 2025 | Proceedings of the ACM on Software | cites=33 | score=17 | sema,open,arxi
+      TITLE: Understanding Automated Program Repair Agents through the Lens of Traceability: An Empirical Study
+ 12 | https://doi.org/10.48550/arxiv.2409.13642 | 2024 | arXiv (Cornell University) | cites=32 | score=17 | open
+      TITLE: A Multi-Agent Approach to Fault Localization via Graph-Based Retrieval and Reflexion
+ 13 | https://www.semanticscholar.org/paper/7c3ec85787498d05c1f0f7e0796330b481e594a7 | 2025 | Proceedings of the ACM on Software | cites=17 | score=17 | sema,open
+      TITLE: Lingxi: Repository-Level Issue Resolution Framework Enhanced by Procedural Knowledge Guided Scaling
+ 14 | http://arxiv.org/abs/2507.23348v1 | 2025 | arXiv | cites=0 | score=17 | arxi
+      TITLE: SWE-Debate: Competitive Multi-Agent Debate for Software Issue Resolution
+ 15 | http://arxiv.org/abs/2606.14061v4 | 2026 | arXiv | cites=0 | score=17 | arxi
+      TITLE: LLM Agents Can See Code Repositories
+ 16 | http://arxiv.org/abs/2605.18747v1 | 2026 | arXiv | cites=0 | score=17 | arxi
+      TITLE: Code as Agent Harness
+ 17 | https://doi.org/10.2139/ssrn.7138608 | None |  | cites=0 | score=17 | cros
+      TITLE: Evaluating Large Language Model Agents for Simulink Model Repair
+ 18 | https://doi.org/10.1145/3744916.3773269 | 2026 | ACM/IEEE International Conference  | cites=40 | score=16 | open
+      TITLE: LLM-based Agents for Automated Bug Fixing: How Far Are We?
+ 19 | https://doi.org/10.48550/arxiv.2504.06939 | 2025 | arXiv (Cornell University) | cites=33 | score=16 | open
+      TITLE: FeedbackEval: A Benchmark for Evaluating Large Language Models in Feedback-Driven Code Repair Tasks
+ 20 | https://doi.org/10.48550/arxiv.2605.03117 | 2026 | arXiv (Cornell University) | cites=6 | score=16 | open,arxi
+      TITLE: ARISE: A Repository-level Graph Representation and Toolset for Agentic Program Repair and Fault Localization
+ 21 | https://www.semanticscholar.org/paper/2355cbc4c10119a01c2d5c66839f97e8ae2b4246 | 2026 | arXiv.org | cites=5 | score=16 | sema
+      TITLE: Beyond Fixed Tests: Repository-Level Issue Resolution as Coevolution of Code and Behavioral Constraints
+ 22 | https://www.semanticscholar.org/paper/6f53a3494d7ca0bc5d2b399e39582231b3700431 | 2025 | arXiv.org | cites=3 | score=16 | sema,arxi
+      TITLE: Collaborative Agents for Automated Program Repair in Ruby
+ 23 | https://doi.org/10.1109/access.2026.3691783 | 2026 | IEEE Access | cites=3 | score=16 | open
+      TITLE: Utilizing Dynamic Context and Static Analysis for Agent-Based Automated Program Repair
+ 24 | https://doi.org/10.48550/arxiv.2607.12605 | 2026 | arXiv (Cornell University) | cites=2 | score=16 | open
+      TITLE: Multi-Perspective Agentic Program Repair via Code Property Graphs and Temporal Execution Graphs
+ 25 | https://doi.org/10.2139/ssrn.7193639 | None |  | cites=0 | score=16 | cros
+      TITLE: Multi-Artifact Versioning for LLM-Agent-Based Software
+ 26 | https://www.semanticscholar.org/paper/006c4c7470566327e5b02b94936d0be0033fc9f5 | 2024 | Neural Information Processing Syst | cites=234 | score=15 | sema,cros
+      TITLE: MAGIS: LLM-Based Multi-Agent Framework for GitHub Issue Resolution
+ 27 | https://doi.org/10.1145/3696630.3728549 | 2025 | ACM Joint European Software Engine | cites=163 | score=15 | open
+      TITLE: Alibaba LingmaAgent: Improving Automated Issue Resolution via Comprehensive Repository Exploration
+ 28 | https://doi.org/10.48550/arxiv.2507.23370 | 2025 | arXiv (Cornell University) | cites=149 | score=15 | open
+      TITLE: Trae Agent: An LLM-based Agent for Software Engineering with Test-time Scaling
+ 29 | https://doi.org/10.1109/ase63991.2025.00234 | 2025 | IEEE/ACM International Conference  | cites=137 | score=15 | open
+      TITLE: Understanding Software Engineering Agents: A Study of Thought-Action-Result Trajectories
+ 30 | https://doi.org/10.48550/arxiv.2308.15276 | 2023 | arXiv (Cornell University) | cites=124 | score=15 | open
+      TITLE: Large Language Models in Fault Localisation
+ 31 | https://doi.org/10.48550/arxiv.2507.12415 | 2025 | arXiv (Cornell University) | cites=67 | score=15 | open
+      TITLE: SWE-Perf: Can Language Models Optimize Code Performance on Real-World Repositories?
+ 32 | https://www.semanticscholar.org/paper/352f843fa870125922d1c6978169f4c68c712a0c | 2024 | arXiv.org | cites=56 | score=15 | sema,arxi
+      TITLE: SWE-bench-java: A GitHub Issue Resolving Benchmark for Java
+ 33 | https://doi.org/10.48550/arxiv.2511.06090 | 2025 | arXiv (Cornell University) | cites=45 | score=15 | open
+      TITLE: SWE-fficiency: Can Language Models Optimize Real-World Repositories on Real Workloads?
+ 34 | https://doi.org/10.48550/arxiv.2602.23866 | 2026 | arXiv (Cornell University) | cites=40 | score=15 | open
+      TITLE: SWE-rebench V2: Language-Agnostic SWE Task Collection at Scale
+ 35 | https://www.semanticscholar.org/paper/dcc23cede5a4b5ef1f6c9e677fa2be01dbfb5352 | 2025 | arXiv.org | cites=33 | score=15 | sema,open,arxi
+      TITLE: SWE-Bench++: A Framework for the Scalable Generation of Software Engineering Benchmarks from Open-Source Repositories
+ 36 | https://doi.org/10.1145/3728939 | 2025 | Proceedings of the ACM on software | cites=31 | score=15 | open
+      TITLE: AdverIntent-Agent: Adversarial Reasoning for Repair Based on Inferred Program Intent
+ 37 | https://doi.org/10.1145/3808129 | 2026 | Proceedings of the ACM on software | cites=18 | score=15 | open,arxi
+      TITLE: Evaluating LLM-Based Regression Test Generation
+ 38 | https://www.semanticscholar.org/paper/bf691cc5e10b5d5125a3de145360a9de3f720e2c | 2025 | ACM Transactions on Software Engin | cites=17 | score=15 | sema
+      TITLE: Hallucination to Consensus: Multi-Agent LLMs for End-to-End JUnit Test Generation
+ 39 | https://doi.org/10.1109/tse.2026.3696849 | 2026 | IEEE Transactions on Software Engi | cites=16 | score=15 | open
+      TITLE: Agentic Program Repair From Test Failures at Scale: A Neuro-Symbolic Approach With Static Analysis and Test Execution Feedback
+ 40 | https://www.semanticscholar.org/paper/ec7ba302617c705ec3c1145f966946db78080275 | 2025 | Conference of the European Chapter | cites=13 | score=15 | sema
+      TITLE: TDFlow: Agentic Workflows for Test Driven Development
+ 41 | https://doi.org/10.48550/arxiv.2511.01047 | 2025 | arXiv (Cornell University) | cites=10 | score=15 | open
+      TITLE: HAFixAgent: History-Aware Agentic Program Repair
+ 42 | https://doi.org/10.48550/arxiv.2607.06273 | 2026 | arXiv (Cornell University) | cites=6 | score=15 | open
+      TITLE: AgentTether: Graph-Guided Diagnosis and Runtime Intervention for Reliable LLM Agent Operation
+ 43 | https://doi.org/10.48550/arxiv.2606.05608 | 2026 | arXiv (Cornell University) | cites=4 | score=15 | open
+      TITLE: Agentic Software: How AI Agents Are Restructuring the Software Paradigm
+ 44 | https://www.semanticscholar.org/paper/270e8aeb7bccf739e9dd75ec86a185d5e7edbe7a | 2024 | Journal of Advanced Computing Syst | cites=3 | score=15 | sema,cros
+      TITLE: Test-in-the-loop LLM Repair: Verifiable Automated Program Repair on QuixBugs with a “Failing Test → Patch → Regression Test” Loop
+ 45 | https://www.semanticscholar.org/paper/5bd60c971e9930a50e440ace00db0df69c59ea30 | 2026 | arXiv.org | cites=1 | score=15 | sema
+      TITLE: Verication-driven closed-loop multi-agent large language modelframework for code-compliant structural design
+ 46 | https://www.semanticscholar.org/paper/1ed935829fa3f7ea4f3eaba6f2787e6c0fabe3bc | 2026 | Proceedings of the 41st IEEE/ACM I | cites=0 | score=15 | sema,cros
+      TITLE: CiL-Agent: Compiler-in-the-Loop LLM Agent for Memory-Safe C Program Repair
+ 47 | https://openalex.org/W7166257599 | 2026 | DiVA (Linnaeus University) | cites=0 | score=15 | open
+      TITLE: Impact of LSP Diagnostics on Agentic Code Translation Repair : A Controlled Comparison of Raw Compiler Output and Structured LSP Feedback
+ 48 | http://arxiv.org/abs/2410.12532v3 | 2024 | arXiv | cites=0 | score=15 | arxi
+      TITLE: MedAide: Information Fusion and Anatomy of Medical Intents via LLM-based Agent Collaboration
+ 49 | http://arxiv.org/abs/2608.09802v2 | 2026 | arXiv | cites=0 | score=15 | arxi
+      TITLE: SWE-Bench ProMax: Benchmarking Agents on Large-Scale Multilingual Code Refactoring
+ 50 | http://arxiv.org/abs/2608.05917v2 | 2026 | arXiv | cites=0 | score=15 | arxi,cros
+      TITLE: Escaping the Self-Repair Trap: Improving Test Oracle Generation via Dual-Context Awareness
+ 51 | http://arxiv.org/abs/2510.26423v1 | 2025 | arXiv | cites=0 | score=15 | arxi
+      TITLE: Nexus: Execution-Grounded Multi-Agent Test Oracle Synthesis
+ 52 | https://doi.org/10.1145/3650212.3680323 | 2024 | ACM SIGSOFT International Symposiu | cites=573 | score=14 | open
+      TITLE: Automated Program Repair via Conversation: Fixing 162 out of 337 Bugs for $0.42 Each using ChatGPT
+ 53 | https://doi.org/10.1109/tse.2025.3543187 | 2025 | IEEE Transactions on Software Engi | cites=151 | score=14 | open
+      TITLE: SoapFL: A Standard Operating Procedure for LLM-Based Method-Level Fault Localization
+ 54 | https://www.semanticscholar.org/paper/13b3bb88f7f28b76214e13e4792c159b8b75cedf | 2025 | Neural Information Processing Syst | cites=48 | score=14 | sema
+      TITLE: Code Graph Model (CGM): A Graph-Integrated Large Language Model for Repository-Level Software Engineering Tasks
+ 55 | https://doi.org/10.1109/icst69053.2026.00045 | 2026 | IEEE International Conference on S | cites=25 | score=14 | open
+      TITLE: Assessing the Impact of Code Changes on the Fault Localizability of Large Language Models
+ 56 | https://www.semanticscholar.org/paper/bfcd2c14b4cb7a3c8d4b8a25daa73ee2ed39e04f | 2024 | 2024 5th IEEE Global Conference fo | cites=11 | score=14 | sema
+      TITLE: AI-Powered Multi-Agent Framework for Automated Unit Test Case Generation: Enhancing Software Quality through LLM’s
+ 57 | https://doi.org/10.48550/arxiv.2509.20552 | 2025 | arXiv (Cornell University) | cites=11 | score=14 | open
+      TITLE: Enhancing LLM-based Fault Localization with a Functionality-Aware Retrieval-Augmented Generation Framework
+ 58 | https://www.semanticscholar.org/paper/cd0970fc8c95fc5cb89742edc840e776af783861 | 2026 | Proceedings of the 2026 IEEE/ACM 4 | cites=8 | score=14 | sema,open,cros
+      TITLE: Agent-Based Ensemble Reasoning for Repository-Level Issue Resolution
+ 59 | https://www.semanticscholar.org/paper/21f54abab1f36e1c376226aeab7b4f4cdd1e3a78 | 2026 | arXiv.org | cites=4 | score=14 | sema
+      TITLE: CodeTeam: An LLM-Powered Multi-Agent Framework for Repository-Level Code Generation
+ 60 | https://doi.org/10.1111/exsy.70400 | 2026 | Expert Systems | cites=4 | score=14 | open
+      TITLE: SCAgent : An LLM ‐Based Agent With State‐Aware Coordination for Automated Program Repair
+ 61 | https://doi.org/10.48550/arxiv.2603.20075 | 2026 | arXiv (Cornell University) | cites=4 | score=14 | open
+      TITLE: Agentic Harness for Real-World Compilers
+ 62 | https://www.semanticscholar.org/paper/cdc16c49cc2c8ca959a5b9ec80c1ca99cbaa397e | 2026 | Proceedings of the 41st IEEE/ACM I | cites=3 | score=14 | sema
+      TITLE: Is Three the Magic Number? An Empirical Evaluation of LLM-Based Repair Loops
+ 63 | https://doi.org/10.20944/preprints202603.0129.v1 | None |  | cites=3 | score=14 | cros
+      TITLE: A Self-Reflective Multi-Agent Collaboration Framework for Dynamic Software Engineering Tasks
+ 64 | https://www.semanticscholar.org/paper/e016ff9921d01ae1102d7a555dc95d7c82a26aca | 2025 | IEEE International Conference on S | cites=2 | score=14 | sema,arxi,cros
+      TITLE: Feedback Loops and Code Perturbations in LLM-Based Software Engineering: A Case Study on a C-to-Rust Translation System
+ 65 | https://www.semanticscholar.org/paper/cd0c41d61b0edea243ec761bcffb2f8af116f7eb | 2026 | SIGSOFT FSE Companion | cites=1 | score=14 | sema
+      TITLE: TestAgent: A Multi-Agent LLM Framework for Repository-Level Unit Test Generation
+ 66 | https://www.semanticscholar.org/paper/b83c86791840f9821ae9caa5844d9cbc3e2224ff | 2026 | arXiv.org | cites=0 | score=14 | sema
+      TITLE: Evidence-Driven LLM Agent for C-to-Synthesizable-C Conversion and Verification
+ 67 | https://www.semanticscholar.org/paper/b2d75e1cc811fe9bc01d016338a6644a53d0b327 | 2026 | 2026 Student Multidisciplinary Inn | cites=0 | score=14 | sema,cros
+      TITLE: C2SafeRust: Memory-Safe C-to-Rust Transpilation via Ownership Inference and Compiler-in-the-Loop Repair
+ 68 | https://openalex.org/W7165271792 | 2026 | DiVA (Digitala Vetenskapliga Arkiv | cites=0 | score=14 | open
+      TITLE: Agentic Automated Program Repair: Debugger Agents for C to Rust Translation : Optimizing LLM Context for Industrial-Scale Legacy Code Migration
+ 69 | http://arxiv.org/abs/2403.01971v2 | 2024 | arXiv | cites=0 | score=14 | arxi
+      TITLE: ContrastRepair: Enhancing Conversation-Based Automated Program Repair via Contrastive Test Case Pairs
+ 70 | http://arxiv.org/abs/2605.27238v2 | 2026 | arXiv | cites=0 | score=14 | arxi
+      TITLE: EviACT: An Evidence-to-Action Framework for Agentic Program Repair

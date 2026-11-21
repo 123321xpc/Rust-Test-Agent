@@ -1,0 +1,467 @@
+{
+  "ACI-impr": {
+    "evaluation_exit_code": 0,
+    "evaluation_error": null,
+    "counts": {
+      "resolved": 13,
+      "unresolved": 18,
+      "no_patch": 0,
+      "agent_error": 18,
+      "evaluation_error": 0,
+      "error": 1
+    },
+    "total": 50,
+    "instances": [
+      {
+        "instance_id": "BurntSushi__ripgrep-2209",
+        "agent_exit_code": 0,
+        "seconds": 326.82,
+        "patch_bytes": 851,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/BurntSushi__ripgrep-2209/report.json"
+      },
+      {
+        "instance_id": "ast-grep__ast-grep-1558",
+        "agent_exit_code": 0,
+        "seconds": 329.85,
+        "patch_bytes": 1897,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/ast-grep__ast-grep-1558/report.json"
+      },
+      {
+        "instance_id": "async-graphql__async-graphql-1048",
+        "agent_exit_code": 1,
+        "seconds": 188.12,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "async-graphql__async-graphql-1099",
+        "agent_exit_code": 1,
+        "seconds": 403.8,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "async-graphql__async-graphql-1228",
+        "agent_exit_code": 1,
+        "seconds": 337.93,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "async-graphql__async-graphql-1491",
+        "agent_exit_code": 1,
+        "seconds": 168.06,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "axodotdev__cargo-dist-1024",
+        "agent_exit_code": 0,
+        "seconds": 403.34,
+        "patch_bytes": 787,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/axodotdev__cargo-dist-1024/report.json"
+      },
+      {
+        "instance_id": "axodotdev__cargo-dist-1655",
+        "agent_exit_code": 0,
+        "seconds": 187.8,
+        "patch_bytes": 518,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/axodotdev__cargo-dist-1655/report.json"
+      },
+      {
+        "instance_id": "aya-rs__aya-431",
+        "agent_exit_code": 1,
+        "seconds": 209.64,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "aya-rs__aya-656",
+        "agent_exit_code": 0,
+        "seconds": 190.63,
+        "patch_bytes": 1802,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/aya-rs__aya-656/report.json"
+      },
+      {
+        "instance_id": "aya-rs__aya-774",
+        "agent_exit_code": 0,
+        "seconds": 396.7,
+        "patch_bytes": 2626,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/aya-rs__aya-774/report.json"
+      },
+      {
+        "instance_id": "aya-rs__aya-897",
+        "agent_exit_code": 0,
+        "seconds": 216.39,
+        "patch_bytes": 637,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/aya-rs__aya-897/report.json"
+      },
+      {
+        "instance_id": "aya-rs__aya-90",
+        "agent_exit_code": 1,
+        "seconds": 243.66,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "bevyengine__bevy-15398",
+        "agent_exit_code": 1,
+        "seconds": 402.24,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "boa-dev__boa-4047",
+        "agent_exit_code": 0,
+        "seconds": 246.66,
+        "patch_bytes": 617,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/boa-dev__boa-4047/report.json"
+      },
+      {
+        "instance_id": "cargo-generate__cargo-generate-474",
+        "agent_exit_code": 0,
+        "seconds": 271.51,
+        "patch_bytes": 1885,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/cargo-generate__cargo-generate-474/report.json"
+      },
+      {
+        "instance_id": "cargo-generate__cargo-generate-511",
+        "agent_exit_code": 0,
+        "seconds": 212.73,
+        "patch_bytes": 876,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/cargo-generate__cargo-generate-511/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-1621",
+        "agent_exit_code": 0,
+        "seconds": 93.22,
+        "patch_bytes": 419,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-1621/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-378",
+        "agent_exit_code": 0,
+        "seconds": 178.3,
+        "patch_bytes": 505,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-378/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-445",
+        "agent_exit_code": 0,
+        "seconds": 488.68,
+        "patch_bytes": 9134,
+        "error": null,
+        "verdict": "error",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-445/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-508",
+        "agent_exit_code": 0,
+        "seconds": 199.49,
+        "patch_bytes": 1035,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-508/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-686",
+        "agent_exit_code": 0,
+        "seconds": 110.62,
+        "patch_bytes": 1058,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-686/report.json"
+      },
+      {
+        "instance_id": "chronotope__chrono-999",
+        "agent_exit_code": 0,
+        "seconds": 52.81,
+        "patch_bytes": 728,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/chronotope__chrono-999/report.json"
+      },
+      {
+        "instance_id": "dtolnay__async-trait-100",
+        "agent_exit_code": 0,
+        "seconds": 162.68,
+        "patch_bytes": 2109,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/dtolnay__async-trait-100/report.json"
+      },
+      {
+        "instance_id": "dtolnay__async-trait-160",
+        "agent_exit_code": 0,
+        "seconds": 109.04,
+        "patch_bytes": 859,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/dtolnay__async-trait-160/report.json"
+      },
+      {
+        "instance_id": "dtolnay__async-trait-227",
+        "agent_exit_code": 0,
+        "seconds": 81.51,
+        "patch_bytes": 907,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/dtolnay__async-trait-227/report.json"
+      },
+      {
+        "instance_id": "dtolnay__async-trait-90",
+        "agent_exit_code": 0,
+        "seconds": 314.18,
+        "patch_bytes": 761,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/dtolnay__async-trait-90/report.json"
+      },
+      {
+        "instance_id": "imsnif__bandwhich-118",
+        "agent_exit_code": 1,
+        "seconds": 297.18,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "mozilla__cbindgen-494",
+        "agent_exit_code": 1,
+        "seconds": 273.65,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "mozilla__cbindgen-501",
+        "agent_exit_code": 1,
+        "seconds": 298.11,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "nushell__nushell-12901",
+        "agent_exit_code": 1,
+        "seconds": 595.27,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "rust-fuzz__cargo-fuzz-231",
+        "agent_exit_code": 1,
+        "seconds": 205.55,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "rust-fuzz__cargo-fuzz-388",
+        "agent_exit_code": 1,
+        "seconds": 221.86,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "rust-lang__cc-rs-1181",
+        "agent_exit_code": 0,
+        "seconds": 180.61,
+        "patch_bytes": 888,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/rust-lang__cc-rs-1181/report.json"
+      },
+      {
+        "instance_id": "rust-lang__cc-rs-1212",
+        "agent_exit_code": 0,
+        "seconds": 159.21,
+        "patch_bytes": 566,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/rust-lang__cc-rs-1212/report.json"
+      },
+      {
+        "instance_id": "rust-lang__cc-rs-1279",
+        "agent_exit_code": 1,
+        "seconds": 164.0,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "rust-lang__cc-rs-914",
+        "agent_exit_code": 0,
+        "seconds": 187.33,
+        "patch_bytes": 3259,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/rust-lang__cc-rs-914/report.json"
+      },
+      {
+        "instance_id": "rust-lang__cc-rs-991",
+        "agent_exit_code": 0,
+        "seconds": 96.86,
+        "patch_bytes": 661,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/rust-lang__cc-rs-991/report.json"
+      },
+      {
+        "instance_id": "rust-lang__chalk-755",
+        "agent_exit_code": 1,
+        "seconds": 358.01,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "serde-rs__serde-2709",
+        "agent_exit_code": 0,
+        "seconds": 360.24,
+        "patch_bytes": 1537,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/serde-rs__serde-2709/report.json"
+      },
+      {
+        "instance_id": "starkware-libs__cairo-4909",
+        "agent_exit_code": 0,
+        "seconds": 831.32,
+        "patch_bytes": 1557,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/starkware-libs__cairo-4909/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__bytes-361",
+        "agent_exit_code": 0,
+        "seconds": 272.36,
+        "patch_bytes": 752,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tokio-rs__bytes-361/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__bytes-376",
+        "agent_exit_code": 0,
+        "seconds": 85.56,
+        "patch_bytes": 560,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tokio-rs__bytes-376/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__bytes-413",
+        "agent_exit_code": 0,
+        "seconds": 176.97,
+        "patch_bytes": 600,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tokio-rs__bytes-413/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__bytes-560",
+        "agent_exit_code": 0,
+        "seconds": 115.06,
+        "patch_bytes": 1071,
+        "error": null,
+        "verdict": "resolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tokio-rs__bytes-560/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__bytes-721",
+        "agent_exit_code": 1,
+        "seconds": 94.36,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "tokio-rs__bytes-732",
+        "agent_exit_code": 0,
+        "seconds": 95.0,
+        "patch_bytes": 462,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tokio-rs__bytes-732/report.json"
+      },
+      {
+        "instance_id": "tokio-rs__tokio-4519",
+        "agent_exit_code": 1,
+        "seconds": 1041.73,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "tokio-rs__tokio-5343",
+        "agent_exit_code": 1,
+        "seconds": 302.9,
+        "patch_bytes": 0,
+        "error": null,
+        "verdict": "agent_error",
+        "report": null
+      },
+      {
+        "instance_id": "tracel-ai__burn-815",
+        "agent_exit_code": 0,
+        "seconds": 273.12,
+        "patch_bytes": 2713,
+        "error": null,
+        "verdict": "unresolved",
+        "report": "/home/xupeicai/xpc/Rust-bench/logs/run_evaluation/testset_20261117_152405_41a770_ACI_impr/ACI-impr/tracel-ai__burn-815/report.json"
+      }
+    ]
+  }
+}
